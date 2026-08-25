@@ -9,6 +9,7 @@ class NasLibraryMovie {
   const NasLibraryMovie({
     required this.id,
     required this.title,
+    required this.summary,
     required this.episodeCount,
     required this.durationMs,
     required this.updatedAt,
@@ -16,6 +17,7 @@ class NasLibraryMovie {
 
   final String id;
   final String title;
+  final String summary;
   final int episodeCount;
   final int? durationMs;
   final String updatedAt;
@@ -29,6 +31,7 @@ class NasLibraryEpisode {
     required this.relativePath,
     required this.fileSize,
     required this.isAvailable,
+    required this.updatedAt,
     this.durationMs,
   });
 
@@ -38,6 +41,7 @@ class NasLibraryEpisode {
   final String relativePath;
   final int fileSize;
   final bool isAvailable;
+  final String updatedAt;
   final int? durationMs;
 }
 
@@ -256,14 +260,13 @@ class NasLibraryDatabase {
       final timestamp = _now();
       _db.execute('''
         INSERT INTO movies(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at
+        ON CONFLICT(id) DO NOTHING
       ''', [movieId, title, timestamp, timestamp]);
       _db.execute('''
         INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, file_size, is_available, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
-          movie_id = excluded.movie_id, title = excluded.title, file_size = excluded.file_size,
-          is_available = 1, updated_at = excluded.updated_at
+          file_size = excluded.file_size, is_available = 1, updated_at = excluded.updated_at
       ''', [
         episodeId,
         movieId,
@@ -283,7 +286,7 @@ class NasLibraryDatabase {
   List<NasLibraryMovie> listMovies({String query = ''}) {
     final queryLike = '%${query.trim()}%';
     final rows = _db.select('''
-      SELECT m.id, m.title, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.summary, m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m JOIN episodes e ON e.movie_id = m.id
       WHERE e.is_available = 1 AND (? = '%%' OR lower(m.title) LIKE lower(?))
@@ -293,6 +296,7 @@ class NasLibraryDatabase {
         .map((row) => NasLibraryMovie(
               id: row['id'] as String,
               title: row['title'] as String,
+              summary: row['summary'] as String,
               episodeCount: row['episode_count'] as int,
               durationMs: (row['duration_ms'] as int?) == 0
                   ? null
@@ -318,9 +322,49 @@ class NasLibraryDatabase {
     return null;
   }
 
+  NasLibraryMovie? findMovieForAdmin(String movieId) {
+    final rows = _db.select('''
+      SELECT m.id, m.title, m.summary, m.updated_at, COUNT(e.id) AS episode_count,
+             SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
+      FROM movies m LEFT JOIN episodes e ON e.movie_id = m.id
+      WHERE m.id = ?
+      GROUP BY m.id
+    ''', [movieId]);
+    return rows.isEmpty ? null : _mapMovie(rows.single);
+  }
+
+  NasLibraryMovie? updateMovieMetadata({
+    required String movieId,
+    String? title,
+    String? summary,
+  }) {
+    if (title == null && summary == null) {
+      throw ArgumentError('At least one movie field is required.');
+    }
+    if (findMovieForAdmin(movieId) == null) return null;
+    final assignments = <String>[];
+    final values = <Object?>[];
+    if (title != null) {
+      assignments.add('title = ?');
+      values.add(title);
+    }
+    if (summary != null) {
+      assignments.add('summary = ?');
+      values.add(summary);
+    }
+    assignments.add('updated_at = ?');
+    values.add(_now());
+    values.add(movieId);
+    _db.execute(
+      'UPDATE movies SET ${assignments.join(', ')} WHERE id = ?',
+      values,
+    );
+    return findMovieForAdmin(movieId);
+  }
+
   List<NasLibraryEpisode> episodesForMovie(String movieId) {
     final rows = _db.select('''
-      SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms
+      SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms, updated_at
       FROM episodes WHERE movie_id = ? ORDER BY title COLLATE NOCASE
     ''', [movieId]);
     return rows
@@ -332,6 +376,7 @@ class NasLibraryDatabase {
               fileSize: row['file_size'] as int,
               isAvailable: (row['is_available'] as int) == 1,
               durationMs: row['duration_ms'] as int?,
+              updatedAt: row['updated_at'] as String,
             ))
         .toList(growable: false);
   }
@@ -346,6 +391,30 @@ class NasLibraryDatabase {
         : episodesForMovie(rows.first['movie_id'] as String)
             .firstWhere((episode) => episode.id == episodeId);
   }
+
+  NasLibraryEpisode? updateEpisodeTitle({
+    required String episodeId,
+    required String title,
+  }) {
+    final episode = findEpisode(episodeId);
+    if (episode == null) return null;
+    _db.execute(
+      'UPDATE episodes SET title = ?, updated_at = ? WHERE id = ?',
+      [title, _now(), episodeId],
+    );
+    return findEpisode(episodeId);
+  }
+
+  NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
+        id: row['id'] as String,
+        title: row['title'] as String,
+        summary: row['summary'] as String,
+        episodeCount: row['episode_count'] as int,
+        durationMs: (row['duration_ms'] as int?) == 0
+            ? null
+            : row['duration_ms'] as int?,
+        updatedAt: row['updated_at'] as String,
+      );
 
   NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
     final rows = _db.select('''

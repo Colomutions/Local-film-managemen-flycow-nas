@@ -118,6 +118,14 @@ class NasHealthServer {
       if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
         return _adminMediaRoots(request);
       }
+      if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
+        return _updateAdminMovie(request);
+      }
+      if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/episodes/[^/]+$').hasMatch(path)) {
+        return _updateAdminEpisode(request);
+      }
       if (request.method == 'POST' && path == '/api/v1/admin/scan-jobs') {
         return _createScanJob(request);
       }
@@ -336,7 +344,7 @@ class NasHealthServer {
     }
     return {
       ..._databaseSummary(movie),
-      'summary': '',
+      'summary': movie.summary,
       'episodes': episodes,
     };
   }
@@ -365,6 +373,57 @@ class NasHealthServer {
           },
         },
       );
+
+  Future<void> _updateAdminMovie(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null ||
+        body.keys.any((key) => key != 'title' && key != 'summary')) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final rawTitle = body['title'];
+    final rawSummary = body['summary'];
+    if ((rawTitle != null && rawTitle is! String) ||
+        (rawSummary != null && rawSummary is! String) ||
+        (rawTitle == null && rawSummary == null)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final title = (rawTitle as String?)?.trim();
+    if (title != null && title.isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movie = _libraryDatabase.updateMovieMetadata(
+      movieId: request.uri.pathSegments.last,
+      title: title,
+      summary: rawSummary as String?,
+    );
+    if (movie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': await _databaseDetails(movie),
+    });
+  }
+
+  Future<void> _updateAdminEpisode(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final rawTitle = body?['title'];
+    if (body == null ||
+        body.keys.any((key) => key != 'title') ||
+        rawTitle is! String ||
+        rawTitle.trim().isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final episode = _libraryDatabase.updateEpisodeTitle(
+      episodeId: request.uri.pathSegments.last,
+      title: rawTitle.trim(),
+    );
+    if (episode == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _adminEpisodePayload(episode),
+    });
+  }
 
   Future<void> _createScanJob(HttpRequest request) async {
     final body = await _readJsonBody(request);
@@ -446,6 +505,16 @@ class NasHealthServer {
         'startedAt': job.startedAt?.toIso8601String(),
         'finishedAt': job.finishedAt?.toIso8601String(),
         'errorCode': job.errorCode,
+      };
+
+  Map<String, Object?> _adminEpisodePayload(NasLibraryEpisode episode) => {
+        'id': episode.id,
+        'movieId': episode.movieId,
+        'title': episode.title,
+        'durationMs': episode.durationMs,
+        'fileSize': episode.fileSize,
+        'isAvailable': episode.isAvailable,
+        'updatedAt': episode.updatedAt,
       };
 
   Future<void> _emptyItems(HttpRequest request) => _writeJson(

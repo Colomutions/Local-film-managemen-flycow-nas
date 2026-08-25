@@ -119,6 +119,123 @@ Future<void> main() async {
         'viewer sees the movie scanned by the admin job');
     _expect(!jsonEncode(movie).contains(mediaRoot.path),
         'viewer movie response hides container path');
+
+    final details = await _request(
+      base,
+      'GET',
+      '/api/v1/movies/${movie['id']}',
+      token: viewerToken,
+    );
+    final initialEpisode = ((details.json['data']
+            as Map<String, dynamic>)['episodes'] as List<dynamic>)
+        .single as Map<String, dynamic>;
+    final noTokenMovieUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}',
+      body: {'title': '不得保存'},
+    );
+    _expectError(
+        noTokenMovieUpdate, HttpStatus.unauthorized, 'authentication_required');
+    final viewerMovieUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}',
+      token: viewerToken,
+      body: {'title': '不得保存'},
+    );
+    _expectError(viewerMovieUpdate, HttpStatus.forbidden, 'insufficient_scope');
+    final invalidMovieUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}',
+      token: adminToken,
+      body: {'title': '   '},
+    );
+    _expectError(invalidMovieUpdate, HttpStatus.badRequest, 'invalid_request');
+    final movieUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}',
+      token: adminToken,
+      body: {'title': '管理员标题', 'summary': '仅写入 NAS SQLite。'},
+    );
+    _expect(movieUpdate.statusCode == HttpStatus.ok,
+        'admin updates scanned movie metadata');
+    _expect(movieUpdate.json['data']['title'] == '管理员标题',
+        'movie update returns title');
+    _expect(movieUpdate.json['data']['summary'] == '仅写入 NAS SQLite。',
+        'movie update returns summary');
+    _expect(!jsonEncode(movieUpdate.json).contains(mediaRoot.path),
+        'movie update hides container path');
+    final missingMovieUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/missing',
+      token: adminToken,
+      body: {'title': '不存在'},
+    );
+    _expectError(missingMovieUpdate, HttpStatus.notFound, 'resource_not_found');
+
+    final episodeUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/episodes/${initialEpisode['id']}',
+      token: adminToken,
+      body: {'title': '管理员分集标题'},
+    );
+    _expect(episodeUpdate.statusCode == HttpStatus.ok,
+        'admin updates scanned episode title');
+    _expect(episodeUpdate.json['data']['title'] == '管理员分集标题',
+        'episode update returns title');
+    _expect(!jsonEncode(episodeUpdate.json).contains(mediaRoot.path),
+        'episode update hides container path');
+    final invalidEpisodeUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/episodes/${initialEpisode['id']}',
+      token: adminToken,
+      body: {'title': '', 'relativePath': 'forbidden.mp4'},
+    );
+    _expectError(
+        invalidEpisodeUpdate, HttpStatus.badRequest, 'invalid_request');
+    final missingEpisodeUpdate = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/episodes/missing',
+      token: adminToken,
+      body: {'title': '不存在'},
+    );
+    _expectError(
+        missingEpisodeUpdate, HttpStatus.notFound, 'resource_not_found');
+
+    final rescan = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/scan-jobs',
+      token: adminToken,
+      body: {'mediaRootId': rootId},
+    );
+    final rescanId =
+        (rescan.json['data'] as Map<String, dynamic>)['id'] as String;
+    final rescanned = await _waitForFinishedJob(base, rescanId, adminToken);
+    _expect(rescanned['status'] == 'succeeded',
+        'rescan succeeds after metadata edits');
+    final persistedDetails = await _request(
+      base,
+      'GET',
+      '/api/v1/movies/${movie['id']}',
+      token: viewerToken,
+    );
+    final persistedEpisode = ((persistedDetails.json['data']
+            as Map<String, dynamic>)['episodes'] as List<dynamic>)
+        .single as Map<String, dynamic>;
+    _expect(persistedDetails.json['data']['title'] == '管理员标题',
+        'rescan does not overwrite movie title');
+    _expect(persistedDetails.json['data']['summary'] == '仅写入 NAS SQLite。',
+        'rescan does not overwrite movie summary');
+    _expect(persistedEpisode['title'] == '管理员分集标题',
+        'rescan does not overwrite episode title');
   } finally {
     await server.stop();
     await directory.delete(recursive: true);
