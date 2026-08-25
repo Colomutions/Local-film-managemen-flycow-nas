@@ -162,6 +162,12 @@ class NasLibraryDatabase {
     _database = null;
   }
 
+  Future<void> createBackupSnapshot(File target) async {
+    await target.parent.create(recursive: true);
+    final escapedPath = target.absolute.path.replaceAll("'", "''");
+    _db.execute("VACUUM INTO '$escapedPath'");
+  }
+
   void _migrate() {
     _db.execute('''
       CREATE TABLE IF NOT EXISTS schema_migrations (

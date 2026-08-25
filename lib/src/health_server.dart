@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'artwork_service.dart';
 import 'auth.dart';
+import 'backup_service.dart';
 import 'config.dart';
 import 'fixture_library.dart';
 import 'library_database.dart';
@@ -19,6 +20,7 @@ class NasHealthServer {
     NasMediaService? mediaService,
     NasLibraryDatabase? libraryDatabase,
     NasArtworkService? artworkService,
+    NasBackupService? backupService,
   })  : _stateStore = stateStore ?? NasPersistentStateStore(config.dataDir),
         _library = library ?? NasFixtureLibrary(),
         _mediaService = mediaService ??
@@ -28,7 +30,8 @@ class NasHealthServer {
             ),
         _libraryDatabase =
             libraryDatabase ?? NasLibraryDatabase(config.dataDir),
-        _artworkService = artworkService ?? NasArtworkService(config.dataDir);
+        _artworkService = artworkService ?? NasArtworkService(config.dataDir),
+        _backupService = backupService ?? NasBackupService(config.dataDir);
 
   final NasConfig config;
   final NasPersistentStateStore _stateStore;
@@ -36,6 +39,7 @@ class NasHealthServer {
   final NasMediaService _mediaService;
   final NasLibraryDatabase _libraryDatabase;
   final NasArtworkService _artworkService;
+  final NasBackupService _backupService;
   HttpServer? _server;
   NasPersistentState? _state;
   final Map<String, _PairingSession> _pairingSessions = {};
@@ -128,6 +132,16 @@ class NasHealthServer {
       if (request.method == 'DELETE' &&
           RegExp(r'^/api/v1/admin/devices/[^/]+$').hasMatch(path)) {
         return _revokeAdminDevice(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/backups') {
+        return _createAdminBackup(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/backups') {
+        return _adminBackups(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/admin/backups/[^/]+$').hasMatch(path)) {
+        return _adminBackup(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/categories') {
         return _adminCategories(request);
@@ -632,6 +646,34 @@ class NasHealthServer {
     await request.response.close();
   }
 
+  Future<void> _createAdminBackup(HttpRequest request) async {
+    final backup = await _backupService.create(
+      databaseSnapshot: _libraryDatabase.createBackupSnapshot,
+    );
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': _backupPayload(backup),
+    });
+  }
+
+  Future<void> _adminBackups(HttpRequest request) async {
+    final backups = await _backupService.list();
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': backups.map(_backupPayload).toList(growable: false),
+      },
+    });
+  }
+
+  Future<void> _adminBackup(HttpRequest request) async {
+    final backup = await _backupService.find(request.uri.pathSegments.last);
+    if (backup == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _backupPayload(backup),
+    });
+  }
+
   Future<void> _updateAdminMovie(HttpRequest request) async {
     final body = await _readJsonBody(request);
     if (body == null ||
@@ -798,6 +840,8 @@ class NasHealthServer {
         'scope': device.scope,
         'expiresAt': device.expiresAt.toUtc().toIso8601String(),
       };
+
+  Map<String, Object> _backupPayload(NasBackupRecord backup) => backup.toJson();
 
   Map<String, Object?> _categoryPayload(NasLibraryCategory category) => {
         'id': category.id,

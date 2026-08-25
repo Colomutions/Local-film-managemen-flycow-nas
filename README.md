@@ -1,6 +1,6 @@
 # 幕境 NAS 服务（任务 I）
 
-这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 已提供受 admin scope 保护的媒体根、扫描、影片/分集元数据、分类、标签、标签层级与海报管理；它尚未实现备份、设备或源文件管理 API。
+这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 已提供受 admin scope 保护的媒体根、扫描、影片/分集元数据、分类、标签、标签层级、海报、设备管理与备份 API；它尚未实现源文件管理 API。
 
 ## 技术选型
 
@@ -125,6 +125,8 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 dart run test/admin_api_test.dart
 dart run test/taxonomy_api_test.dart
 dart run test/artwork_api_test.dart
+dart run test/devices_api_test.dart
+dart run test/backups_api_test.dart
 ```
 
 示例错误 envelope：
@@ -132,6 +134,14 @@ dart run test/artwork_api_test.dart
 ```json
 {"error":{"code":"authentication_required","message":"A valid device token is required."}}
 ```
+
+## 任务 K：设备与备份
+
+- `GET /api/v1/admin/devices` 与 `DELETE /api/v1/admin/devices/{deviceId}`：仅 admin 可查看脱敏的设备 ID、scope 和过期时间，或撤销指定设备。撤销后该设备的原令牌立即失效；响应不返回令牌、令牌哈希或配对码。
+- `POST /api/v1/admin/backups`：仅 admin 可创建备份，成功返回服务生成的备份 ID、创建时间与数据大小。备份使用 SQLite `VACUUM INTO` 生成一致性快照，并复制 `/data` 内的服务身份状态、可选配置和海报资产。
+- `GET /api/v1/admin/backups` 与 `GET /api/v1/admin/backups/{id}`：仅返回备份元数据，不提供文件系统路径、备份内容下载或恢复操作。
+
+备份绝不包含 `/media` 源视频，也不修改 SQLite 正常数据、海报或媒体文件。真实 NAS 上仍需验证 Docker 重建后的备份清单、SQLite 快照和海报资产可用性。
 
 ## 目录
 
