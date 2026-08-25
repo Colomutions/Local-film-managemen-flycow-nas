@@ -19,11 +19,13 @@ class NasHealthServer {
     NasLibraryDatabase? libraryDatabase,
   })  : _stateStore = stateStore ?? NasPersistentStateStore(config.dataDir),
         _library = library ?? NasFixtureLibrary(),
-        _mediaService = mediaService ?? NasMediaService(
-          mediaDir: config.mediaDir,
-          fixtureRelativePath: config.fixtureMediaRelativePath,
-        ),
-        _libraryDatabase = libraryDatabase ?? NasLibraryDatabase(config.dataDir);
+        _mediaService = mediaService ??
+            NasMediaService(
+              mediaDir: config.mediaDir,
+              fixtureRelativePath: config.fixtureMediaRelativePath,
+            ),
+        _libraryDatabase =
+            libraryDatabase ?? NasLibraryDatabase(config.dataDir);
 
   final NasConfig config;
   final NasPersistentStateStore _stateStore;
@@ -34,7 +36,9 @@ class NasHealthServer {
   NasPersistentState? _state;
   final Map<String, _PairingSession> _pairingSessions = {};
   final Map<String, _PlaybackSession> _playbackSessions = {};
+  final Map<String, _ScanJob> _scanJobs = {};
   _FixturePlaybackState? _fixturePlaybackState;
+  NasMediaRoot? _configuredMediaRoot;
 
   bool get isRunning => _server != null;
   int get port => _server?.port ?? config.port;
@@ -43,14 +47,17 @@ class NasHealthServer {
     if (_server != null) {
       throw StateError('NAS health server is already running.');
     }
-    _state = await _stateStore.load() ??
-        NasPersistentState(serverId: newUuidV4());
+    _state =
+        await _stateStore.load() ?? NasPersistentState(serverId: newUuidV4());
     await _persistState();
     await _libraryDatabase.open();
+    _configuredMediaRoot = _libraryDatabase.ensureConfiguredMediaRoot(
+      rootName: config.mediaRootName,
+      containerPath: config.mediaDir,
+    );
     if (config.scanOnStart) {
-      await _libraryDatabase.scanConfiguredRoot(
-        rootName: config.mediaRootName,
-        containerPath: config.mediaDir,
+      await _libraryDatabase.scanMediaRoot(
+        mediaRootId: _configuredMediaRoot!.id,
         mediaService: _mediaService,
       );
     }
@@ -64,6 +71,7 @@ class NasHealthServer {
     _server = null;
     _pairingSessions.clear();
     _playbackSessions.clear();
+    _scanJobs.clear();
     await server?.close(force: true);
     await _libraryDatabase.close();
   }
@@ -101,10 +109,24 @@ class NasHealthServer {
       final tokenHash = _authenticatedTokenHash(request);
       final device = tokenHash == null ? null : _state!.tokens[tokenHash];
       if (device == null || tokenHash == null) {
-        return _error(request, HttpStatus.unauthorized, 'authentication_required');
+        return _error(
+            request, HttpStatus.unauthorized, 'authentication_required');
       }
       if (path.startsWith('/api/v1/admin/') && device.scope != 'admin') {
         return _error(request, HttpStatus.forbidden, 'insufficient_scope');
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
+        return _adminMediaRoots(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/scan-jobs') {
+        return _createScanJob(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/scan-jobs') {
+        return _listScanJobs(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/admin/scan-jobs/[^/]+$').hasMatch(path)) {
+        return _scanJob(request);
       }
       if (request.method == 'GET' && path == '/api/v1/movies') {
         return _movies(request);
@@ -130,7 +152,8 @@ class NasHealthServer {
         return _createPlaybackSession(request, tokenHash);
       }
       if (request.method == 'PATCH' &&
-          RegExp(r'^/api/v1/playback/sessions/[^/]+/progress$').hasMatch(path)) {
+          RegExp(r'^/api/v1/playback/sessions/[^/]+/progress$')
+              .hasMatch(path)) {
         return _savePlaybackProgress(request, tokenHash);
       }
       if (request.method == 'DELETE' &&
@@ -144,7 +167,8 @@ class NasHealthServer {
       await _error(request, HttpStatus.notFound, 'resource_not_found');
     } catch (_) {
       try {
-        await _error(request, HttpStatus.internalServerError, 'service_unavailable');
+        await _error(
+            request, HttpStatus.internalServerError, 'service_unavailable');
       } catch (_) {
         await request.response.close();
       }
@@ -156,13 +180,17 @@ class NasHealthServer {
       request.response.headers.set(HttpHeaders.allowHeader, 'GET, HEAD');
       return _error(request, HttpStatus.methodNotAllowed, 'method_not_allowed');
     }
-    await _writeJson(request.response, HttpStatus.ok, {
-      'data': {
-        'status': 'ok',
-        'service': 'mujing-nas',
-        'version': '0.1.0',
-      },
-    }, headOnly: request.method == 'HEAD');
+    await _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'status': 'ok',
+            'service': 'mujing-nas',
+            'version': '0.1.0',
+          },
+        },
+        headOnly: request.method == 'HEAD');
   }
 
   Future<void> _serverInfo(HttpRequest request) async {
@@ -190,7 +218,8 @@ class NasHealthServer {
 
   Future<void> _createPairingSession(HttpRequest request) async {
     if (config.pairingCode == null) {
-      return _error(request, HttpStatus.serviceUnavailable, 'pairing_not_configured');
+      return _error(
+          request, HttpStatus.serviceUnavailable, 'pairing_not_configured');
     }
     final body = await _readJsonBody(request);
     if (body == null || body['serverId'] != _state!.serverId) {
@@ -221,7 +250,8 @@ class NasHealthServer {
     if (session == null ||
         session.expiresAt.isBefore(DateTime.now().toUtc()) ||
         body == null ||
-        !constantTimeEquals(body['pairingPassword'] as String? ?? '', config.pairingCode ?? '')) {
+        !constantTimeEquals(body['pairingPassword'] as String? ?? '',
+            config.pairingCode ?? '')) {
       return _error(request, HttpStatus.unauthorized, 'pairing_failed');
     }
     final token = newOpaqueSecret();
@@ -244,11 +274,14 @@ class NasHealthServer {
   }
 
   Future<void> _movies(HttpRequest request) {
-    final hasDatabaseLibrary = _libraryDatabase.hasMediaRoots;
+    final hasDatabaseLibrary = _libraryDatabase.hasScannedMediaRoots;
     final query = request.uri.queryParameters['query'] ?? '';
     final items = !hasDatabaseLibrary
         ? _library.listMovies(query: query)
-        : _libraryDatabase.listMovies(query: query).map(_databaseSummary).toList();
+        : _libraryDatabase
+            .listMovies(query: query)
+            .map(_databaseSummary)
+            .toList();
     return _writeJson(request.response, HttpStatus.ok, {
       'data': {'items': items},
       'page': {'nextCursor': null, 'hasMore': false},
@@ -258,12 +291,14 @@ class NasHealthServer {
   Future<void> _movieDetails(HttpRequest request) async {
     final movieId = request.uri.pathSegments.last;
     final databaseMovie = _libraryDatabase.findMovie(movieId);
-    final movie = databaseMovie == null
-        ? _library.movieDetails(
-            movieId,
-            isAvailable: await _mediaService.fixtureFile() != null,
-          )
-        : await _databaseDetails(databaseMovie);
+    final movie = databaseMovie != null
+        ? await _databaseDetails(databaseMovie)
+        : !_libraryDatabase.hasScannedMediaRoots
+            ? _library.movieDetails(
+                movieId,
+                isAvailable: await _mediaService.fixtureFile() != null,
+              )
+            : null;
     if (movie == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
@@ -289,7 +324,8 @@ class NasHealthServer {
   Future<Map<String, Object?>> _databaseDetails(NasLibraryMovie movie) async {
     final episodes = <Map<String, Object?>>[];
     for (final episode in _libraryDatabase.episodesForMovie(movie.id)) {
-      final file = await _mediaService.fileForRelativePath(episode.relativePath);
+      final file =
+          await _mediaService.fileForRelativePath(episode.relativePath);
       episodes.add({
         'id': episode.id,
         'title': episode.title,
@@ -309,9 +345,108 @@ class NasHealthServer {
         request.response,
         HttpStatus.ok,
         {
-          'data': {'items': _library.tagPaths()},
+          'data': {
+            'items': _libraryDatabase.hasScannedMediaRoots
+                ? const <List<String>>[]
+                : _library.tagPaths(),
+          },
         },
       );
+
+  Future<void> _adminMediaRoots(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items': _libraryDatabase
+                .listMediaRoots()
+                .map(_mediaRootPayload)
+                .toList(growable: false),
+          },
+        },
+      );
+
+  Future<void> _createScanJob(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final mediaRootId = body?['mediaRootId'];
+    if (mediaRootId is! String ||
+        mediaRootId.isEmpty ||
+        _configuredMediaRoot?.id != mediaRootId) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final job = _ScanJob(
+      id: newUuidV4(),
+      mediaRootId: mediaRootId,
+      createdAt: DateTime.now().toUtc(),
+    );
+    _scanJobs[job.id] = job;
+    unawaited(_runScanJob(job));
+    await _writeJson(request.response, HttpStatus.accepted, {
+      'data': _scanJobPayload(job),
+    });
+  }
+
+  Future<void> _listScanJobs(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items':
+                _scanJobs.values.map(_scanJobPayload).toList(growable: false),
+          },
+        },
+      );
+
+  Future<void> _scanJob(HttpRequest request) {
+    final job = _scanJobs[request.uri.pathSegments.last];
+    if (job == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    return _writeJson(request.response, HttpStatus.ok, {
+      'data': _scanJobPayload(job),
+    });
+  }
+
+  Future<void> _runScanJob(_ScanJob job) async {
+    job.status = 'running';
+    job.startedAt = DateTime.now().toUtc();
+    try {
+      final result = await _libraryDatabase.scanMediaRoot(
+        mediaRootId: job.mediaRootId,
+        mediaService: _mediaService,
+      );
+      job.status = 'succeeded';
+      job.scannedFiles = result.scannedFiles;
+      job.availableEpisodes = result.availableEpisodes;
+    } catch (_) {
+      job.status = 'failed';
+      job.errorCode = 'service_unavailable';
+    } finally {
+      job.finishedAt = DateTime.now().toUtc();
+    }
+  }
+
+  Map<String, Object?> _mediaRootPayload(NasMediaRoot root) => {
+        'id': root.id,
+        'name': root.name,
+        'readOnly': root.readOnly,
+        'enabled': root.enabled,
+        'createdAt': root.createdAt,
+        'updatedAt': root.updatedAt,
+        'lastScannedAt': root.lastScannedAt,
+      };
+
+  Map<String, Object?> _scanJobPayload(_ScanJob job) => {
+        'id': job.id,
+        'mediaRootId': job.mediaRootId,
+        'status': job.status,
+        'scannedFiles': job.scannedFiles,
+        'availableEpisodes': job.availableEpisodes,
+        'createdAt': job.createdAt.toIso8601String(),
+        'startedAt': job.startedAt?.toIso8601String(),
+        'finishedAt': job.finishedAt?.toIso8601String(),
+        'errorCode': job.errorCode,
+      };
 
   Future<void> _emptyItems(HttpRequest request) => _writeJson(
         request.response,
@@ -334,7 +469,8 @@ class NasHealthServer {
     await request.response.close();
   }
 
-  Future<void> _createPlaybackSession(HttpRequest request, String tokenHash) async {
+  Future<void> _createPlaybackSession(
+      HttpRequest request, String tokenHash) async {
     final body = await _readJsonBody(request);
     final requestedMovieId = body?['contentId'];
     final requestedEpisodeId = body?['episodeId'];
@@ -342,7 +478,8 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     if (requestedMovieId != NasFixtureLibrary.movieId ||
-        (requestedEpisodeId != null && requestedEpisodeId != 'fixture-episode-1')) {
+        (requestedEpisodeId != null &&
+            requestedEpisodeId != 'fixture-episode-1')) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     final file = await _mediaService.fixtureFile();
@@ -374,7 +511,8 @@ class NasHealthServer {
     });
   }
 
-  Future<void> _savePlaybackProgress(HttpRequest request, String tokenHash) async {
+  Future<void> _savePlaybackProgress(
+      HttpRequest request, String tokenHash) async {
     final session = _playbackSession(request, tokenHash);
     final body = await _readJsonBody(request);
     final positionMs = (body?['positionMs'] as num?)?.toInt();
@@ -382,7 +520,10 @@ class NasHealthServer {
     if (session == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    if (positionMs == null || durationMs == null || positionMs < 0 || durationMs < 0) {
+    if (positionMs == null ||
+        durationMs == null ||
+        positionMs < 0 ||
+        durationMs < 0) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     _fixturePlaybackState = _FixturePlaybackState(
@@ -394,7 +535,8 @@ class NasHealthServer {
     });
   }
 
-  Future<void> _deletePlaybackSession(HttpRequest request, String tokenHash) async {
+  Future<void> _deletePlaybackSession(
+      HttpRequest request, String tokenHash) async {
     final sessionId = request.uri.pathSegments[4];
     final session = _playbackSessions[sessionId];
     if (session == null || session.tokenHash != tokenHash) {
@@ -408,7 +550,9 @@ class NasHealthServer {
   Future<void> _streamPlayback(HttpRequest request, String tokenHash) async {
     final session = _playbackSession(request, tokenHash);
     final file = await _mediaService.fixtureFile();
-    if (session == null || file == null || file.relativePath != session.relativePath) {
+    if (session == null ||
+        file == null ||
+        file.relativePath != session.relativePath) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     final length = await file.length();
@@ -419,21 +563,24 @@ class NasHealthServer {
     if (parsedRange.requested && parsedRange.range == null) {
       request.response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
       request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-      request.response.headers.set(HttpHeaders.contentRangeHeader, 'bytes */$length');
+      request.response.headers
+          .set(HttpHeaders.contentRangeHeader, 'bytes */$length');
       request.response.headers.contentLength = 0;
       return request.response.close();
     }
     final range = parsedRange.range;
     final start = range?.start ?? 0;
     final end = range?.end ?? length - 1;
-    request.response.statusCode = range == null ? HttpStatus.ok : HttpStatus.partialContent;
+    request.response.statusCode =
+        range == null ? HttpStatus.ok : HttpStatus.partialContent;
     request.response.headers.contentType = ContentType.parse(
       mimeTypeForMediaPath(file.relativePath),
     );
     request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
     request.response.headers.contentLength = end - start + 1;
     if (range != null) {
-      request.response.headers.set(HttpHeaders.contentRangeHeader, 'bytes $start-$end/$length');
+      request.response.headers
+          .set(HttpHeaders.contentRangeHeader, 'bytes $start-$end/$length');
     }
     if (request.method == 'GET') {
       await request.response.addStream(file.openRead(start, end + 1));
@@ -442,8 +589,10 @@ class NasHealthServer {
   }
 
   String? _authenticatedTokenHash(HttpRequest request) {
-    final authorization = request.headers.value(HttpHeaders.authorizationHeader);
-    if (authorization == null || !authorization.startsWith('Bearer ')) return null;
+    final authorization =
+        request.headers.value(HttpHeaders.authorizationHeader);
+    if (authorization == null || !authorization.startsWith('Bearer '))
+      return null;
     final token = authorization.substring('Bearer '.length).trim();
     if (token.isEmpty) return null;
     final tokenHash = sha256Hex(token);
@@ -475,7 +624,8 @@ class NasHealthServer {
       'authentication_required': 'A valid device token is required.',
       'insufficient_scope': 'This device does not have the required scope.',
       'invalid_request': 'The request is invalid.',
-      'method_not_allowed': 'The HTTP method is not supported for this resource.',
+      'method_not_allowed':
+          'The HTTP method is not supported for this resource.',
       'pairing_failed': 'Pairing could not be confirmed.',
       'pairing_not_configured': 'Pairing is not configured on this server.',
       'resource_not_found': 'Resource not found.',
@@ -489,11 +639,9 @@ class NasHealthServer {
   Future<void> _writeJson(
     HttpResponse response,
     int statusCode,
-    Map<String, Object?> payload,
-    {
+    Map<String, Object?> payload, {
     bool headOnly = false,
-  }
-  ) async {
+  }) async {
     final bytes = utf8.encode(jsonEncode(payload));
     response.statusCode = statusCode;
     response.headers.contentType = ContentType.json;
@@ -521,17 +669,37 @@ class _PlaybackSession {
 }
 
 class _FixturePlaybackState {
-  const _FixturePlaybackState({required this.positionMs, required this.durationMs});
+  const _FixturePlaybackState(
+      {required this.positionMs, required this.durationMs});
 
   final int positionMs;
   final int durationMs;
+}
+
+class _ScanJob {
+  _ScanJob({
+    required this.id,
+    required this.mediaRootId,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String mediaRootId;
+  final DateTime createdAt;
+  String status = 'queued';
+  int? scannedFiles;
+  int? availableEpisodes;
+  DateTime? startedAt;
+  DateTime? finishedAt;
+  String? errorCode;
 }
 
 Future<bool> checkLocalHealth(NasConfig config) async {
   final client = HttpClient();
   try {
     final host = config.bindHost == '0.0.0.0' ? '127.0.0.1' : config.bindHost;
-    final request = await client.headUrl(Uri.http('$host:${config.port}', '/health'));
+    final request =
+        await client.headUrl(Uri.http('$host:${config.port}', '/health'));
     final response = await request.close();
     await response.drain<void>();
     return response.statusCode == HttpStatus.ok;

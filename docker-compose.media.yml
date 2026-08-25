@@ -4,5 +4,4 @@ services:
       - type: bind
         source: ${MEDIA_ROOT:?Set MEDIA_ROOT in .env before enabling the media overlay.}
         target: /media
-        read_only: false
-
+        read_only: true

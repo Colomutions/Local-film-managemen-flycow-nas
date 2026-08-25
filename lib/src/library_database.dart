@@ -41,8 +41,31 @@ class NasLibraryEpisode {
   final int? durationMs;
 }
 
+class NasMediaRoot {
+  const NasMediaRoot({
+    required this.id,
+    required this.name,
+    required this.containerPath,
+    required this.readOnly,
+    required this.enabled,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.lastScannedAt,
+  });
+
+  final String id;
+  final String name;
+  final String containerPath;
+  final bool readOnly;
+  final bool enabled;
+  final String createdAt;
+  final String updatedAt;
+  final String? lastScannedAt;
+}
+
 class NasScanResult {
-  const NasScanResult({required this.scannedFiles, required this.availableEpisodes});
+  const NasScanResult(
+      {required this.scannedFiles, required this.availableEpisodes});
 
   final int scannedFiles;
   final int availableEpisodes;
@@ -60,8 +83,11 @@ class NasLibraryDatabase {
     if (_database != null) return;
     final directory = Directory('$dataDir${Platform.pathSeparator}db');
     await directory.create(recursive: true);
-    await Directory('$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters').create(recursive: true);
-    final database = sqlite3.open('${directory.path}${Platform.pathSeparator}mujing.sqlite');
+    await Directory(
+            '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters')
+        .create(recursive: true);
+    final database =
+        sqlite3.open('${directory.path}${Platform.pathSeparator}mujing.sqlite');
     database.execute('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
     _database = database;
     _migrate();
@@ -79,9 +105,12 @@ class NasLibraryDatabase {
         applied_at TEXT NOT NULL
       );
     ''');
-    final current = _db.select('SELECT MAX(version) AS version FROM schema_migrations').first['version'] as int? ?? 0;
-    if (current >= 1) return;
-    _db.execute('''
+    final current = _db
+            .select('SELECT MAX(version) AS version FROM schema_migrations')
+            .first['version'] as int? ??
+        0;
+    if (current < 1) {
+      _db.execute('''
       CREATE TABLE media_roots (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -113,10 +142,63 @@ class NasLibraryDatabase {
       CREATE INDEX episodes_movie_id_idx ON episodes(movie_id);
       CREATE INDEX episodes_root_path_idx ON episodes(media_root_id, relative_path);
     ''');
-    _db.execute(
-      'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-      [1, _now()],
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [1, _now()],
+      );
+    }
+    if (current < 2) {
+      _db.execute('ALTER TABLE media_roots ADD COLUMN last_scanned_at TEXT');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [2, _now()],
+      );
+    }
+  }
+
+  NasMediaRoot ensureConfiguredMediaRoot({
+    required String rootName,
+    required String containerPath,
+  }) {
+    final existing = _db.select(
+      'SELECT id FROM media_roots WHERE container_path = ?',
+      [containerPath],
     );
+    final timestamp = _now();
+    if (existing.isEmpty) {
+      _db.execute(
+        '''INSERT INTO media_roots(
+          id, name, container_path, read_only, enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, 1, 1, ?, ?)''',
+        [newUuidV4(), rootName, containerPath, timestamp, timestamp],
+      );
+    } else {
+      _db.execute(
+        '''UPDATE media_roots
+           SET name = ?, read_only = 1, enabled = 1, updated_at = ?
+           WHERE id = ?''',
+        [rootName, timestamp, existing.first['id']],
+      );
+    }
+    return _mediaRootForContainerPath(containerPath)!;
+  }
+
+  List<NasMediaRoot> listMediaRoots() {
+    final rows = _db.select('''
+      SELECT id, name, container_path, read_only, enabled, created_at,
+             updated_at, last_scanned_at
+      FROM media_roots ORDER BY created_at
+    ''');
+    return rows.map(_mapMediaRoot).toList(growable: false);
+  }
+
+  NasMediaRoot? findMediaRoot(String mediaRootId) {
+    final rows = _db.select('''
+      SELECT id, name, container_path, read_only, enabled, created_at,
+             updated_at, last_scanned_at
+      FROM media_roots WHERE id = ?
+    ''', [mediaRootId]);
+    return rows.isEmpty ? null : _mapMediaRoot(rows.single);
   }
 
   Future<NasScanResult> scanConfiguredRoot({
@@ -124,10 +206,34 @@ class NasLibraryDatabase {
     required String containerPath,
     required NasMediaService mediaService,
   }) async {
-    final rootId = _ensureMediaRoot(rootName, containerPath);
-    _db.execute('UPDATE episodes SET is_available = 0, updated_at = ? WHERE media_root_id = ?', [_now(), rootId]);
-    final root = Directory(containerPath);
-    if (!await root.exists()) return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    final root = ensureConfiguredMediaRoot(
+      rootName: rootName,
+      containerPath: containerPath,
+    );
+    return scanMediaRoot(mediaRootId: root.id, mediaService: mediaService);
+  }
+
+  Future<NasScanResult> scanMediaRoot({
+    required String mediaRootId,
+    required NasMediaService mediaService,
+  }) async {
+    final configuredRoot = findMediaRoot(mediaRootId);
+    if (configuredRoot == null || !configuredRoot.enabled) {
+      throw ArgumentError.value(mediaRootId, 'mediaRootId', 'is not enabled');
+    }
+    if (configuredRoot.containerPath != mediaService.mediaDir) {
+      throw StateError(
+          'Only the configured media service root can be scanned.');
+    }
+    final rootId = configuredRoot.id;
+    _db.execute(
+        'UPDATE episodes SET is_available = 0, updated_at = ? WHERE media_root_id = ?',
+        [_now(), rootId]);
+    final root = Directory(configuredRoot.containerPath);
+    if (!await root.exists()) {
+      _markRootScanned(rootId);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
     final canonicalRoot = await root.resolveSymbolicLinks();
     final prefix = canonicalRoot.endsWith(Platform.pathSeparator)
         ? canonicalRoot
@@ -137,11 +243,15 @@ class NasLibraryDatabase {
       if (entity is! File || !_isVideo(entity.path)) continue;
       final canonicalFile = await entity.resolveSymbolicLinks();
       if (!canonicalFile.startsWith(prefix)) continue;
-      final relativePath = canonicalFile.substring(prefix.length).replaceAll(Platform.pathSeparator, '/');
+      final relativePath = canonicalFile
+          .substring(prefix.length)
+          .replaceAll(Platform.pathSeparator, '/');
       final checkedFile = await mediaService.fileForRelativePath(relativePath);
       if (checkedFile == null) continue;
-      final movieId = 'movie-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
-      final episodeId = 'episode-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
+      final movieId =
+          'movie-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
+      final episodeId =
+          'episode-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
       final title = _titleFromPath(relativePath);
       final timestamp = _now();
       _db.execute('''
@@ -154,10 +264,20 @@ class NasLibraryDatabase {
         ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
           movie_id = excluded.movie_id, title = excluded.title, file_size = excluded.file_size,
           is_available = 1, updated_at = excluded.updated_at
-      ''', [episodeId, movieId, rootId, title, relativePath, await checkedFile.length(), timestamp]);
+      ''', [
+        episodeId,
+        movieId,
+        rootId,
+        title,
+        relativePath,
+        await checkedFile.length(),
+        timestamp
+      ]);
       scannedFiles++;
     }
-    return NasScanResult(scannedFiles: scannedFiles, availableEpisodes: scannedFiles);
+    _markRootScanned(rootId);
+    return NasScanResult(
+        scannedFiles: scannedFiles, availableEpisodes: scannedFiles);
   }
 
   List<NasLibraryMovie> listMovies({String query = ''}) {
@@ -169,16 +289,26 @@ class NasLibraryDatabase {
       WHERE e.is_available = 1 AND (? = '%%' OR lower(m.title) LIKE lower(?))
       GROUP BY m.id ORDER BY m.title COLLATE NOCASE
     ''', [queryLike, queryLike]);
-    return rows.map((row) => NasLibraryMovie(
-      id: row['id'] as String,
-      title: row['title'] as String,
-      episodeCount: row['episode_count'] as int,
-      durationMs: (row['duration_ms'] as int?) == 0 ? null : row['duration_ms'] as int?,
-      updatedAt: row['updated_at'] as String,
-    )).toList(growable: false);
+    return rows
+        .map((row) => NasLibraryMovie(
+              id: row['id'] as String,
+              title: row['title'] as String,
+              episodeCount: row['episode_count'] as int,
+              durationMs: (row['duration_ms'] as int?) == 0
+                  ? null
+                  : row['duration_ms'] as int?,
+              updatedAt: row['updated_at'] as String,
+            ))
+        .toList(growable: false);
   }
 
-  bool get hasMediaRoots => _db.select('SELECT 1 FROM media_roots LIMIT 1').isNotEmpty;
+  bool get hasMediaRoots =>
+      _db.select('SELECT 1 FROM media_roots LIMIT 1').isNotEmpty;
+
+  bool get hasScannedMediaRoots => _db
+      .select(
+          'SELECT 1 FROM media_roots WHERE last_scanned_at IS NOT NULL LIMIT 1')
+      .isNotEmpty;
 
   NasLibraryMovie? findMovie(String movieId) {
     final movies = listMovies();
@@ -193,15 +323,17 @@ class NasLibraryDatabase {
       SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms
       FROM episodes WHERE movie_id = ? ORDER BY title COLLATE NOCASE
     ''', [movieId]);
-    return rows.map((row) => NasLibraryEpisode(
-      id: row['id'] as String,
-      movieId: row['movie_id'] as String,
-      title: row['title'] as String,
-      relativePath: row['relative_path'] as String,
-      fileSize: row['file_size'] as int,
-      isAvailable: (row['is_available'] as int) == 1,
-      durationMs: row['duration_ms'] as int?,
-    )).toList(growable: false);
+    return rows
+        .map((row) => NasLibraryEpisode(
+              id: row['id'] as String,
+              movieId: row['movie_id'] as String,
+              title: row['title'] as String,
+              relativePath: row['relative_path'] as String,
+              fileSize: row['file_size'] as int,
+              isAvailable: (row['is_available'] as int) == 1,
+              durationMs: row['duration_ms'] as int?,
+            ))
+        .toList(growable: false);
   }
 
   NasLibraryEpisode? findEpisode(String episodeId) {
@@ -209,27 +341,46 @@ class NasLibraryDatabase {
       SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms
       FROM episodes WHERE id = ?
     ''', [episodeId]);
-    return rows.isEmpty ? null : episodesForMovie(rows.first['movie_id'] as String).firstWhere((episode) => episode.id == episodeId);
+    return rows.isEmpty
+        ? null
+        : episodesForMovie(rows.first['movie_id'] as String)
+            .firstWhere((episode) => episode.id == episodeId);
   }
 
-  String _ensureMediaRoot(String name, String containerPath) {
-    final existing = _db.select('SELECT id FROM media_roots WHERE container_path = ?', [containerPath]);
-    final timestamp = _now();
-    if (existing.isNotEmpty) {
-      final id = existing.first['id'] as String;
-      _db.execute('UPDATE media_roots SET name = ?, enabled = 1, updated_at = ? WHERE id = ?', [name, timestamp, id]);
-      return id;
-    }
-    final id = newUuidV4();
-    _db.execute('INSERT INTO media_roots(id, name, container_path, read_only, enabled, created_at, updated_at) VALUES (?, ?, ?, 0, 1, ?, ?)', [id, name, containerPath, timestamp, timestamp]);
-    return id;
+  NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
+    final rows = _db.select('''
+      SELECT id, name, container_path, read_only, enabled, created_at,
+             updated_at, last_scanned_at
+      FROM media_roots WHERE container_path = ?
+    ''', [containerPath]);
+    return rows.isEmpty ? null : _mapMediaRoot(rows.single);
   }
 
-  static bool _isVideo(String path) => RegExp(r'\.(mp4|m4v|mkv|mov|webm)$', caseSensitive: false).hasMatch(path);
+  NasMediaRoot _mapMediaRoot(Row row) => NasMediaRoot(
+        id: row['id'] as String,
+        name: row['name'] as String,
+        containerPath: row['container_path'] as String,
+        readOnly: (row['read_only'] as int) == 1,
+        enabled: (row['enabled'] as int) == 1,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+        lastScannedAt: row['last_scanned_at'] as String?,
+      );
+
+  void _markRootScanned(String rootId) {
+    _db.execute(
+      'UPDATE media_roots SET last_scanned_at = ?, updated_at = ? WHERE id = ?',
+      [_now(), _now(), rootId],
+    );
+  }
+
+  static bool _isVideo(String path) =>
+      RegExp(r'\.(mp4|m4v|mkv|mov|webm)$', caseSensitive: false).hasMatch(path);
   static String _titleFromPath(String relativePath) {
     final name = relativePath.split('/').last;
     final dot = name.lastIndexOf('.');
     return dot <= 0 ? name : name.substring(0, dot);
   }
+
   static String _now() => DateTime.now().toUtc().toIso8601String();
 }

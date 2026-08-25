@@ -1,6 +1,6 @@
 # 幕境 NAS 服务（任务 I）
 
-这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。它尚未实现管理 API、ffprobe 时长探测、海报持久化或源文件操作。
+这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 的第一切片还提供受 admin scope 保护的媒体根只读查询和扫描任务；它尚未实现影片资料、分类/标签、海报、备份、设备或源文件管理 API。
 
 ## 技术选型
 
@@ -28,7 +28,7 @@ MEDIA_ROOT=/你的/NAS/媒体目录
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml up -d --build
 ```
 
-该覆盖文件把媒体目录以**读写**方式挂到容器 `/media`。任务 D 不读取、扫描、重命名或删除它；将来仅在管理员 API 明确实现路径校验、媒体根 ID 和相对路径规则后，才允许源文件操作。
+该覆盖文件把媒体目录以**只读**方式挂到容器 `/media`。扫描只读取该目录；当前服务没有源文件重命名、移动或删除能力。将来若要开放这些能力，必须先获得用户对读写挂载的明确授权，并实现媒体根 ID 与相对路径校验。
 
 ## 启动与验证
 
@@ -96,6 +96,22 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 任务 I 使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。设置 `MUJING_SCAN_ON_START=true` 后，服务只扫描容器 `/media` 中的 `mp4`、`m4v`、`mkv`、`mov` 与 `webm` 文件；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。首次扫描完成后可把该开关改回 `false`，以避免每次重启全量扫描。
 
 任务 I 暂不调用 ffprobe，因此时长和分辨率可为空；它也不提供管理 API、重命名、移动或删除。扫码得到的 SQLite 影片会优先替代内存 fixture；尚未扫描时仍保留 fixture 用于协议测试。
+
+## 任务 K 第一切片：管理员媒体根与扫描任务
+
+当前仅实现以下管理员路由，所有路由都要求显式 `admin` token；缺少 token 为 `401 authentication_required`，viewer token 为 `403 insufficient_scope`：
+
+- `GET /api/v1/admin/media-roots`：返回当前容器 `/media` 对应的服务内 `id`、名称、只读状态、启用状态和时间戳。响应不返回 `containerPath`、宿主机路径或容器路径。
+- `POST /api/v1/admin/scan-jobs`：请求体仅接受服务端返回的 `{ "mediaRootId": "..." }`，创建一个 `202` 扫描任务。服务不接受、猜测或创建任意文件系统路径。
+- `GET /api/v1/admin/scan-jobs` 与 `GET /api/v1/admin/scan-jobs/{id}`：读取当前进程内扫描任务的状态、文件数和可用分集数。扫描结果写入 NAS SQLite；任务状态本身在容器重启后不保留。
+
+媒体覆盖保持只读。扫描任务只能扫描当前已配置的 `/media` 根，使用媒体根 ID 和相对路径，不会执行源文件写操作。数据库 migration v2 为媒体根增加扫描时间，用于区分“尚未扫描时的协议 fixture”和“已扫描但目录为空”的真实 SQLite 结果。
+
+本切片的本地回归命令：
+
+```text
+dart run test/admin_api_test.dart
+```
 
 示例错误 envelope：
 
