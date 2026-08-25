@@ -1,0 +1,26 @@
+services:
+  mujing-nas:
+    build:
+      context: .
+    image: mujing-nas:local
+    container_name: mujing-nas
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${MUJING_HOST_PORT:-48291}:48291"
+    environment:
+      MUJING_BIND_HOST: 0.0.0.0
+      MUJING_PORT: 48291
+      MUJING_SERVER_NAME: ${MUJING_SERVER_NAME:-幕境 NAS}
+      MUJING_ADVERTISE_URL: ${MUJING_ADVERTISE_URL:-}
+      MUJING_PAIRING_CODE: ${MUJING_PAIRING_CODE:-}
+      MUJING_FIXTURE_MEDIA_RELATIVE_PATH: ${MUJING_FIXTURE_MEDIA_RELATIVE_PATH:-}
+      MUJING_MEDIA_ROOT_NAME: ${MUJING_MEDIA_ROOT_NAME:-媒体库}
+      MUJING_SCAN_ON_START: ${MUJING_SCAN_ON_START:-false}
+      MUJING_DATA_DIR: /data
+      MUJING_MEDIA_DIR: /media
+      MUJING_TIMEZONE: ${MUJING_TIMEZONE:-Asia/Shanghai}
+    volumes:
+      - ./data:/data
+    security_opt:
+      - no-new-privileges:true

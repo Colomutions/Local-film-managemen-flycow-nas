@@ -1,0 +1,10 @@
+name: mujing_nas
+description: Minimal headless NAS service for the Mujing distributed library.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  sqlite3: ^2.4.5
