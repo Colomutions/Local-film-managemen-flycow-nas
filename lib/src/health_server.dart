@@ -122,6 +122,13 @@ class NasHealthServer {
       if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
         return _adminMediaRoots(request);
       }
+      if (request.method == 'GET' && path == '/api/v1/admin/devices') {
+        return _adminDevices(request);
+      }
+      if (request.method == 'DELETE' &&
+          RegExp(r'^/api/v1/admin/devices/[^/]+$').hasMatch(path)) {
+        return _revokeAdminDevice(request);
+      }
       if (request.method == 'GET' && path == '/api/v1/admin/categories') {
         return _adminCategories(request);
       }
@@ -594,6 +601,37 @@ class NasHealthServer {
         },
       );
 
+  Future<void> _adminDevices(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items': _state!.tokens.values
+                .map(_devicePayload)
+                .toList(growable: false)
+              ..sort((left, right) => (left['deviceId']! as String)
+                  .compareTo(right['deviceId']! as String)),
+          },
+        },
+      );
+
+  Future<void> _revokeAdminDevice(HttpRequest request) async {
+    final deviceId = request.uri.pathSegments.last;
+    final removedTokenHashes = _state!.tokens.entries
+        .where((entry) => entry.value.deviceId == deviceId)
+        .map((entry) => entry.key)
+        .toList(growable: false);
+    if (removedTokenHashes.isEmpty) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    for (final tokenHash in removedTokenHashes) {
+      _state!.tokens.remove(tokenHash);
+    }
+    await _persistState();
+    request.response.statusCode = HttpStatus.noContent;
+    await request.response.close();
+  }
+
   Future<void> _updateAdminMovie(HttpRequest request) async {
     final body = await _readJsonBody(request);
     if (body == null ||
@@ -753,6 +791,12 @@ class NasHealthServer {
         'createdAt': root.createdAt,
         'updatedAt': root.updatedAt,
         'lastScannedAt': root.lastScannedAt,
+      };
+
+  Map<String, Object?> _devicePayload(NasDeviceToken device) => {
+        'deviceId': device.deviceId,
+        'scope': device.scope,
+        'expiresAt': device.expiresAt.toUtc().toIso8601String(),
       };
 
   Map<String, Object?> _categoryPayload(NasLibraryCategory category) => {
