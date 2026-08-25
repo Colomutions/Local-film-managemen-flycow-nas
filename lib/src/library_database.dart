@@ -67,6 +67,64 @@ class NasMediaRoot {
   final String? lastScannedAt;
 }
 
+class NasLibraryCategory {
+  const NasLibraryCategory({
+    required this.id,
+    required this.name,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String name;
+  final String createdAt;
+  final String updatedAt;
+}
+
+class NasLibraryTag {
+  const NasLibraryTag({
+    required this.id,
+    required this.name,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String name;
+  final String createdAt;
+  final String updatedAt;
+}
+
+class NasTagPlacement {
+  const NasTagPlacement({
+    required this.id,
+    required this.tagId,
+    required this.parentPlacementId,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String tagId;
+  final String? parentPlacementId;
+  final String createdAt;
+  final String updatedAt;
+}
+
+class NasTagPath {
+  const NasTagPath({
+    required this.placementId,
+    required this.tagId,
+    required this.tagName,
+    required this.names,
+  });
+
+  final String placementId;
+  final String tagId;
+  final String tagName;
+  final List<String> names;
+}
+
 class NasScanResult {
   const NasScanResult(
       {required this.scannedFiles, required this.availableEpisodes});
@@ -156,6 +214,44 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [2, _now()],
+      );
+    }
+    if (current < 3) {
+      _db.execute('''
+        CREATE TABLE library_categories (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE tags (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE tag_placements (
+          id TEXT PRIMARY KEY,
+          tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+          parent_placement_id TEXT REFERENCES tag_placements(id) ON DELETE CASCADE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(tag_id, parent_placement_id)
+        );
+        CREATE TABLE movie_tag_placements (
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          tag_placement_id TEXT NOT NULL REFERENCES tag_placements(id) ON DELETE CASCADE,
+          PRIMARY KEY(movie_id, tag_placement_id)
+        );
+        ALTER TABLE movies ADD COLUMN category_id TEXT REFERENCES library_categories(id) ON DELETE SET NULL;
+        CREATE INDEX movies_category_id_idx ON movies(category_id);
+        CREATE INDEX tag_placements_tag_id_idx ON tag_placements(tag_id);
+        CREATE INDEX tag_placements_parent_id_idx ON tag_placements(parent_placement_id);
+        CREATE INDEX movie_tag_placements_placement_idx ON movie_tag_placements(tag_placement_id);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [3, _now()],
       );
     }
   }
@@ -338,10 +434,8 @@ class NasLibraryDatabase {
     String? title,
     String? summary,
   }) {
-    if (title == null && summary == null) {
-      throw ArgumentError('At least one movie field is required.');
-    }
     if (findMovieForAdmin(movieId) == null) return null;
+    if (title == null && summary == null) return findMovieForAdmin(movieId);
     final assignments = <String>[];
     final values = <Object?>[];
     if (title != null) {
@@ -405,6 +499,239 @@ class NasLibraryDatabase {
     return findEpisode(episodeId);
   }
 
+  List<NasLibraryCategory> listCategories() => _db
+      .select(
+          'SELECT id, name, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
+      .map(_mapCategory)
+      .toList(growable: false);
+
+  NasLibraryCategory? findCategory(String categoryId) {
+    final rows = _db.select(
+      'SELECT id, name, created_at, updated_at FROM library_categories WHERE id = ?',
+      [categoryId],
+    );
+    return rows.isEmpty ? null : _mapCategory(rows.single);
+  }
+
+  bool hasCategoryName(String name, {String? excludingId}) {
+    final rows = _db.select(
+      'SELECT id FROM library_categories WHERE name = ?',
+      [name],
+    );
+    return rows.any((row) => row['id'] != excludingId);
+  }
+
+  NasLibraryCategory createCategory(String name) {
+    final timestamp = _now();
+    final category = NasLibraryCategory(
+      id: newUuidV4(),
+      name: name,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    );
+    _db.execute(
+      'INSERT INTO library_categories(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
+      [category.id, category.name, category.createdAt, category.updatedAt],
+    );
+    return category;
+  }
+
+  NasLibraryCategory? updateCategoryName(String categoryId, String name) {
+    if (findCategory(categoryId) == null) return null;
+    _db.execute(
+      'UPDATE library_categories SET name = ?, updated_at = ? WHERE id = ?',
+      [name, _now(), categoryId],
+    );
+    return findCategory(categoryId);
+  }
+
+  bool deleteCategory(String categoryId) {
+    if (findCategory(categoryId) == null) return false;
+    _db.execute('DELETE FROM library_categories WHERE id = ?', [categoryId]);
+    return true;
+  }
+
+  List<NasLibraryTag> listTags() => _db
+      .select(
+          'SELECT id, name, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
+      .map(_mapTag)
+      .toList(growable: false);
+
+  NasLibraryTag? findTag(String tagId) {
+    final rows = _db.select(
+      'SELECT id, name, created_at, updated_at FROM tags WHERE id = ?',
+      [tagId],
+    );
+    return rows.isEmpty ? null : _mapTag(rows.single);
+  }
+
+  bool hasTagName(String name, {String? excludingId}) {
+    final rows = _db.select('SELECT id FROM tags WHERE name = ?', [name]);
+    return rows.any((row) => row['id'] != excludingId);
+  }
+
+  NasLibraryTag createTag(String name) {
+    final timestamp = _now();
+    final tag = NasLibraryTag(
+      id: newUuidV4(),
+      name: name,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    );
+    _db.execute(
+      'INSERT INTO tags(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
+      [tag.id, tag.name, tag.createdAt, tag.updatedAt],
+    );
+    return tag;
+  }
+
+  NasLibraryTag? updateTagName(String tagId, String name) {
+    if (findTag(tagId) == null) return null;
+    _db.execute(
+      'UPDATE tags SET name = ?, updated_at = ? WHERE id = ?',
+      [name, _now(), tagId],
+    );
+    return findTag(tagId);
+  }
+
+  bool deleteTag(String tagId) {
+    if (findTag(tagId) == null) return false;
+    _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
+    return true;
+  }
+
+  List<NasTagPlacement> listTagPlacements() => _db.select('''
+        SELECT id, tag_id, parent_placement_id, created_at, updated_at
+        FROM tag_placements ORDER BY created_at
+      ''').map(_mapTagPlacement).toList(growable: false);
+
+  NasTagPlacement? findTagPlacement(String placementId) {
+    final rows = _db.select('''
+      SELECT id, tag_id, parent_placement_id, created_at, updated_at
+      FROM tag_placements WHERE id = ?
+    ''', [placementId]);
+    return rows.isEmpty ? null : _mapTagPlacement(rows.single);
+  }
+
+  NasTagPlacement createTagPlacement({
+    required String tagId,
+    required String? parentPlacementId,
+  }) {
+    final timestamp = _now();
+    final placement = NasTagPlacement(
+      id: newUuidV4(),
+      tagId: tagId,
+      parentPlacementId: parentPlacementId,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    );
+    _db.execute('''
+      INSERT INTO tag_placements(id, tag_id, parent_placement_id, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    ''', [
+      placement.id,
+      placement.tagId,
+      placement.parentPlacementId,
+      placement.createdAt,
+      placement.updatedAt,
+    ]);
+    return placement;
+  }
+
+  NasTagPlacement? updateTagPlacementParent({
+    required String placementId,
+    required String? parentPlacementId,
+  }) {
+    if (findTagPlacement(placementId) == null) return null;
+    _db.execute(
+      'UPDATE tag_placements SET parent_placement_id = ?, updated_at = ? WHERE id = ?',
+      [parentPlacementId, _now(), placementId],
+    );
+    return findTagPlacement(placementId);
+  }
+
+  bool deleteTagPlacement(String placementId) {
+    if (findTagPlacement(placementId) == null) return false;
+    _db.execute('DELETE FROM tag_placements WHERE id = ?', [placementId]);
+    return true;
+  }
+
+  bool isTagPlacementDescendant({
+    required String candidateParentId,
+    required String placementId,
+  }) {
+    var current = findTagPlacement(candidateParentId);
+    final visited = <String>{};
+    while (current != null && visited.add(current.id)) {
+      if (current.id == placementId) return true;
+      current = current.parentPlacementId == null
+          ? null
+          : findTagPlacement(current.parentPlacementId!);
+    }
+    return false;
+  }
+
+  NasLibraryCategory? categoryForMovie(String movieId) {
+    final rows = _db.select('''
+      SELECT c.id, c.name, c.created_at, c.updated_at
+      FROM movies m JOIN library_categories c ON c.id = m.category_id
+      WHERE m.id = ?
+    ''', [movieId]);
+    return rows.isEmpty ? null : _mapCategory(rows.single);
+  }
+
+  List<NasTagPath> tagPathsForMovie(String movieId) {
+    final rows = _db.select('''
+      SELECT tag_placement_id FROM movie_tag_placements
+      WHERE movie_id = ? ORDER BY tag_placement_id
+    ''', [movieId]);
+    return rows
+        .map((row) => _tagPathForPlacement(row['tag_placement_id'] as String))
+        .whereType<NasTagPath>()
+        .toList(growable: false);
+  }
+
+  List<NasTagPath> allTagPaths() => listTagPlacements()
+      .map((placement) => _tagPathForPlacement(placement.id))
+      .whereType<NasTagPath>()
+      .toList(growable: false);
+
+  List<NasLibraryTag> tagsForMovie(String movieId) {
+    final tags = <String, NasLibraryTag>{};
+    for (final path in tagPathsForMovie(movieId)) {
+      final tag = findTag(path.tagId);
+      if (tag != null) tags[tag.id] = tag;
+    }
+    return tags.values.toList(growable: false);
+  }
+
+  bool setMovieTaxonomy({
+    required String movieId,
+    required bool updateCategory,
+    required String? categoryId,
+    required bool updateTagPlacements,
+    required List<String> tagPlacementIds,
+  }) {
+    if (findMovieForAdmin(movieId) == null) return false;
+    if (updateCategory) {
+      _db.execute(
+        'UPDATE movies SET category_id = ?, updated_at = ? WHERE id = ?',
+        [categoryId, _now(), movieId],
+      );
+    }
+    if (updateTagPlacements) {
+      _db.execute(
+          'DELETE FROM movie_tag_placements WHERE movie_id = ?', [movieId]);
+      for (final placementId in tagPlacementIds) {
+        _db.execute(
+          'INSERT INTO movie_tag_placements(movie_id, tag_placement_id) VALUES (?, ?)',
+          [movieId, placementId],
+        );
+      }
+    }
+    return true;
+  }
+
   NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
         id: row['id'] as String,
         title: row['title'] as String,
@@ -435,6 +762,52 @@ class NasLibraryDatabase {
         updatedAt: row['updated_at'] as String,
         lastScannedAt: row['last_scanned_at'] as String?,
       );
+
+  NasLibraryCategory _mapCategory(Row row) => NasLibraryCategory(
+        id: row['id'] as String,
+        name: row['name'] as String,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+      );
+
+  NasLibraryTag _mapTag(Row row) => NasLibraryTag(
+        id: row['id'] as String,
+        name: row['name'] as String,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+      );
+
+  NasTagPlacement _mapTagPlacement(Row row) => NasTagPlacement(
+        id: row['id'] as String,
+        tagId: row['tag_id'] as String,
+        parentPlacementId: row['parent_placement_id'] as String?,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+      );
+
+  NasTagPath? _tagPathForPlacement(String placementId) {
+    final reversedNames = <String>[];
+    final visited = <String>{};
+    var current = findTagPlacement(placementId);
+    while (current != null && visited.add(current.id)) {
+      final tag = findTag(current.tagId);
+      if (tag == null) return null;
+      reversedNames.add(tag.name);
+      current = current.parentPlacementId == null
+          ? null
+          : findTagPlacement(current.parentPlacementId!);
+    }
+    if (reversedNames.isEmpty || current != null) return null;
+    final placement = findTagPlacement(placementId);
+    final tag = placement == null ? null : findTag(placement.tagId);
+    if (tag == null) return null;
+    return NasTagPath(
+      placementId: placementId,
+      tagId: tag.id,
+      tagName: tag.name,
+      names: reversedNames.reversed.toList(growable: false),
+    );
+  }
 
   void _markRootScanned(String rootId) {
     _db.execute(

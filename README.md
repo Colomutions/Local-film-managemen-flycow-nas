@@ -1,6 +1,6 @@
 # 幕境 NAS 服务（任务 I）
 
-这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 已提供受 admin scope 保护的媒体根只读查询、扫描任务和已扫描影片/分集的最小元数据更新；它尚未实现分类/标签、海报、备份、设备或源文件管理 API。
+这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 已提供受 admin scope 保护的媒体根、扫描、影片/分集元数据、分类、标签和标签层级管理；它尚未实现海报、备份、设备或源文件管理 API。
 
 ## 技术选型
 
@@ -97,7 +97,7 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 
 任务 I 暂不调用 ffprobe，因此时长和分辨率可为空；它也不提供管理 API、重命名、移动或删除。扫码得到的 SQLite 影片会优先替代内存 fixture；尚未扫描时仍保留 fixture 用于协议测试。
 
-## 任务 K：管理员媒体根、扫描任务与最小影片元数据
+## 任务 K：管理员媒体根、扫描任务、影片元数据与分类标签
 
 当前仅实现以下管理员路由，所有路由都要求显式 `admin` token；缺少 token 为 `401 authentication_required`，viewer token 为 `403 insufficient_scope`：
 
@@ -106,15 +106,21 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 - `GET /api/v1/admin/scan-jobs` 与 `GET /api/v1/admin/scan-jobs/{id}`：读取当前进程内扫描任务的状态、文件数和可用分集数。扫描结果写入 NAS SQLite；任务状态本身在容器重启后不保留。
 - `PATCH /api/v1/admin/movies/{id}`：仅接受 `title` 和/或 `summary`，更新已扫描影片的 NAS SQLite 元数据并返回浏览兼容的影片详情。
 - `PATCH /api/v1/admin/episodes/{id}`：仅接受 `title`，更新已扫描分集的 NAS SQLite 元数据；响应不包含 `relativePath`。
+- `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/categories`：管理 NAS 节点内的分类名称。删除分类会清空影片上的该分类关联，不影响媒体文件。
+- `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/tags`：管理 NAS 节点内的标签名称。删除标签会级联删除其 placement 与影片关联，不影响媒体文件。
+- `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/tag-placements`：用 `tagId` 与可空 `parentPlacementId` 管理标签层级；服务拒绝循环层级。
 
 媒体覆盖保持只读。扫描任务只能扫描当前已配置的 `/media` 根，使用媒体根 ID 和相对路径，不会执行源文件写操作。数据库 migration v2 为媒体根增加扫描时间，用于区分“尚未扫描时的协议 fixture”和“已扫描但目录为空”的真实 SQLite 结果。
 
 重复扫描同一媒体根时仅刷新文件大小、可用性和扫描时间，不会覆盖管理员写入的影片标题、简介或分集标题。
 
+影片 PATCH 还可设置可空 `categoryId` 和完整替换的 `tagPlacementIds`。这些字段只能是服务端已有 ID；浏览 API 仍只返回分类 DTO、标签 DTO 和名称路径，Android 按名称做跨节点聚合时不使用这些节点内 ID。
+
 本切片的本地回归命令：
 
 ```text
 dart run test/admin_api_test.dart
+dart run test/taxonomy_api_test.dart
 ```
 
 示例错误 envelope：

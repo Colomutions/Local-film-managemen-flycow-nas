@@ -118,6 +118,37 @@ class NasHealthServer {
       if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
         return _adminMediaRoots(request);
       }
+      if (request.method == 'GET' && path == '/api/v1/admin/categories') {
+        return _adminCategories(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/categories') {
+        return _createAdminCategory(request);
+      }
+      if (RegExp(r'^/api/v1/admin/categories/[^/]+$').hasMatch(path)) {
+        if (request.method == 'PATCH') return _updateAdminCategory(request);
+        if (request.method == 'DELETE') return _deleteAdminCategory(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/tags') {
+        return _adminTags(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/tags') {
+        return _createAdminTag(request);
+      }
+      if (RegExp(r'^/api/v1/admin/tags/[^/]+$').hasMatch(path)) {
+        if (request.method == 'PATCH') return _updateAdminTag(request);
+        if (request.method == 'DELETE') return _deleteAdminTag(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/tag-placements') {
+        return _adminTagPlacements(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/tag-placements') {
+        return _createAdminTagPlacement(request);
+      }
+      if (RegExp(r'^/api/v1/admin/tag-placements/[^/]+$').hasMatch(path)) {
+        if (request.method == 'PATCH') return _updateAdminTagPlacement(request);
+        if (request.method == 'DELETE')
+          return _deleteAdminTagPlacement(request);
+      }
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
         return _updateAdminMovie(request);
@@ -317,9 +348,15 @@ class NasHealthServer {
         'id': movie.id,
         'title': movie.title,
         'actors': const [],
-        'category': null,
-        'tags': const [],
-        'tagPaths': const [],
+        'category': _categoryForMoviePayload(movie.id),
+        'tags': _libraryDatabase
+            .tagsForMovie(movie.id)
+            .map(_tagPayload)
+            .toList(growable: false),
+        'tagPaths': _libraryDatabase
+            .tagPathsForMovie(movie.id)
+            .map((path) => path.names)
+            .toList(growable: false),
         'episodeCount': movie.episodeCount,
         'durationMs': movie.durationMs,
         'posterUrl': null,
@@ -355,11 +392,184 @@ class NasHealthServer {
         {
           'data': {
             'items': _libraryDatabase.hasScannedMediaRoots
-                ? const <List<String>>[]
+                ? _libraryDatabase
+                    .allTagPaths()
+                    .map((path) => path.names)
+                    .toList(growable: false)
                 : _library.tagPaths(),
           },
         },
       );
+
+  Future<void> _adminCategories(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items': _libraryDatabase
+                .listCategories()
+                .map(_categoryPayload)
+                .toList(growable: false),
+          },
+        },
+      );
+
+  Future<void> _createAdminCategory(HttpRequest request) async {
+    final name = await _requiredName(request);
+    if (name == null || _libraryDatabase.hasCategoryName(name)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final category = _libraryDatabase.createCategory(name);
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': _categoryPayload(category),
+    });
+  }
+
+  Future<void> _updateAdminCategory(HttpRequest request) async {
+    final name = await _requiredName(request);
+    final categoryId = request.uri.pathSegments.last;
+    if (name == null ||
+        _libraryDatabase.hasCategoryName(name, excludingId: categoryId)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final category = _libraryDatabase.updateCategoryName(categoryId, name);
+    if (category == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _categoryPayload(category),
+    });
+  }
+
+  Future<void> _deleteAdminCategory(HttpRequest request) async {
+    if (!_libraryDatabase.deleteCategory(request.uri.pathSegments.last)) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    request.response.statusCode = HttpStatus.noContent;
+    await request.response.close();
+  }
+
+  Future<void> _adminTags(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items': _libraryDatabase
+                .listTags()
+                .map(_tagPayload)
+                .toList(growable: false),
+          },
+        },
+      );
+
+  Future<void> _createAdminTag(HttpRequest request) async {
+    final name = await _requiredName(request);
+    if (name == null || _libraryDatabase.hasTagName(name)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final tag = _libraryDatabase.createTag(name);
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': _tagPayload(tag),
+    });
+  }
+
+  Future<void> _updateAdminTag(HttpRequest request) async {
+    final name = await _requiredName(request);
+    final tagId = request.uri.pathSegments.last;
+    if (name == null || _libraryDatabase.hasTagName(name, excludingId: tagId)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final tag = _libraryDatabase.updateTagName(tagId, name);
+    if (tag == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _tagPayload(tag),
+    });
+  }
+
+  Future<void> _deleteAdminTag(HttpRequest request) async {
+    if (!_libraryDatabase.deleteTag(request.uri.pathSegments.last)) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    request.response.statusCode = HttpStatus.noContent;
+    await request.response.close();
+  }
+
+  Future<void> _adminTagPlacements(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items': _libraryDatabase
+                .listTagPlacements()
+                .map(_tagPlacementPayload)
+                .toList(growable: false),
+          },
+        },
+      );
+
+  Future<void> _createAdminTagPlacement(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final tagId = body?['tagId'];
+    final parentPlacementId = body?['parentPlacementId'];
+    if (body == null ||
+        body.keys.any((key) => key != 'tagId' && key != 'parentPlacementId') ||
+        tagId is! String ||
+        tagId.isEmpty ||
+        (parentPlacementId != null && parentPlacementId is! String) ||
+        _libraryDatabase.findTag(tagId) == null ||
+        (parentPlacementId is String &&
+            _libraryDatabase.findTagPlacement(parentPlacementId) == null)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final placement = _libraryDatabase.createTagPlacement(
+      tagId: tagId,
+      parentPlacementId: parentPlacementId as String?,
+    );
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': _tagPlacementPayload(placement),
+    });
+  }
+
+  Future<void> _updateAdminTagPlacement(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final placementId = request.uri.pathSegments.last;
+    if (body == null ||
+        body.length != 1 ||
+        !body.containsKey('parentPlacementId') ||
+        (body['parentPlacementId'] != null &&
+            body['parentPlacementId'] is! String)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final parentPlacementId = body['parentPlacementId'] as String?;
+    if (_libraryDatabase.findTagPlacement(placementId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (parentPlacementId != null &&
+        (_libraryDatabase.findTagPlacement(parentPlacementId) == null ||
+            _libraryDatabase.isTagPlacementDescendant(
+              candidateParentId: parentPlacementId,
+              placementId: placementId,
+            ))) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final placement = _libraryDatabase.updateTagPlacementParent(
+      placementId: placementId,
+      parentPlacementId: parentPlacementId,
+    );
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _tagPlacementPayload(placement!),
+    });
+  }
+
+  Future<void> _deleteAdminTagPlacement(HttpRequest request) async {
+    if (!_libraryDatabase.deleteTagPlacement(request.uri.pathSegments.last)) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    request.response.statusCode = HttpStatus.noContent;
+    await request.response.close();
+  }
 
   Future<void> _adminMediaRoots(HttpRequest request) => _writeJson(
         request.response,
@@ -377,18 +587,50 @@ class NasHealthServer {
   Future<void> _updateAdminMovie(HttpRequest request) async {
     final body = await _readJsonBody(request);
     if (body == null ||
-        body.keys.any((key) => key != 'title' && key != 'summary')) {
+        body.keys.any((key) =>
+            key != 'title' &&
+            key != 'summary' &&
+            key != 'categoryId' &&
+            key != 'tagPlacementIds')) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final rawTitle = body['title'];
     final rawSummary = body['summary'];
+    final hasCategoryId = body.containsKey('categoryId');
+    final rawCategoryId = body['categoryId'];
+    final hasTagPlacementIds = body.containsKey('tagPlacementIds');
+    final rawTagPlacementIds = body['tagPlacementIds'];
     if ((rawTitle != null && rawTitle is! String) ||
         (rawSummary != null && rawSummary is! String) ||
-        (rawTitle == null && rawSummary == null)) {
+        (rawTitle == null &&
+            rawSummary == null &&
+            !hasCategoryId &&
+            !hasTagPlacementIds) ||
+        (hasCategoryId && rawCategoryId != null && rawCategoryId is! String) ||
+        (hasTagPlacementIds && rawTagPlacementIds is! List)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final title = (rawTitle as String?)?.trim();
     if (title != null && title.isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final categoryId = rawCategoryId as String?;
+    if (hasCategoryId &&
+        (categoryId?.isEmpty == true ||
+            (categoryId != null &&
+                _libraryDatabase.findCategory(categoryId) == null))) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final tagPlacementIds = hasTagPlacementIds
+        ? (rawTagPlacementIds as List)
+            .map((value) => value is String ? value : null)
+            .toList(growable: false)
+        : const <String?>[];
+    if (tagPlacementIds.any((id) => id == null || id!.isEmpty) ||
+        tagPlacementIds.toSet().length != tagPlacementIds.length ||
+        tagPlacementIds.any(
+          (id) => _libraryDatabase.findTagPlacement(id!) == null,
+        )) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final movie = _libraryDatabase.updateMovieMetadata(
@@ -399,8 +641,16 @@ class NasHealthServer {
     if (movie == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
+    _libraryDatabase.setMovieTaxonomy(
+      movieId: movie.id,
+      updateCategory: hasCategoryId,
+      categoryId: categoryId,
+      updateTagPlacements: hasTagPlacementIds,
+      tagPlacementIds: tagPlacementIds.cast<String>(),
+    );
+    final updatedMovie = _libraryDatabase.findMovieForAdmin(movie.id)!;
     await _writeJson(request.response, HttpStatus.ok, {
-      'data': await _databaseDetails(movie),
+      'data': await _databaseDetails(updatedMovie),
     });
   }
 
@@ -494,6 +744,47 @@ class NasHealthServer {
         'updatedAt': root.updatedAt,
         'lastScannedAt': root.lastScannedAt,
       };
+
+  Map<String, Object?> _categoryPayload(NasLibraryCategory category) => {
+        'id': category.id,
+        'name': category.name,
+        'createdAt': category.createdAt,
+        'updatedAt': category.updatedAt,
+      };
+
+  Map<String, Object?>? _categoryForMoviePayload(String movieId) {
+    final category = _libraryDatabase.categoryForMovie(movieId);
+    return category == null ? null : _categoryPayload(category);
+  }
+
+  Map<String, Object?> _tagPayload(NasLibraryTag tag) => {
+        'id': tag.id,
+        'name': tag.name,
+        'createdAt': tag.createdAt,
+        'updatedAt': tag.updatedAt,
+      };
+
+  Map<String, Object?> _tagPlacementPayload(NasTagPlacement placement) {
+    final path = _libraryDatabase.allTagPaths().where(
+          (candidate) => candidate.placementId == placement.id,
+        );
+    return {
+      'id': placement.id,
+      'tagId': placement.tagId,
+      'parentPlacementId': placement.parentPlacementId,
+      'path': path.isEmpty ? const <String>[] : path.single.names,
+      'createdAt': placement.createdAt,
+      'updatedAt': placement.updatedAt,
+    };
+  }
+
+  Future<String?> _requiredName(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null || body.length != 1 || body['name'] is! String)
+      return null;
+    final name = (body['name'] as String).trim();
+    return name.isEmpty ? null : name;
+  }
 
   Map<String, Object?> _scanJobPayload(_ScanJob job) => {
         'id': job.id,
