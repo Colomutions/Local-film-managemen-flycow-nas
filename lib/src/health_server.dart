@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'artwork_service.dart';
 import 'auth.dart';
 import 'config.dart';
 import 'fixture_library.dart';
@@ -17,6 +18,7 @@ class NasHealthServer {
     NasFixtureLibrary? library,
     NasMediaService? mediaService,
     NasLibraryDatabase? libraryDatabase,
+    NasArtworkService? artworkService,
   })  : _stateStore = stateStore ?? NasPersistentStateStore(config.dataDir),
         _library = library ?? NasFixtureLibrary(),
         _mediaService = mediaService ??
@@ -25,13 +27,15 @@ class NasHealthServer {
               fixtureRelativePath: config.fixtureMediaRelativePath,
             ),
         _libraryDatabase =
-            libraryDatabase ?? NasLibraryDatabase(config.dataDir);
+            libraryDatabase ?? NasLibraryDatabase(config.dataDir),
+        _artworkService = artworkService ?? NasArtworkService(config.dataDir);
 
   final NasConfig config;
   final NasPersistentStateStore _stateStore;
   final NasFixtureLibrary _library;
   final NasMediaService _mediaService;
   final NasLibraryDatabase _libraryDatabase;
+  final NasArtworkService _artworkService;
   HttpServer? _server;
   NasPersistentState? _state;
   final Map<String, _PairingSession> _pairingSessions = {};
@@ -152,6 +156,10 @@ class NasHealthServer {
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
         return _updateAdminMovie(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/movies/[^/]+/poster$').hasMatch(path)) {
+        return _uploadAdminMoviePoster(request);
       }
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/episodes/[^/]+$').hasMatch(path)) {
@@ -359,7 +367,9 @@ class NasHealthServer {
             .toList(growable: false),
         'episodeCount': movie.episodeCount,
         'durationMs': movie.durationMs,
-        'posterUrl': null,
+        'posterUrl': movie.posterFileName == null
+            ? null
+            : '/api/v1/assets/posters/${movie.id}',
         'isFavorite': false,
         'playCount': 0,
         'resumePositionMs': 0,
@@ -817,16 +827,78 @@ class NasHealthServer {
       );
 
   Future<void> _poster(HttpRequest request) async {
-    final bytes = _library.poster(request.uri.pathSegments.last);
-    if (bytes == null) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    final movieId = request.uri.pathSegments.last;
+    final databaseMovie = _libraryDatabase.findMovie(movieId);
+    if (databaseMovie != null) {
+      final artwork =
+          await _artworkService.poster(databaseMovie.posterFileName);
+      if (artwork == null) {
+        return _error(request, HttpStatus.notFound, 'resource_not_found');
+      }
+      request.response.statusCode = HttpStatus.ok;
+      request.response.headers.contentType =
+          ContentType.parse(artwork.mimeType);
+      request.response.headers.contentLength = await artwork.file.length();
+      request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+      if (request.method == 'GET') {
+        await request.response.addStream(artwork.file.openRead());
+      }
+      return request.response.close();
     }
+    final bytes = _library.poster(movieId);
+    if (bytes == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
     request.response.statusCode = HttpStatus.ok;
     request.response.headers.contentType = ContentType('image', 'png');
     request.response.headers.contentLength = bytes.length;
     request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
     if (request.method == 'GET') request.response.add(bytes);
     await request.response.close();
+  }
+
+  Future<void> _uploadAdminMoviePoster(HttpRequest request) async {
+    final movieId = request.uri.pathSegments[4];
+    final movie = _libraryDatabase.findMovieForAdmin(movieId);
+    final mimeType = request.headers.contentType?.mimeType;
+    if (movie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (mimeType == null ||
+        !const {'image/png', 'image/jpeg', 'image/webp'}.contains(mimeType) ||
+        request.headers.contentLength > NasArtworkService.maxPosterBytes) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final bytes = <int>[];
+    await for (final chunk in request) {
+      if (bytes.length + chunk.length > NasArtworkService.maxPosterBytes) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
+      }
+      bytes.addAll(chunk);
+    }
+    if (!NasArtworkService.isValidPosterBytes(
+      mimeType: mimeType,
+      bytes: bytes,
+    )) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final fileName = await _artworkService.savePoster(
+      movieId: movieId,
+      mimeType: mimeType,
+      bytes: bytes,
+    );
+    final updatedMovie = _libraryDatabase.updateMoviePosterFileName(
+      movieId: movieId,
+      posterFileName: fileName,
+    );
+    if (updatedMovie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (movie.posterFileName != null && movie.posterFileName != fileName) {
+      await _artworkService.deletePoster(movie.posterFileName);
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'posterUrl': '/api/v1/assets/posters/$movieId'},
+    });
   }
 
   Future<void> _createPlaybackSession(

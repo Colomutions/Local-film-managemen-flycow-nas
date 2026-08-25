@@ -10,6 +10,7 @@ class NasLibraryMovie {
     required this.id,
     required this.title,
     required this.summary,
+    required this.posterFileName,
     required this.episodeCount,
     required this.durationMs,
     required this.updatedAt,
@@ -18,6 +19,7 @@ class NasLibraryMovie {
   final String id;
   final String title;
   final String summary;
+  final String? posterFileName;
   final int episodeCount;
   final int? durationMs;
   final String updatedAt;
@@ -254,6 +256,13 @@ class NasLibraryDatabase {
         [3, _now()],
       );
     }
+    if (current < 4) {
+      _db.execute('ALTER TABLE movies ADD COLUMN poster_file_name TEXT');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [4, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -382,7 +391,7 @@ class NasLibraryDatabase {
   List<NasLibraryMovie> listMovies({String query = ''}) {
     final queryLike = '%${query.trim()}%';
     final rows = _db.select('''
-      SELECT m.id, m.title, m.summary, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.summary, m.poster_file_name, m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m JOIN episodes e ON e.movie_id = m.id
       WHERE e.is_available = 1 AND (? = '%%' OR lower(m.title) LIKE lower(?))
@@ -393,6 +402,7 @@ class NasLibraryDatabase {
               id: row['id'] as String,
               title: row['title'] as String,
               summary: row['summary'] as String,
+              posterFileName: row['poster_file_name'] as String?,
               episodeCount: row['episode_count'] as int,
               durationMs: (row['duration_ms'] as int?) == 0
                   ? null
@@ -420,7 +430,7 @@ class NasLibraryDatabase {
 
   NasLibraryMovie? findMovieForAdmin(String movieId) {
     final rows = _db.select('''
-      SELECT m.id, m.title, m.summary, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.summary, m.poster_file_name, m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m LEFT JOIN episodes e ON e.movie_id = m.id
       WHERE m.id = ?
@@ -732,10 +742,23 @@ class NasLibraryDatabase {
     return true;
   }
 
+  NasLibraryMovie? updateMoviePosterFileName({
+    required String movieId,
+    required String posterFileName,
+  }) {
+    if (findMovieForAdmin(movieId) == null) return null;
+    _db.execute(
+      'UPDATE movies SET poster_file_name = ?, updated_at = ? WHERE id = ?',
+      [posterFileName, _now(), movieId],
+    );
+    return findMovieForAdmin(movieId);
+  }
+
   NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
         id: row['id'] as String,
         title: row['title'] as String,
         summary: row['summary'] as String,
+        posterFileName: row['poster_file_name'] as String?,
         episodeCount: row['episode_count'] as int,
         durationMs: (row['duration_ms'] as int?) == 0
             ? null
