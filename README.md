@@ -2,9 +2,11 @@
 
 这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 已提供受 admin scope 保护的媒体根、扫描、影片/分集元数据、分类、标签、标签层级、海报、设备管理与备份 API；它尚未实现源文件管理 API。
 
+第一次部署请先阅读 [`docs/飞牛NAS小白部署指南.md`](docs/飞牛NAS小白部署指南.md)，其中包含目录说明、`.env`、镜像加速、最小启动、只读媒体挂载、扫描和常见故障处理。
+
 ## 技术选型
 
-- **运行时：Dart 3.3 + `dart:io` HTTP。** 当前 Windows 服务已将协议核心的依赖边界抽离为 Dart 接口；本项目先使用零第三方依赖的独立 Dart 进程，避免引入 Flutter、Drift、Windows 路径或桌面生命周期。
+- **运行时：Dart 3.13.2 + `dart:io` HTTP。** 当前 Windows 服务已将协议核心的依赖边界抽离为 Dart 接口；本项目使用独立 Dart 进程与 `sqlite3` 持久层，避免引入 Flutter、Drift、Windows 路径或桌面生命周期。
 - **镜像：`dart:3.3-sdk` 构建，Debian Bookworm 运行。** Intel N150 使用 `linux/amd64`；镜像不需要 NAS 的 GUI 或 Docker Socket。
 - **安全：** 容器没有特权模式，使用可配置的 `PUID:PGID`，并启用 `no-new-privileges`。
 

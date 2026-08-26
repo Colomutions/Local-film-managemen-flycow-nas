@@ -17,8 +17,8 @@ Future<void> main(List<String> arguments) async {
   );
 
   await Future.any<void>([
-    ProcessSignal.sigint.watch.first,
-    ProcessSignal.sigterm.watch.first,
+    ProcessSignal.sigint.watch().first,
+    ProcessSignal.sigterm.watch().first,
   ]);
   await server.stop();
 }
