@@ -66,13 +66,13 @@ class NasBackupService {
         File(
             '${temporary.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite'),
       );
-      await _copyFileIfExists(
+      await _copySanitizedJsonFile(
         File(
             '$dataDir${Platform.pathSeparator}state${Platform.pathSeparator}server.json'),
         File(
             '${temporary.path}${Platform.pathSeparator}state${Platform.pathSeparator}server.json'),
       );
-      await _copyFileIfExists(
+      await _copySanitizedJsonFile(
         File(
             '$dataDir${Platform.pathSeparator}config${Platform.pathSeparator}config.json'),
         File(
@@ -135,11 +135,46 @@ class NasBackupService {
     return null;
   }
 
-  Future<void> _copyFileIfExists(File source, File target) async {
+  /// Copies a persisted JSON file while removing credential-bearing fields.
+  ///
+  /// The live state file stores token hashes under `tokens`; those hashes are
+  /// deliberately omitted from backups. Optional config files are sanitized
+  /// recursively so a future config key cannot accidentally place a pairing
+  /// code or token in a backup artifact.
+  Future<void> _copySanitizedJsonFile(File source, File target) async {
     if (!await source.exists()) return;
+    final decoded = jsonDecode(await source.readAsString());
+    final sanitized = _sanitizeJson(decoded, parentKey: '');
     await target.parent.create(recursive: true);
-    await source.copy(target.path);
+    await target.writeAsString(jsonEncode(sanitized), flush: true);
   }
+
+  Object? _sanitizeJson(Object? value, {required String parentKey}) {
+    if (value is Map) {
+      final result = <String, Object?>{};
+      value.forEach((key, child) {
+        final name = key.toString();
+        final normalized = name.toLowerCase();
+        // `tokens` is a map keyed by token hash in server.json. Remove the
+        // entire field rather than attempting to retain device metadata.
+        if (normalized == 'tokens' || _sensitiveKey(normalized)) return;
+        result[name] = _sanitizeJson(child, parentKey: normalized);
+      });
+      return result;
+    }
+    if (value is List) {
+      return value
+          .map((child) => _sanitizeJson(child, parentKey: parentKey))
+          .toList(growable: false);
+    }
+    return value;
+  }
+
+  bool _sensitiveKey(String normalized) =>
+      normalized.contains('token') ||
+      normalized.contains('pairing') ||
+      normalized.contains('password') ||
+      normalized.contains('secret');
 
   Future<void> _copyDirectoryIfExists(
       Directory source, Directory target) async {

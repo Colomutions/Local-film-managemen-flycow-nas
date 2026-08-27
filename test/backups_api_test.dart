@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:sqlite3/sqlite3.dart';
 
 import '../lib/mujing_nas.dart';
+import '../lib/src/auth.dart';
 
 Future<void> main() async {
   final directory =
@@ -34,7 +35,8 @@ Future<void> main() async {
       '${dataDir.path}${Platform.pathSeparator}config${Platform.pathSeparator}config.json',
     );
     await configFile.parent.create(recursive: true);
-    await configFile.writeAsString('{"backupTest":true}');
+    await configFile.writeAsString(
+        '{"backupTest":true,"pairingCode":"do-not-back-up","accessToken":"secret"}');
     final posterFile = File(
       '${dataDir.path}${Platform.pathSeparator}artwork${Platform.pathSeparator}posters${Platform.pathSeparator}test.png',
     );
@@ -142,18 +144,33 @@ Future<void> main() async {
     } finally {
       database.dispose();
     }
-    _expect(
-      await File(
-        '${backupDir.path}${Platform.pathSeparator}state${Platform.pathSeparator}server.json',
-      ).exists(),
-      'backup contains persistent service state',
+    final backupState = File(
+      '${backupDir.path}${Platform.pathSeparator}state${Platform.pathSeparator}server.json',
     );
     _expect(
-      await File(
-        '${backupDir.path}${Platform.pathSeparator}config${Platform.pathSeparator}config.json',
-      ).exists(),
-      'backup contains persisted configuration when present',
+        await backupState.exists(), 'backup contains persistent service state');
+    final stateText = await backupState.readAsString();
+    final stateJson = jsonDecode(stateText) as Map<String, dynamic>;
+    _expect(
+        stateJson['serverId'] is String, 'backup preserves server identity');
+    _expect(
+        !stateJson.containsKey('tokens') &&
+            !stateText.contains('tokenHash') &&
+            !stateText.contains(sha256Hex(viewer)),
+        'backup state omits token material');
+
+    final backupConfig = File(
+      '${backupDir.path}${Platform.pathSeparator}config${Platform.pathSeparator}config.json',
     );
+    _expect(await backupConfig.exists(),
+        'backup contains persisted configuration when present');
+    final configText = await backupConfig.readAsString();
+    _expect(
+        configText.contains('backupTest') &&
+            !configText.contains('pairingCode') &&
+            !configText.contains('accessToken') &&
+            !configText.contains('do-not-back-up'),
+        'backup config omits credential fields');
     _expect(
       await File(
         '${backupDir.path}${Platform.pathSeparator}artwork${Platform.pathSeparator}posters${Platform.pathSeparator}test.png',
