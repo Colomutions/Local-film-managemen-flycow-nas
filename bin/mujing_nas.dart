@@ -10,16 +10,40 @@ Future<void> main(List<String> arguments) async {
     return;
   }
 
-  final server = NasHealthServer(config);
-  await server.start();
-  stdout.writeln(
-    'Mujing NAS health service listening on ${config.bindHost}:${server.port}.',
+  final logger = NasDiagnosticLogger.forConfig(
+    config.dataDir,
+    minimumLevel: config.logLevel,
+    diagnosticMode: config.diagnosticMode,
+    maxBytes: config.logMaxBytes,
+    retentionFiles: config.logRetentionFiles,
   );
-
-  await Future.any<void>([
-    ProcessSignal.sigint.watch().first,
-    ProcessSignal.sigterm.watch().first,
-  ]);
-  await server.stop();
+  await runZonedGuarded(() async {
+    logger.event('process.start', fields: {
+      'component': 'nas.process',
+      'port': config.port,
+    });
+    final server = NasHealthServer(config, logger: logger);
+    await server.start();
+    logger.event('process.ready', fields: {
+      'component': 'nas.process',
+      'port': server.port,
+    });
+    await Future.any<void>([
+      ProcessSignal.sigint.watch().first,
+      ProcessSignal.sigterm.watch().first,
+    ]);
+    logger.event('process.stop', fields: {
+      'component': 'nas.process',
+      'cancelReason': 'signal',
+    });
+    await server.stop();
+  }, (error, stackTrace) {
+    logger.event('process.uncaught_error', level: 'ERROR', fields: {
+      'component': 'nas.process',
+      'outcome': 'error',
+      'errorType': error.runtimeType.toString(),
+      'stack': stackTrace.toString(),
+    });
+  });
 }
 

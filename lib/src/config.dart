@@ -11,6 +11,10 @@ class NasConfig {
     required this.dataDir,
     required this.mediaDir,
     required this.timezone,
+    this.logLevel = 'INFO',
+    this.diagnosticMode = false,
+    this.logMaxBytes = 2 * 1024 * 1024,
+    this.logRetentionFiles = 3,
   });
 
   factory NasConfig.fromEnvironment(Map<String, String> environment) {
@@ -31,6 +35,10 @@ class NasConfig {
       dataDir: _value(environment, 'MUJING_DATA_DIR', '/data'),
       mediaDir: _value(environment, 'MUJING_MEDIA_DIR', '/media'),
       timezone: _value(environment, 'MUJING_TIMEZONE', 'Asia/Shanghai'),
+      logLevel: _logLevel(environment),
+      diagnosticMode: _boolValue(environment, 'MUJING_DIAGNOSTIC_MODE', false),
+      logMaxBytes: _positiveInt(environment, 'MUJING_LOG_MAX_BYTES', 2 * 1024 * 1024),
+      logRetentionFiles: _positiveInt(environment, 'MUJING_LOG_RETENTION_FILES', 3),
     );
   }
 
@@ -45,6 +53,27 @@ class NasConfig {
   final String dataDir;
   final String mediaDir;
   final String timezone;
+  final String logLevel;
+  final bool diagnosticMode;
+  final int logMaxBytes;
+  final int logRetentionFiles;
+
+  static String _logLevel(Map<String, String> environment) {
+    final value = _value(environment, 'MUJING_LOG_LEVEL', 'INFO').toUpperCase();
+    if (!const {'DEBUG', 'INFO', 'WARN', 'ERROR'}.contains(value)) {
+      throw ArgumentError.value(value, 'MUJING_LOG_LEVEL', 'must be DEBUG, INFO, WARN, or ERROR');
+    }
+    return value;
+  }
+
+  static int _positiveInt(Map<String, String> environment, String key, int defaultValue) {
+    final value = _optionalValue(environment, key);
+    final parsed = value == null ? defaultValue : int.tryParse(value);
+    if (parsed == null || parsed < 1) {
+      throw ArgumentError.value(value, key, 'must be a positive integer');
+    }
+    return parsed;
+  }
 
   static String _value(
     Map<String, String> environment,

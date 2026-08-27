@@ -1,3 +1,5 @@
+// The request dispatcher intentionally remains serial; logging does not alter
+// its await-for scheduling or request concurrency.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -6,6 +8,7 @@ import 'artwork_service.dart';
 import 'auth.dart';
 import 'backup_service.dart';
 import 'config.dart';
+import 'diagnostic_log.dart';
 import 'fixture_library.dart';
 import 'library_database.dart';
 import 'media_service.dart';
@@ -21,6 +24,7 @@ class NasHealthServer {
     NasLibraryDatabase? libraryDatabase,
     NasArtworkService? artworkService,
     NasBackupService? backupService,
+    NasDiagnosticLogger? logger,
   })  : _stateStore = stateStore ?? NasPersistentStateStore(config.dataDir),
         _library = library ?? NasFixtureLibrary(),
         _mediaService = mediaService ??
@@ -31,7 +35,8 @@ class NasHealthServer {
         _libraryDatabase =
             libraryDatabase ?? NasLibraryDatabase(config.dataDir),
         _artworkService = artworkService ?? NasArtworkService(config.dataDir),
-        _backupService = backupService ?? NasBackupService(config.dataDir);
+        _backupService = backupService ?? NasBackupService(config.dataDir),
+        _logger = logger ?? NasDiagnosticLogger();
 
   final NasConfig config;
   final NasPersistentStateStore _stateStore;
@@ -40,6 +45,7 @@ class NasHealthServer {
   final NasLibraryDatabase _libraryDatabase;
   final NasArtworkService _artworkService;
   final NasBackupService _backupService;
+  final NasDiagnosticLogger _logger;
   HttpServer? _server;
   NasPersistentState? _state;
   final Map<String, _PairingSession> _pairingSessions = {};
@@ -47,6 +53,8 @@ class NasHealthServer {
   final Map<String, _ScanJob> _scanJobs = {};
   _FixturePlaybackState? _fixturePlaybackState;
   NasMediaRoot? _configuredMediaRoot;
+  int _activeRequests = 0;
+  int _activeStreams = 0;
 
   bool get isRunning => _server != null;
   int get port => _server?.port ?? config.port;
@@ -55,6 +63,7 @@ class NasHealthServer {
     if (_server != null) {
       throw StateError('NAS health server is already running.');
     }
+    _logger.event('service.start', fields: {'component': 'nas.service', 'phase': 'startup'});
     _state =
         await _stateStore.load() ?? NasPersistentState(serverId: newUuidV4());
     await _persistState();
@@ -71,10 +80,24 @@ class NasHealthServer {
     }
     final server = await HttpServer.bind(config.bindHost, config.port);
     _server = server;
+    _logger.event('service.ready', fields: {
+      'component': 'nas.service',
+      'serverIdShort': nasShortId(_state!.serverId),
+      'port': server.port,
+      'bindHost': config.bindHost,
+      'activeRequests': _activeRequests,
+      'activeStreams': _activeStreams,
+    });
     unawaited(_serve(server));
   }
 
   Future<void> stop() async {
+    _logger.event('service.stop', fields: {
+      'component': 'nas.service',
+      'activeRequests': _activeRequests,
+      'activeStreams': _activeStreams,
+      'cancelReason': 'shutdown',
+    });
     final server = _server;
     _server = null;
     _pairingSessions.clear();
@@ -91,156 +114,222 @@ class NasHealthServer {
       }
     } on HttpException {
       // A client may disconnect while a health response is being sent.
+      _logger.event('http.transport_error', level: 'WARN', fields: {
+        'component': 'nas.http',
+        'outcome': 'disconnect',
+        'errorType': 'HttpException',
+      });
     }
   }
 
   Future<void> _handle(HttpRequest request) async {
+    final stopwatch = Stopwatch()..start();
+    final traceId = _safeIncomingId(request.headers.value('x-mujing-trace-id'), 't');
+    final requestId = _safeIncomingId(request.headers.value('x-mujing-request-id'), 'r');
+    final route = nasRouteTemplate(request.uri.path);
+    _activeRequests++;
+    _logger.event('http.request.start', fields: {
+      'component': 'nas.http',
+      'traceId': traceId,
+      'requestId': requestId,
+      'method': request.method,
+      'route': route,
+      'phase': 'handler_start',
+      'pendingRequests': 0,
+      'activeRequests': _activeRequests,
+      'activeStreams': _activeStreams,
+    });
     try {
       final path = request.uri.path;
       if (path == '/health') {
-        return _health(request);
+        return await _health(request);
       }
       if (request.method == 'GET' && path == '/api/v1/server-info') {
-        return _serverInfo(request);
+        return await _serverInfo(request);
       }
       if (request.method == 'POST' && path == '/api/v1/pairing/sessions') {
-        return _createPairingSession(request);
+        return await _createPairingSession(request);
       }
       if (request.method == 'POST' &&
           RegExp(r'^/api/v1/pairing/sessions/[^/]+/confirm$').hasMatch(path)) {
-        return _confirmPairing(request);
+        return await _confirmPairing(request);
       }
       if (!path.startsWith('/api/v1/')) {
-        return _error(request, HttpStatus.notFound, 'resource_not_found');
+        return await _error(request, HttpStatus.notFound, 'resource_not_found');
       }
 
       final tokenHash = _authenticatedTokenHash(request);
       final device = tokenHash == null ? null : _state!.tokens[tokenHash];
       if (device == null || tokenHash == null) {
-        return _error(
+        return await _error(
             request, HttpStatus.unauthorized, 'authentication_required');
       }
       if (path.startsWith('/api/v1/admin/') && device.scope != 'admin') {
-        return _error(request, HttpStatus.forbidden, 'insufficient_scope');
+        return await _error(request, HttpStatus.forbidden, 'insufficient_scope');
       }
       if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
-        return _adminMediaRoots(request);
+        return await _adminMediaRoots(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/devices') {
-        return _adminDevices(request);
+        return await _adminDevices(request);
       }
       if (request.method == 'DELETE' &&
           RegExp(r'^/api/v1/admin/devices/[^/]+$').hasMatch(path)) {
-        return _revokeAdminDevice(request);
+        return await _revokeAdminDevice(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/backups') {
-        return _createAdminBackup(request);
+        return await _createAdminBackup(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/backups') {
-        return _adminBackups(request);
+        return await _adminBackups(request);
       }
       if (request.method == 'GET' &&
           RegExp(r'^/api/v1/admin/backups/[^/]+$').hasMatch(path)) {
-        return _adminBackup(request);
+        return await _adminBackup(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/categories') {
-        return _adminCategories(request);
+        return await _adminCategories(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/categories') {
-        return _createAdminCategory(request);
+        return await _createAdminCategory(request);
       }
       if (RegExp(r'^/api/v1/admin/categories/[^/]+$').hasMatch(path)) {
-        if (request.method == 'PATCH') return _updateAdminCategory(request);
-        if (request.method == 'DELETE') return _deleteAdminCategory(request);
+        if (request.method == 'PATCH') return await _updateAdminCategory(request);
+        if (request.method == 'DELETE') return await _deleteAdminCategory(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/tags') {
-        return _adminTags(request);
+        return await _adminTags(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/tags') {
-        return _createAdminTag(request);
+        return await _createAdminTag(request);
       }
       if (RegExp(r'^/api/v1/admin/tags/[^/]+$').hasMatch(path)) {
-        if (request.method == 'PATCH') return _updateAdminTag(request);
-        if (request.method == 'DELETE') return _deleteAdminTag(request);
+        if (request.method == 'PATCH') return await _updateAdminTag(request);
+        if (request.method == 'DELETE') return await _deleteAdminTag(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/tag-placements') {
-        return _adminTagPlacements(request);
+        return await _adminTagPlacements(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/tag-placements') {
-        return _createAdminTagPlacement(request);
+        return await _createAdminTagPlacement(request);
       }
       if (RegExp(r'^/api/v1/admin/tag-placements/[^/]+$').hasMatch(path)) {
-        if (request.method == 'PATCH') return _updateAdminTagPlacement(request);
+        if (request.method == 'PATCH') return await _updateAdminTagPlacement(request);
         if (request.method == 'DELETE')
-          return _deleteAdminTagPlacement(request);
+          return await _deleteAdminTagPlacement(request);
       }
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
-        return _updateAdminMovie(request);
+        return await _updateAdminMovie(request);
       }
       if (request.method == 'POST' &&
           RegExp(r'^/api/v1/admin/movies/[^/]+/poster$').hasMatch(path)) {
-        return _uploadAdminMoviePoster(request);
+        return await _uploadAdminMoviePoster(request);
       }
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/episodes/[^/]+$').hasMatch(path)) {
-        return _updateAdminEpisode(request);
+        return await _updateAdminEpisode(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/scan-jobs') {
-        return _createScanJob(request);
+        return await _createScanJob(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/scan-jobs') {
-        return _listScanJobs(request);
+        return await _listScanJobs(request);
       }
       if (request.method == 'GET' &&
           RegExp(r'^/api/v1/admin/scan-jobs/[^/]+$').hasMatch(path)) {
-        return _scanJob(request);
+        return await _scanJob(request);
       }
       if (request.method == 'GET' && path == '/api/v1/movies') {
-        return _movies(request);
+        return await _movies(request);
       }
       if (request.method == 'GET' &&
           RegExp(r'^/api/v1/movies/[^/]+$').hasMatch(path)) {
-        return _movieDetails(request);
+        return await _movieDetails(request);
       }
       if (request.method == 'GET' && path == '/api/v1/tag-paths') {
-        return _tagPaths(request);
+        return await _tagPaths(request);
       }
       if (request.method == 'GET' && path == '/api/v1/favorites') {
-        return _emptyItems(request);
+        return await _emptyItems(request);
       }
       if (request.method == 'GET' && path == '/api/v1/history') {
-        return _emptyItems(request);
+        return await _emptyItems(request);
       }
       if ((request.method == 'GET' || request.method == 'HEAD') &&
           RegExp(r'^/api/v1/assets/posters/[^/]+$').hasMatch(path)) {
-        return _poster(request);
+        return await _poster(request);
       }
       if (request.method == 'POST' && path == '/api/v1/playback/sessions') {
-        return _createPlaybackSession(request, tokenHash);
+        return await _createPlaybackSession(request, tokenHash);
       }
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/playback/sessions/[^/]+/progress$')
               .hasMatch(path)) {
-        return _savePlaybackProgress(request, tokenHash);
+        return await _savePlaybackProgress(request, tokenHash);
       }
       if (request.method == 'DELETE' &&
           RegExp(r'^/api/v1/playback/sessions/[^/]+$').hasMatch(path)) {
-        return _deletePlaybackSession(request, tokenHash);
+        return await _deletePlaybackSession(request, tokenHash);
       }
       if ((request.method == 'GET' || request.method == 'HEAD') &&
           RegExp(r'^/api/v1/playback/sessions/[^/]+/stream$').hasMatch(path)) {
-        return _streamPlayback(request, tokenHash);
+        return await _streamPlayback(request, tokenHash);
       }
       await _error(request, HttpStatus.notFound, 'resource_not_found');
-    } catch (_) {
+    } catch (error, stackTrace) {
+      _logger.event('http.request.error', level: 'ERROR', fields: {
+        'component': 'nas.http',
+        'traceId': traceId,
+        'requestId': requestId,
+        'method': request.method,
+        'route': route,
+        'outcome': 'error',
+        'errorType': error.runtimeType.toString(),
+        'errorCode': 'service_unavailable',
+        'stack': stackTrace.toString(),
+      });
       try {
         await _error(
             request, HttpStatus.internalServerError, 'service_unavailable');
       } catch (_) {
         await request.response.close();
       }
+    } finally {
+      stopwatch.stop();
+      final response = request.response;
+      final status = response.statusCode;
+      final bytes = response.headers.contentLength >= 0 ? response.headers.contentLength : null;
+      _logger.event('http.response.headers', fields: {
+        'component': 'nas.http',
+        'traceId': traceId,
+        'requestId': requestId,
+        'method': request.method,
+        'route': route,
+        'status': status,
+        'contentLength': bytes,
+        'activeRequests': _activeRequests,
+        'activeStreams': _activeStreams,
+      });
+      _logger.event('http.response.end', level: status >= 500 ? 'ERROR' : (status >= 400 ? 'WARN' : 'DEBUG'), fields: {
+        'component': 'nas.http',
+        'traceId': traceId,
+        'requestId': requestId,
+        'method': request.method,
+        'route': route,
+        'status': status,
+        'outcome': status >= 400 ? 'http_error' : 'success',
+        'durationMs': stopwatch.elapsedMilliseconds,
+        'bytes': bytes,
+        'phase': 'handler_end',
+      });
+      _activeRequests--;
     }
+  }
+
+  String _safeIncomingId(String? value, String prefix) {
+    if (value != null && RegExp(r'^[A-Za-z0-9_-]{1,64}$').hasMatch(value)) return value;
+    return _logger.newId(prefix);
   }
 
   Future<void> _health(HttpRequest request) async {
@@ -647,12 +736,30 @@ class NasHealthServer {
   }
 
   Future<void> _createAdminBackup(HttpRequest request) async {
-    final backup = await _backupService.create(
-      databaseSnapshot: _libraryDatabase.createBackupSnapshot,
-    );
-    await _writeJson(request.response, HttpStatus.created, {
-      'data': _backupPayload(backup),
-    });
+    final watch = Stopwatch()..start();
+    _logger.event('backup.start', fields: {'component': 'nas.backup'});
+    try {
+      final backup = await _backupService.create(
+        databaseSnapshot: _libraryDatabase.createBackupSnapshot,
+      );
+      _logger.event('backup.end', fields: {
+        'component': 'nas.backup',
+        'outcome': 'success',
+        'durationMs': watch.elapsedMilliseconds,
+        'bytes': backup.sizeBytes,
+      });
+      await _writeJson(request.response, HttpStatus.created, {
+        'data': _backupPayload(backup),
+      });
+    } catch (error) {
+      _logger.event('backup.error', level: 'ERROR', fields: {
+        'component': 'nas.backup',
+        'outcome': 'error',
+        'durationMs': watch.elapsedMilliseconds,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    }
   }
 
   Future<void> _adminBackups(HttpRequest request) async {
@@ -716,7 +823,7 @@ class NasHealthServer {
             .map((value) => value is String ? value : null)
             .toList(growable: false)
         : const <String?>[];
-    if (tagPlacementIds.any((id) => id == null || id!.isEmpty) ||
+    if (tagPlacementIds.any((id) => id == null || id.isEmpty) ||
         tagPlacementIds.toSet().length != tagPlacementIds.length ||
         tagPlacementIds.any(
           (id) => _libraryDatabase.findTagPlacement(id!) == null,
@@ -809,6 +916,11 @@ class NasHealthServer {
   Future<void> _runScanJob(_ScanJob job) async {
     job.status = 'running';
     job.startedAt = DateTime.now().toUtc();
+    final watch = Stopwatch()..start();
+    _logger.event('scan.start', fields: {
+      'component': 'nas.scan',
+      'sessionId': nasShortId(job.id),
+    });
     try {
       final result = await _libraryDatabase.scanMediaRoot(
         mediaRootId: job.mediaRootId,
@@ -817,9 +929,24 @@ class NasHealthServer {
       job.status = 'succeeded';
       job.scannedFiles = result.scannedFiles;
       job.availableEpisodes = result.availableEpisodes;
-    } catch (_) {
+      _logger.event('scan.end', fields: {
+        'component': 'nas.scan',
+        'sessionId': nasShortId(job.id),
+        'outcome': 'success',
+        'durationMs': watch.elapsedMilliseconds,
+        'bytes': result.scannedFiles,
+      });
+    } catch (error) {
       job.status = 'failed';
       job.errorCode = 'service_unavailable';
+      _logger.event('scan.error', level: 'ERROR', fields: {
+        'component': 'nas.scan',
+        'sessionId': nasShortId(job.id),
+        'outcome': 'error',
+        'durationMs': watch.elapsedMilliseconds,
+        'errorType': error.runtimeType.toString(),
+        'errorCode': job.errorCode,
+      });
     } finally {
       job.finishedAt = DateTime.now().toUtc();
     }
@@ -1014,6 +1141,12 @@ class NasHealthServer {
       tokenHash: tokenHash,
       relativePath: file.relativePath,
     );
+    _logger.event('playback.session.create', fields: {
+      'component': 'nas.playback',
+      'playbackSessionId': nasShortId(sessionId),
+      'movieIdShort': nasShortId(requestedMovieId),
+      'outcome': 'success',
+    });
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {
         'sessionId': sessionId,
@@ -1050,6 +1183,11 @@ class NasHealthServer {
       positionMs: positionMs > durationMs ? durationMs : positionMs,
       durationMs: durationMs,
     );
+    _logger.event('playback.progress', level: 'DEBUG', fields: {
+      'component': 'nas.playback',
+      'playbackSessionId': nasShortId(request.uri.pathSegments[4]),
+      'outcome': 'success',
+    });
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {'updatedAt': DateTime.now().toUtc().toIso8601String()},
     });
@@ -1063,6 +1201,11 @@ class NasHealthServer {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     _playbackSessions.remove(sessionId);
+    _logger.event('playback.session.close', fields: {
+      'component': 'nas.playback',
+      'playbackSessionId': nasShortId(sessionId),
+      'outcome': 'success',
+    });
     request.response.statusCode = HttpStatus.noContent;
     await request.response.close();
   }
@@ -1086,6 +1229,13 @@ class NasHealthServer {
       request.response.headers
           .set(HttpHeaders.contentRangeHeader, 'bytes */$length');
       request.response.headers.contentLength = 0;
+      _logger.event('playback.stream.error', level: 'WARN', fields: {
+        'component': 'nas.playback',
+        'playbackSessionId': nasShortId(request.uri.pathSegments[4]),
+        'status': HttpStatus.requestedRangeNotSatisfiable,
+        'outcome': 'http_error',
+        'errorCode': 'invalid_range',
+      });
       return request.response.close();
     }
     final range = parsedRange.range;
@@ -1102,10 +1252,57 @@ class NasHealthServer {
       request.response.headers
           .set(HttpHeaders.contentRangeHeader, 'bytes $start-$end/$length');
     }
-    if (request.method == 'GET') {
-      await request.response.addStream(file.openRead(start, end + 1));
+    final streamWatch = Stopwatch()..start();
+    final sessionShort = nasShortId(request.uri.pathSegments[4]);
+    _activeStreams++;
+    _logger.event('playback.stream.start', fields: {
+      'component': 'nas.playback',
+      'playbackSessionId': sessionShort,
+      'method': request.method,
+      'range': '$start-$end/$length',
+      'bytes': end - start + 1,
+      'activeStreams': _activeStreams,
+      'streamStart': true,
+    });
+    try {
+      if (request.method == 'GET') {
+        var firstByte = true;
+        final monitored = file.openRead(start, end + 1).map((chunk) {
+          if (firstByte) {
+            firstByte = false;
+            _logger.event('playback.stream.first_byte', fields: {
+              'component': 'nas.playback',
+              'playbackSessionId': sessionShort,
+              'bytes': chunk.length,
+              'durationMs': streamWatch.elapsedMilliseconds,
+            });
+          }
+          return chunk;
+        });
+        await request.response.addStream(monitored);
+      }
+      await request.response.close();
+      _logger.event('playback.stream.end', fields: {
+        'component': 'nas.playback',
+        'playbackSessionId': sessionShort,
+        'outcome': 'success',
+        'durationMs': streamWatch.elapsedMilliseconds,
+        'bytes': request.method == 'GET' ? end - start + 1 : 0,
+        'streamEnd': true,
+      });
+    } catch (error) {
+      _logger.event('playback.stream.error', level: 'WARN', fields: {
+        'component': 'nas.playback',
+        'playbackSessionId': sessionShort,
+        'outcome': 'disconnect',
+        'cancelReason': 'client_disconnect',
+        'durationMs': streamWatch.elapsedMilliseconds,
+        'errorType': error.runtimeType.toString(),
+      });
+      rethrow;
+    } finally {
+      _activeStreams--;
     }
-    await request.response.close();
   }
 
   String? _authenticatedTokenHash(HttpRequest request) {
