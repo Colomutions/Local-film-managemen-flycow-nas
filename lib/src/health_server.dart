@@ -1081,14 +1081,24 @@ class NasHealthServer {
     if (mimeType == null ||
         !const {'image/png', 'image/jpeg', 'image/webp'}.contains(mimeType) ||
         request.headers.contentLength > NasArtworkService.maxPosterBytes) {
+      // Consume an oversized request before writing the error response. If the
+      // body is left unread, dart:io may close the connection early and clients
+      // observe a truncated JSON error (for example curl error 18).
+      await request.drain<void>();
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final bytes = <int>[];
+    var oversized = false;
     await for (final chunk in request) {
+      if (oversized) continue;
       if (bytes.length + chunk.length > NasArtworkService.maxPosterBytes) {
-        return _error(request, HttpStatus.badRequest, 'invalid_request');
+        oversized = true;
+        continue;
       }
       bytes.addAll(chunk);
+    }
+    if (oversized) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     if (!NasArtworkService.isValidPosterBytes(
       mimeType: mimeType,

@@ -55,6 +55,15 @@ Future<void> main() async {
         bytes: _pngOne,
         contentType: 'application/octet-stream');
     _expectError(invalidMime, HttpStatus.badRequest, 'invalid_request');
+    final oversized = await _request(
+      base,
+      'POST',
+      posterPath,
+      token: adminToken,
+      bytes: List<int>.filled(NasArtworkService.maxPosterBytes + 1, 0),
+      contentType: 'image/png',
+    );
+    _expectError(oversized, HttpStatus.badRequest, 'invalid_request');
 
     final uploaded = await _request(base, 'POST', posterPath,
         token: adminToken, bytes: _pngOne, contentType: 'image/png');
