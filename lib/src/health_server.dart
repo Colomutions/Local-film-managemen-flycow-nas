@@ -1,5 +1,5 @@
-// The request dispatcher intentionally remains serial; logging does not alter
-// its await-for scheduling or request concurrency.
+// Request handlers are dispatched independently so a long-lived media stream
+// cannot block health checks or unrelated API requests.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -110,7 +110,7 @@ class NasHealthServer {
   Future<void> _serve(HttpServer server) async {
     try {
       await for (final request in server) {
-        await _handle(request);
+        unawaited(_handle(request));
       }
     } on HttpException {
       // A client may disconnect while a health response is being sent.
