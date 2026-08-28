@@ -136,6 +136,8 @@ class NasScanResult {
 }
 
 class NasLibraryDatabase {
+  static const currentSchemaVersion = 4;
+
   NasLibraryDatabase(this.dataDir);
 
   final String dataDir;
@@ -152,9 +154,15 @@ class NasLibraryDatabase {
         .create(recursive: true);
     final database =
         sqlite3.open('${directory.path}${Platform.pathSeparator}mujing.sqlite');
-    database.execute('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
-    _database = database;
-    _migrate();
+    try {
+      database.execute('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
+      _database = database;
+      _migrate();
+    } catch (_) {
+      database.dispose();
+      _database = null;
+      rethrow;
+    }
   }
 
   Future<void> close() async {
@@ -179,6 +187,12 @@ class NasLibraryDatabase {
             .select('SELECT MAX(version) AS version FROM schema_migrations')
             .first['version'] as int? ??
         0;
+    if (current > currentSchemaVersion) {
+      throw StateError(
+        'Unsupported database schema version $current; '
+        'this service supports up to $currentSchemaVersion.',
+      );
+    }
     if (current < 1) {
       _db.execute('''
       CREATE TABLE media_roots (
