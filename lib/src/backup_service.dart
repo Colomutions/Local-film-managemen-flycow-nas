@@ -135,6 +135,127 @@ class NasBackupService {
     return null;
   }
 
+  /// Restores one backup into a new, isolated directory without touching the
+  /// live data directory or the source backup.
+  ///
+  /// This is intentionally a local/operational primitive rather than an HTTP
+  /// endpoint.  The target must not exist and must be outside the NAS data and
+  /// backup roots, so a restore cannot silently overwrite a running service.
+  /// Only the sanitized backup payload is copied; `/media` and unknown
+  /// top-level entries are rejected.
+  Future<NasBackupRecord> restoreToIsolatedDirectory({
+    required String backupId,
+    required Directory target,
+  }) async {
+    if (!RegExp(r'^[a-f0-9-]{36}$').hasMatch(backupId)) {
+      throw ArgumentError.value(backupId, 'backupId', 'invalid backup ID');
+    }
+    final record = await find(backupId);
+    if (record == null) {
+      throw StateError('Backup not found.');
+    }
+    if (await target.exists()) {
+      throw StateError('Restore target must not already exist.');
+    }
+
+    final source = Directory(
+      '${_backupDirectory.path}${Platform.pathSeparator}$backupId',
+    );
+    final dataPath = _normalizedAbsolutePath(dataDir);
+    final sourcePath = _normalizedAbsolutePath(source.path);
+    final targetPath = _normalizedAbsolutePath(target.path);
+    if (_isWithinPath(targetPath, dataPath) ||
+        _isWithinPath(targetPath, sourcePath)) {
+      throw StateError('Restore target must be outside the live data directory.');
+    }
+
+    final manifest = File(
+      '${source.path}${Platform.pathSeparator}manifest.json',
+    );
+    if (!await manifest.exists()) {
+      throw StateError('Backup manifest is missing.');
+    }
+    final manifestRecord = NasBackupRecord.fromJson(
+      jsonDecode(await manifest.readAsString()),
+    );
+    if (manifestRecord == null ||
+        manifestRecord.id != record.id ||
+        manifestRecord.createdAt != record.createdAt ||
+        manifestRecord.sizeBytes != record.sizeBytes) {
+      throw StateError('Backup manifest is invalid.');
+    }
+
+    final temporary = Directory('${target.path}.tmp-${newUuidV4()}');
+    await temporary.create(recursive: true);
+    try {
+      await _copyRestoreTree(source, temporary);
+      await temporary.rename(target.path);
+      return record;
+    } catch (_) {
+      if (await temporary.exists()) {
+        await temporary.delete(recursive: true);
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _copyRestoreTree(Directory source, Directory target) async {
+    const allowedDirectories = {'db', 'state', 'config', 'artwork'};
+    await for (final entity in source.list(followLinks: false)) {
+      final name = entity.path.split(Platform.pathSeparator).last;
+      if (entity is Link) {
+        throw StateError('Backup contains an unsupported link.');
+      }
+      if (entity is File && name == 'manifest.json') {
+        await entity.copy(
+          '${target.path}${Platform.pathSeparator}manifest.json',
+        );
+        continue;
+      }
+      if (entity is! Directory || !allowedDirectories.contains(name)) {
+        throw StateError('Backup contains an unsupported entry.');
+      }
+      await _copyRestoreDirectory(entity, Directory(
+        '${target.path}${Platform.pathSeparator}$name',
+      ));
+    }
+  }
+
+  Future<void> _copyRestoreDirectory(
+    Directory source,
+    Directory target,
+  ) async {
+    await target.create(recursive: true);
+    await for (final entity in source.list(recursive: true, followLinks: false)) {
+      final relativePath = entity.path.substring(source.path.length + 1);
+      final destination = File(
+        '${target.path}${Platform.pathSeparator}$relativePath',
+      );
+      if (entity is Link) {
+        throw StateError('Backup contains an unsupported link.');
+      }
+      if (entity is Directory) {
+        await Directory(destination.path).create(recursive: true);
+      } else if (entity is File) {
+        await destination.parent.create(recursive: true);
+        await entity.copy(destination.path);
+      } else {
+        throw StateError('Backup contains an unsupported entry.');
+      }
+    }
+  }
+
+  String _normalizedAbsolutePath(String path) {
+    var normalized = Directory(path).absolute.path.replaceAll('\\', '/');
+    while (normalized.length > 1 && normalized.endsWith('/')) {
+      normalized = normalized.substring(0, normalized.length - 1);
+    }
+    return Platform.isWindows ? normalized.toLowerCase() : normalized;
+  }
+
+  bool _isWithinPath(String child, String parent) =>
+      child == parent || child.startsWith('$parent/');
+
   /// Copies a persisted JSON file while removing credential-bearing fields.
   ///
   /// The live state file stores token hashes under `tokens`; those hashes are

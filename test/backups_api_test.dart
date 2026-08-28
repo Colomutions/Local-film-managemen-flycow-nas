@@ -182,6 +182,69 @@ Future<void> main() async {
           .exists(),
       'backup never copies source media files',
     );
+
+    final isolatedRestore = Directory(
+      '${directory.path}${Platform.pathSeparator}isolated-restore',
+    );
+    final restored = await NasBackupService(dataDir.path)
+        .restoreToIsolatedDirectory(
+      backupId: backupId,
+      target: isolatedRestore,
+    );
+    _expect(restored.id == backupId, 'isolated restore returns backup metadata');
+    _expect(
+      await File(
+        '${isolatedRestore.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite',
+      ).exists(),
+      'isolated restore contains the SQLite snapshot',
+    );
+    _expect(
+      await File(
+        '${isolatedRestore.path}${Platform.pathSeparator}state${Platform.pathSeparator}server.json',
+      ).exists(),
+      'isolated restore contains sanitized service state',
+    );
+    _expect(
+      !await Directory(
+        '${isolatedRestore.path}${Platform.pathSeparator}media',
+      ).exists(),
+      'isolated restore excludes media files',
+    );
+    var existingTargetRejected = false;
+    try {
+      await NasBackupService(dataDir.path).restoreToIsolatedDirectory(
+        backupId: backupId,
+        target: isolatedRestore,
+      );
+    } on StateError {
+      existingTargetRejected = true;
+    }
+    _expect(existingTargetRejected, 'restore never overwrites an existing target');
+
+    final unexpectedEntry = Directory(
+      '${backupDir.path}${Platform.pathSeparator}media',
+    );
+    await unexpectedEntry.create();
+    try {
+      final rejectedTarget = Directory(
+        '${directory.path}${Platform.pathSeparator}isolated-invalid',
+      );
+      var unexpectedEntryRejected = false;
+      try {
+        await NasBackupService(dataDir.path).restoreToIsolatedDirectory(
+          backupId: backupId,
+          target: rejectedTarget,
+        );
+      } on StateError {
+        unexpectedEntryRejected = true;
+      }
+      _expect(
+        unexpectedEntryRejected && !await rejectedTarget.exists(),
+        'restore rejects unexpected backup entries without creating a target',
+      );
+    } finally {
+      await unexpectedEntry.delete(recursive: true);
+    }
   } finally {
     await server.stop();
     await directory.delete(recursive: true);
