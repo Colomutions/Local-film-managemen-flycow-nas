@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:sqlite3/sqlite3.dart';
+
 import '../lib/src/backup_recovery_harness.dart';
 import '../lib/src/backup_service.dart';
 
@@ -65,6 +67,32 @@ Future<void> main() async {
           .exists(),
       'rejected target is not created',
     );
+
+    const invalidBackupId = '00000000-0000-4000-8000-000000000002';
+    final invalidBackup = Directory(
+      '${dataDir.path}${Platform.pathSeparator}backups${Platform.pathSeparator}$invalidBackupId',
+    );
+    await _writeFixture(
+      invalidBackup,
+      invalidBackupId,
+      createdAt,
+      validSqlite: false,
+    );
+    final invalidTarget = Directory(
+      '${directory.path}${Platform.pathSeparator}invalid-isolated-copy',
+    );
+    var invalidSnapshotRejected = false;
+    try {
+      await harness.restore(backupId: invalidBackupId, target: invalidTarget);
+    } on StateError {
+      invalidSnapshotRejected = true;
+    }
+    _expect(invalidSnapshotRejected, 'invalid SQLite snapshot is rejected');
+    _expect(
+      !await invalidTarget.exists(),
+      'failed integrity validation removes the isolated target',
+    );
+    _expect(await invalidBackup.exists(), 'invalid source backup is preserved');
   } finally {
     await directory.delete(recursive: true);
   }
@@ -73,10 +101,8 @@ Future<void> main() async {
 }
 
 Future<void> _writeFixture(
-  Directory backupDir,
-  String backupId,
-  DateTime createdAt,
-) async {
+    Directory backupDir, String backupId, DateTime createdAt,
+    {bool validSqlite = true}) async {
   final db = File(
     '${backupDir.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite',
   );
@@ -89,7 +115,16 @@ Future<void> _writeFixture(
   await db.parent.create(recursive: true);
   await state.parent.create(recursive: true);
   await poster.parent.create(recursive: true);
-  await db.writeAsString('sqlite snapshot');
+  if (validSqlite) {
+    final database = sqlite3.open(db.path);
+    try {
+      database.execute('CREATE TABLE fixture (value TEXT NOT NULL);');
+    } finally {
+      database.dispose();
+    }
+  } else {
+    await db.writeAsString('not a SQLite database');
+  }
   await state.writeAsString('{"serverId":"fixture"}');
   await poster.writeAsBytes(const [137, 80, 78, 71]);
   await File('${backupDir.path}${Platform.pathSeparator}manifest.json')

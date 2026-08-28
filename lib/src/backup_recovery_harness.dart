@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:sqlite3/sqlite3.dart';
+
 import 'backup_service.dart';
 
 /// A deliberately local-only wrapper around isolated backup recovery.
@@ -16,10 +18,48 @@ class NasBackupRecoveryHarness {
     required Directory target,
   }) async {
     await _rejectSymlinkTarget(target);
-    return _backupService.restoreToIsolatedDirectory(
-      backupId: backupId,
-      target: target,
+    NasBackupRecord? restored;
+    try {
+      restored = await _backupService.restoreToIsolatedDirectory(
+        backupId: backupId,
+        target: target,
+      );
+      await _verifyRestoredSnapshot(target);
+      return restored;
+    } catch (_) {
+      // The service already cleans its own temporary directory. If it had
+      // completed the rename but validation failed, remove only this newly
+      // created isolated target; an existing target was rejected up front.
+      if (restored != null && await target.exists()) {
+        await target.delete(recursive: true);
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _verifyRestoredSnapshot(Directory target) async {
+    final snapshot = File(
+      '${target.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite',
     );
+    if (await FileSystemEntity.type(snapshot.path, followLinks: false) !=
+        FileSystemEntityType.file) {
+      throw StateError('Restored backup does not contain a SQLite snapshot.');
+    }
+    try {
+      final database = sqlite3.open(snapshot.path);
+      try {
+        final check = database.select('PRAGMA integrity_check');
+        if (check.length != 1 || check.single['integrity_check'] != 'ok') {
+          throw StateError('Restored SQLite snapshot integrity check failed.');
+        }
+      } finally {
+        database.dispose();
+      }
+    } on StateError {
+      rethrow;
+    } catch (_) {
+      throw StateError('Restored SQLite snapshot integrity check failed.');
+    }
   }
 
   Future<void> _rejectSymlinkTarget(Directory target) async {
