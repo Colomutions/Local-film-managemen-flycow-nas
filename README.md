@@ -60,6 +60,21 @@ dart test/health_server_test.dart
 
 `MUJING_ADVERTISE_URL` 可以为空。为空时已配对客户端仍可使用其手动保存的 NAS 地址，但服务不会提供连接/二维码 endpoint。确定 NAS 宿主机地址后，显式设置如 `http://192.168.1.20:48291` 并重新执行 `docker compose up -d`；服务不会从容器网卡推导地址，并会拒绝 Docker `172.16.0.0/12` 地址。
 
+## 升级、回退与异常启动
+
+升级前，在飞牛 Docker 图形界面保留当前可用镜像版本，并确认 `./data` 持久目录和媒体只读挂载配置不变；不得删除数据卷、重建空数据目录或提交 `.env`。随后按当前是否启用媒体覆盖文件执行既有 `up -d --build` 命令，并通过 Docker 容器健康状态确认服务恢复。
+
+若升级后未 healthy 或立即退出：停止继续重建，保留 `./data` 和当前日志；在 Docker 图形界面选择先前保留的镜像版本，以相同的 `./data` 和只读媒体挂载重新启动。不要执行带卷删除的 down 操作，不要覆盖 SQLite、恢复备份或操作源媒体。若日志显示数据库 schema 版本高于服务支持范围，应保持数据卷不变，改用支持该 schema 的服务版本。
+
+本地预检可执行：
+
+```text
+dart run test/upgrade_guard_test.dart
+dart run test/startup_integrity_test.dart
+```
+
+这些测试使用临时目录，分别验证重复迁移、未来 schema 拒绝、损坏状态/SQLite 的安全失败和残留备份临时目录保持；不替代真实 NAS 的镜像升级验收。
+
 首次部署还要在未跟踪的 `.env` 设置 `MUJING_PAIRING_CODE`。它仅用于确认五分钟内有效的配对会话，不能提交或写入日志。
 
 ## 任务 E/F API 与权限
