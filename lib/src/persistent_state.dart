@@ -49,6 +49,7 @@ class NasPersistentStateStore {
   NasPersistentStateStore(this.dataDir);
 
   final String dataDir;
+  Future<void> _saveTail = Future<void>.value();
 
   File get _file => File('$dataDir${Platform.pathSeparator}state${Platform.pathSeparator}server.json');
 
@@ -70,13 +71,25 @@ class NasPersistentStateStore {
     return NasPersistentState(serverId: decoded['serverId'] as String, tokens: tokens);
   }
 
-  Future<void> save(NasPersistentState state) async {
-    final file = _file;
-    await file.parent.create(recursive: true);
+  Future<void> save(NasPersistentState state) {
+    // Capture the state synchronously, then serialize file replacement. Multiple
+    // devices can finish pairing at once; sharing one fixed `.tmp` path without
+    // this queue lets concurrent renames fail and incorrectly return 500.
     final payload = jsonEncode({
       'serverId': state.serverId,
       'tokens': state.tokens.map((key, value) => MapEntry(key, value.toJson())),
     });
+    final write = _saveTail.then<void>(
+      (_) => _writePayload(payload),
+      onError: (_, __) => _writePayload(payload),
+    );
+    _saveTail = write;
+    return write;
+  }
+
+  Future<void> _writePayload(String payload) async {
+    final file = _file;
+    await file.parent.create(recursive: true);
     final temporary = File('${file.path}.tmp');
     await temporary.writeAsString(payload, flush: true);
     await temporary.rename(file.path);
