@@ -14,7 +14,7 @@ RUN dart compile exe bin/mujing_nas.dart -o /tmp/mujing-nas
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libsqlite3-dev ca-certificates \
+    && apt-get install -y --no-install-recommends libsqlite3-dev ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 1000 mujing \

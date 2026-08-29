@@ -2,6 +2,7 @@ import 'dart:io';
 
 import '../lib/src/library_database.dart';
 import '../lib/src/media_service.dart';
+import '../lib/src/metadata_probe.dart';
 
 Future<void> main() async {
   final directory =
@@ -16,6 +17,18 @@ Future<void> main() async {
       NasMediaService(mediaDir: mediaRoot.path, fixtureRelativePath: null);
   final database =
       NasLibraryDatabase('${directory.path}${Platform.pathSeparator}data');
+  var probeCalls = 0;
+  final metadataProbe = NasMediaMetadataProbe(
+    runner: (_, _) async {
+      probeCalls++;
+      return ProcessResult(
+        1,
+        0,
+        '{"streams":[{"width":1920,"height":1080}],"format":{"duration":"12.5"}}',
+        '',
+      );
+    },
+  );
 
   try {
     await database.open();
@@ -23,6 +36,7 @@ Future<void> main() async {
       rootName: '测试媒体根',
       containerPath: mediaRoot.path,
       mediaService: mediaService,
+      metadataProbe: metadataProbe,
     );
     _expect(scan.scannedFiles == 1, 'scanner imports supported video files');
     final movie = database.listMovies().single;
@@ -32,6 +46,19 @@ Future<void> main() async {
         'database stores a relative path');
     _expect(episode.fileSize == 32, 'scanner stores file size');
     _expect(episode.isAvailable, 'scanner marks file available');
+    _expect(episode.durationMs == 12500, 'scanner stores probed duration');
+    _expect(episode.videoWidth == 1920 && episode.videoHeight == 1080,
+        'scanner stores probed dimensions');
+    _expect(episode.resolutionLabel == '1080P',
+        'scanner stores normalized resolution label');
+    final secondScan = await database.scanConfiguredRoot(
+      rootName: '测试媒体根',
+      containerPath: mediaRoot.path,
+      mediaService: mediaService,
+      metadataProbe: metadataProbe,
+    );
+    _expect(secondScan.scannedFiles == 1, 'unchanged media remains available');
+    _expect(probeCalls == 1, 'unchanged media does not invoke ffprobe again');
     _expect(await mediaService.fileForRelativePath('../outside.mp4') == null,
         'media service rejects traversal');
     final configuredRoot = database.listMediaRoots().single;
@@ -41,8 +68,14 @@ Future<void> main() async {
 
     await database.close();
     await database.open();
-    _expect(database.listMovies().single.id == movie.id,
+    final reopenedMovie = database.listMovies().single;
+    _expect(reopenedMovie.id == movie.id,
         'SQLite data survives reopen');
+    final reopenedEpisode = database.episodesForMovie(movie.id).single;
+    _expect(reopenedEpisode.durationMs == 12500 &&
+        reopenedEpisode.videoWidth == 1920 &&
+        reopenedEpisode.videoHeight == 1080,
+        'media metadata survives reopen');
     final reopenedRoot = database.listMediaRoots().single;
     _expect(
         reopenedRoot.id == configuredRoot.id, 'media root ID survives reopen');

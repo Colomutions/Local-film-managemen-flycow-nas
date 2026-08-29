@@ -1,4 +1,5 @@
 class NasConfig {
+  static const fixedPort = 48291;
   const NasConfig({
     required this.bindHost,
     required this.port,
@@ -18,7 +19,7 @@ class NasConfig {
   });
 
   factory NasConfig.fromEnvironment(Map<String, String> environment) {
-    final port = int.tryParse(environment['MUJING_PORT'] ?? '') ?? 48291;
+    final port = int.tryParse(environment['MUJING_PORT'] ?? '') ?? fixedPort;
     if (port < 0 || port > 65535) {
       throw ArgumentError.value(port, 'MUJING_PORT', 'must be 0-65535');
     }
@@ -101,6 +102,13 @@ class NasConfig {
         value,
         'MUJING_ADVERTISE_URL',
         'must be an absolute http(s) URL without query or fragment',
+      );
+    }
+    if (uri.hasPort && uri.port != fixedPort) {
+      throw ArgumentError.value(
+        value,
+        'MUJING_ADVERTISE_URL',
+        'must use the fixed NAS port 48291',
       );
     }
 

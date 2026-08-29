@@ -4,6 +4,7 @@ import 'package:sqlite3/sqlite3.dart';
 
 import 'auth.dart';
 import 'media_service.dart';
+import 'metadata_probe.dart';
 
 class NasLibraryMovie {
   const NasLibraryMovie({
@@ -14,6 +15,9 @@ class NasLibraryMovie {
     required this.episodeCount,
     required this.durationMs,
     required this.updatedAt,
+    this.videoWidth,
+    this.videoHeight,
+    this.resolutionLabel,
   });
 
   final String id;
@@ -23,6 +27,9 @@ class NasLibraryMovie {
   final int episodeCount;
   final int? durationMs;
   final String updatedAt;
+  final int? videoWidth;
+  final int? videoHeight;
+  final String? resolutionLabel;
 }
 
 class NasLibraryEpisode {
@@ -35,6 +42,10 @@ class NasLibraryEpisode {
     required this.isAvailable,
     required this.updatedAt,
     this.durationMs,
+    this.videoWidth,
+    this.videoHeight,
+    this.resolutionLabel,
+    this.mediaModifiedAt,
   });
 
   final String id;
@@ -45,6 +56,10 @@ class NasLibraryEpisode {
   final bool isAvailable;
   final String updatedAt;
   final int? durationMs;
+  final int? videoWidth;
+  final int? videoHeight;
+  final String? resolutionLabel;
+  final int? mediaModifiedAt;
 }
 
 class NasMediaRoot {
@@ -136,7 +151,7 @@ class NasScanResult {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 4;
+  static const currentSchemaVersion = 5;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -283,6 +298,16 @@ class NasLibraryDatabase {
         [4, _now()],
       );
     }
+    if (current < 5) {
+      _db.execute('ALTER TABLE episodes ADD COLUMN video_width INTEGER');
+      _db.execute('ALTER TABLE episodes ADD COLUMN video_height INTEGER');
+      _db.execute('ALTER TABLE episodes ADD COLUMN resolution_label TEXT');
+      _db.execute('ALTER TABLE episodes ADD COLUMN media_modified_at INTEGER');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [5, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -334,17 +359,23 @@ class NasLibraryDatabase {
     required String rootName,
     required String containerPath,
     required NasMediaService mediaService,
+    NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
   }) async {
     final root = ensureConfiguredMediaRoot(
       rootName: rootName,
       containerPath: containerPath,
     );
-    return scanMediaRoot(mediaRootId: root.id, mediaService: mediaService);
+    return scanMediaRoot(
+      mediaRootId: root.id,
+      mediaService: mediaService,
+      metadataProbe: metadataProbe,
+    );
   }
 
   Future<NasScanResult> scanMediaRoot({
     required String mediaRootId,
     required NasMediaService mediaService,
+    NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
   }) async {
     final configuredRoot = findMediaRoot(mediaRootId);
     if (configuredRoot == null || !configuredRoot.enabled) {
@@ -377,6 +408,23 @@ class NasLibraryDatabase {
           .replaceAll(Platform.pathSeparator, '/');
       final checkedFile = await mediaService.fileForRelativePath(relativePath);
       if (checkedFile == null) continue;
+      final stat = await checkedFile.file.stat();
+      final mediaModifiedAt = stat.modified.microsecondsSinceEpoch;
+      final existing = _db.select(
+        'SELECT file_size, media_modified_at, duration_ms, video_width, video_height, resolution_label FROM episodes WHERE media_root_id = ? AND relative_path = ?',
+        [rootId, relativePath],
+      );
+      final fileSize = await checkedFile.length();
+      final unchanged = existing.isNotEmpty &&
+          existing.first['file_size'] == fileSize &&
+          existing.first['media_modified_at'] == mediaModifiedAt &&
+          (existing.first['duration_ms'] != null ||
+              existing.first['video_width'] != null ||
+              existing.first['video_height'] != null);
+      NasMediaMetadata? metadata;
+      if (!unchanged) {
+        metadata = await metadataProbe.probe(checkedFile);
+      }
       final movieId =
           'movie-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
       final episodeId =
@@ -388,9 +436,14 @@ class NasLibraryDatabase {
         ON CONFLICT(id) DO NOTHING
       ''', [movieId, title, timestamp, timestamp]);
       _db.execute('''
-        INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, file_size, is_available, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, duration_ms, video_width, video_height, resolution_label, media_modified_at, file_size, is_available, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
+          duration_ms = excluded.duration_ms,
+          video_width = excluded.video_width,
+          video_height = excluded.video_height,
+          resolution_label = excluded.resolution_label,
+          media_modified_at = excluded.media_modified_at,
           file_size = excluded.file_size, is_available = 1, updated_at = excluded.updated_at
       ''', [
         episodeId,
@@ -398,8 +451,13 @@ class NasLibraryDatabase {
         rootId,
         title,
         relativePath,
-        await checkedFile.length(),
-        timestamp
+        unchanged ? existing.first['duration_ms'] : metadata?.durationMs,
+        unchanged ? existing.first['video_width'] : metadata?.width,
+        unchanged ? existing.first['video_height'] : metadata?.height,
+        unchanged ? existing.first['resolution_label'] : metadata?.resolutionLabel,
+        mediaModifiedAt,
+        fileSize,
+        timestamp,
       ]);
       scannedFiles++;
     }
@@ -418,7 +476,7 @@ class NasLibraryDatabase {
       GROUP BY m.id ORDER BY m.title COLLATE NOCASE
     ''', [queryLike, queryLike]);
     return rows
-        .map((row) => NasLibraryMovie(
+        .map((row) => _withResolution(NasLibraryMovie(
               id: row['id'] as String,
               title: row['title'] as String,
               summary: row['summary'] as String,
@@ -428,7 +486,7 @@ class NasLibraryDatabase {
                   ? null
                   : row['duration_ms'] as int?,
               updatedAt: row['updated_at'] as String,
-            ))
+            )))
         .toList(growable: false);
   }
 
@@ -456,7 +514,7 @@ class NasLibraryDatabase {
       WHERE m.id = ?
       GROUP BY m.id
     ''', [movieId]);
-    return rows.isEmpty ? null : _mapMovie(rows.single);
+    return rows.isEmpty ? null : _withResolution(_mapMovie(rows.single));
   }
 
   NasLibraryMovie? updateMovieMetadata({
@@ -488,7 +546,8 @@ class NasLibraryDatabase {
 
   List<NasLibraryEpisode> episodesForMovie(String movieId) {
     final rows = _db.select('''
-      SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms, updated_at
+      SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms,
+             video_width, video_height, resolution_label, media_modified_at, updated_at
       FROM episodes WHERE movie_id = ? ORDER BY title COLLATE NOCASE
     ''', [movieId]);
     return rows
@@ -500,6 +559,10 @@ class NasLibraryDatabase {
               fileSize: row['file_size'] as int,
               isAvailable: (row['is_available'] as int) == 1,
               durationMs: row['duration_ms'] as int?,
+              videoWidth: row['video_width'] as int?,
+              videoHeight: row['video_height'] as int?,
+              resolutionLabel: row['resolution_label'] as String?,
+              mediaModifiedAt: row['media_modified_at'] as int?,
               updatedAt: row['updated_at'] as String,
             ))
         .toList(growable: false);
@@ -785,6 +848,31 @@ class NasLibraryDatabase {
             : row['duration_ms'] as int?,
         updatedAt: row['updated_at'] as String,
       );
+
+  NasLibraryMovie _withResolution(NasLibraryMovie movie) {
+    final rows = _db.select(
+      'SELECT DISTINCT video_width, video_height, resolution_label FROM episodes WHERE movie_id = ? AND is_available = 1 AND video_width IS NOT NULL AND video_height IS NOT NULL',
+      [movie.id],
+    );
+    final label = rows.length > 1
+        ? '多种分辨率'
+        : rows.isEmpty
+            ? null
+            : rows.single['resolution_label'] as String?;
+    final row = rows.length == 1 ? rows.single : null;
+    return NasLibraryMovie(
+      id: movie.id,
+      title: movie.title,
+      summary: movie.summary,
+      posterFileName: movie.posterFileName,
+      episodeCount: movie.episodeCount,
+      durationMs: movie.durationMs,
+      updatedAt: movie.updatedAt,
+      videoWidth: row?['video_width'] as int?,
+      videoHeight: row?['video_height'] as int?,
+      resolutionLabel: label,
+    );
+  }
 
   NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
     final rows = _db.select('''

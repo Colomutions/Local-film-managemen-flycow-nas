@@ -477,6 +477,9 @@ class NasHealthServer {
             .toList(growable: false),
         'episodeCount': movie.episodeCount,
         'durationMs': movie.durationMs,
+        'resolutionLabel': movie.resolutionLabel,
+        'resolutionWidth': movie.videoWidth,
+        'resolutionHeight': movie.videoHeight,
         'posterUrl': movie.posterFileName == null
             ? null
             : '/api/v1/assets/posters/${movie.id}',
@@ -495,6 +498,9 @@ class NasHealthServer {
         'id': episode.id,
         'title': episode.title,
         'durationMs': episode.durationMs,
+        'resolutionLabel': episode.resolutionLabel,
+        'videoWidth': episode.videoWidth,
+        'videoHeight': episode.videoHeight,
         'fileSize': episode.fileSize,
         'isAvailable': episode.isAvailable && file != null,
       });
@@ -1028,6 +1034,9 @@ class NasHealthServer {
         'movieId': episode.movieId,
         'title': episode.title,
         'durationMs': episode.durationMs,
+        'resolutionLabel': episode.resolutionLabel,
+        'videoWidth': episode.videoWidth,
+        'videoHeight': episode.videoHeight,
         'fileSize': episode.fileSize,
         'isAvailable': episode.isAvailable,
         'updatedAt': episode.updatedAt,
@@ -1134,6 +1143,37 @@ class NasHealthServer {
     if (requestedMovieId is! String) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final databaseMovie = _libraryDatabase.findMovie(requestedMovieId);
+    if (databaseMovie != null) {
+      final episodes = _libraryDatabase.episodesForMovie(databaseMovie.id);
+      NasLibraryEpisode? episode;
+      if (requestedEpisodeId is String) {
+        for (final candidate in episodes) {
+          if (candidate.id == requestedEpisodeId) {
+            episode = candidate;
+            break;
+          }
+        }
+      } else if (episodes.length == 1) {
+        episode = episodes.single;
+      }
+      if (episode == null || !episode.isAvailable) {
+        return _error(request, HttpStatus.notFound, 'resource_not_found');
+      }
+      final file =
+          await _mediaService.fileForRelativePath(episode.relativePath);
+      if (file == null) {
+        return _error(request, HttpStatus.notFound, 'resource_not_found');
+      }
+      return _writePlaybackSession(
+        request,
+        tokenHash: tokenHash,
+        movieId: databaseMovie.id,
+        episodeId: episode.id,
+        relativePath: file.relativePath,
+        durationMs: episode.durationMs ?? 600000,
+      );
+    }
     if (requestedMovieId != NasFixtureLibrary.movieId ||
         (requestedEpisodeId != null &&
             requestedEpisodeId != 'fixture-episode-1')) {
@@ -1143,31 +1183,47 @@ class NasHealthServer {
     if (file == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    final previous = _fixturePlaybackState;
-    final durationMs = previous?.durationMs ?? 600000;
-    final resumePositionMs = previous?.positionMs ?? 0;
+    return _writePlaybackSession(
+      request,
+      tokenHash: tokenHash,
+      movieId: requestedMovieId,
+      episodeId: 'fixture-episode-1',
+      relativePath: file.relativePath,
+      durationMs: _fixturePlaybackState?.durationMs ?? 600000,
+    );
+  }
+
+  Future<void> _writePlaybackSession(
+    HttpRequest request, {
+    required String tokenHash,
+    required String movieId,
+    required String episodeId,
+    required String relativePath,
+    required int durationMs,
+  }) async {
+    final resumePositionMs = _fixturePlaybackState?.positionMs ?? 0;
     final sessionId = newUuidV4();
     _playbackSessions[sessionId] = _PlaybackSession(
       tokenHash: tokenHash,
-      relativePath: file.relativePath,
+      relativePath: relativePath,
     );
     _logger.event('playback.session.create', fields: {
       'component': 'nas.playback',
       'playbackSessionId': nasShortId(sessionId),
-      'movieIdShort': nasShortId(requestedMovieId),
+      'movieIdShort': nasShortId(movieId),
       'outcome': 'success',
     });
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {
         'sessionId': sessionId,
-        'episodeId': 'fixture-episode-1',
+        'episodeId': episodeId,
         'resumePositionMs': resumePositionMs,
         'durationMs': durationMs,
         'playbackVariants': [
           {
             'type': 'direct',
             'url': '/api/v1/playback/sessions/$sessionId/stream',
-            'mimeType': mimeTypeForMediaPath(file.relativePath),
+            'mimeType': mimeTypeForMediaPath(relativePath),
           },
         ],
       },
@@ -1222,10 +1278,10 @@ class NasHealthServer {
 
   Future<void> _streamPlayback(HttpRequest request, String tokenHash) async {
     final session = _playbackSession(request, tokenHash);
-    final file = await _mediaService.fixtureFile();
-    if (session == null ||
-        file == null ||
-        file.relativePath != session.relativePath) {
+    final file = session == null
+        ? null
+        : await _mediaService.fileForRelativePath(session.relativePath);
+    if (file == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     final length = await file.length();
