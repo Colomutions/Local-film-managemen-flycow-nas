@@ -30,7 +30,18 @@ MEDIA_ROOT=/你的/NAS/媒体目录
 docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml up -d --build
 ```
 
-该覆盖文件把媒体目录以**只读**方式挂到容器 `/media`。扫描只读取该目录；当前服务没有源文件重命名、移动或删除能力。将来若要开放这些能力，必须先获得用户对读写挂载的明确授权，并实现媒体根 ID 与相对路径校验。
+该覆盖文件把媒体目录以**只读**方式挂到容器 `/media`。扫描只读取该目录；默认不会修改源媒体。
+
+### 受控源文件改名（默认关闭）
+
+只有需要从 Windows 管理员页面执行“同目录改名”时，用户才可在 `.env` 显式设置 `MUJING_ALLOW_SOURCE_RENAME=true`，并改用 `docker-compose.media-writable.yml`，而不是只读覆盖文件：
+
+```text
+sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media-writable.yml build
+sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media-writable.yml up -d
+```
+
+这是对 NAS 源媒体写入的明确风险开关：服务仍只接受当前已扫描分集的相对路径，只能同目录改名、必须保留扩展名、拒绝路径逃逸和文件名冲突；不会移动或删除文件。成功后服务在一个 SQLite 事务内更新分集路径、标题和文件元数据；数据库更新失败时会尽力回滚文件名。未启用可写覆盖或开关时，专用 API 会明确拒绝请求。不要同时使用只读和可写媒体覆盖文件。
 
 ## 启动与验证
 

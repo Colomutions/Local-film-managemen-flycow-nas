@@ -1000,6 +1000,39 @@ class NasLibraryDatabase {
     return findMovieForAdmin(movieId);
   }
 
+  NasLibraryEpisode? updateEpisodeSourceAfterRename({
+    required String episodeId,
+    required String relativePath,
+    required String title,
+    required int fileSize,
+    required int mediaModifiedAt,
+  }) {
+    final episode = findEpisode(episodeId);
+    if (episode == null) return null;
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      _db.execute(
+        '''UPDATE episodes
+           SET relative_path = ?, title = ?, file_size = ?, media_modified_at = ?,
+               is_available = 1, updated_at = ?
+           WHERE id = ?''',
+        [
+          relativePath,
+          title,
+          fileSize,
+          mediaModifiedAt,
+          _now(),
+          episodeId,
+        ],
+      );
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return findEpisode(episodeId);
+  }
+
   int resumePositionMsForEpisode({
     required String movieId,
     required String episodeId,

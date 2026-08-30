@@ -1,0 +1,7 @@
+services:
+  mujing-nas:
+    volumes:
+      - type: bind
+        source: ${MEDIA_ROOT:?Set MEDIA_ROOT in .env before enabling the writable media overlay.}
+        target: /media
+        read_only: false

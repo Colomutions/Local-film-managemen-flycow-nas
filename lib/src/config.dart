@@ -10,6 +10,7 @@ class NasConfig {
     required this.mediaRootName,
     required this.scanOnStart,
     this.managedCategoryLibrary = false,
+    this.allowSourceRename = false,
     required this.dataDir,
     required this.mediaDir,
     required this.timezone,
@@ -37,6 +38,11 @@ class NasConfig {
       // deployments.  The constructor flag remains for isolated legacy tests.
       scanOnStart: false,
       managedCategoryLibrary: true,
+      allowSourceRename: _boolValue(
+        environment,
+        'MUJING_ALLOW_SOURCE_RENAME',
+        false,
+      ),
       dataDir: _value(environment, 'MUJING_DATA_DIR', '/data'),
       mediaDir: _value(environment, 'MUJING_MEDIA_DIR', '/media'),
       timezone: _value(environment, 'MUJING_TIMEZONE', 'Asia/Shanghai'),
@@ -56,6 +62,9 @@ class NasConfig {
   final String mediaRootName;
   final bool scanOnStart;
   final bool managedCategoryLibrary;
+  /// Source media writes require an explicit deployment opt-in.  The default
+  /// media overlay remains read-only even when this flag is present.
+  final bool allowSourceRename;
   final String dataDir;
   final String mediaDir;
   final String timezone;

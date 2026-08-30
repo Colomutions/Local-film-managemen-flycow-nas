@@ -239,6 +239,10 @@ class NasHealthServer {
         return await _deleteAdminMovieCarouselImage(request);
       }
       if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/episodes/[^/]+/source-name$').hasMatch(path)) {
+        return await _renameAdminEpisodeSource(request);
+      }
+      if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/episodes/[^/]+$').hasMatch(path)) {
         return await _updateAdminEpisode(request);
       }
@@ -522,6 +526,7 @@ class NasHealthServer {
       episodes.add({
         'id': episode.id,
         'title': episode.title,
+        'sourceName': episode.relativePath.split('/').last,
         'durationMs': episode.durationMs,
         'resolutionLabel': episode.resolutionLabel,
         'videoWidth': episode.videoWidth,
@@ -1000,6 +1005,65 @@ class NasHealthServer {
     });
   }
 
+  Future<void> _renameAdminEpisodeSource(HttpRequest request) async {
+    if (!config.allowSourceRename) {
+      return _error(request, HttpStatus.conflict, 'source_rename_disabled');
+    }
+    final body = await _readJsonBody(request);
+    final sourceName = body?['sourceName'];
+    if (body == null || body.length != 1 || sourceName is! String) {
+      return _error(request, HttpStatus.badRequest, 'invalid_source_name');
+    }
+    final segments = request.uri.pathSegments;
+    final episodeId = segments[segments.length - 2];
+    final episode = _libraryDatabase.findEpisode(episodeId);
+    if (episode == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    NasMediaFile? renamed;
+    try {
+      renamed = await _mediaService.renameFileInPlace(
+        relativePath: episode.relativePath,
+        sourceName: sourceName,
+      );
+      final stat = await renamed.file.stat();
+      final updated = _libraryDatabase.updateEpisodeSourceAfterRename(
+        episodeId: episode.id,
+        relativePath: renamed.relativePath,
+        title: _sourceTitle(sourceName),
+        fileSize: stat.size,
+        mediaModifiedAt: stat.modified.microsecondsSinceEpoch,
+      );
+      if (updated == null) throw StateError('episode disappeared during rename');
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': _adminEpisodePayload(updated),
+      });
+    } on NasMediaRenameException catch (error) {
+      return _error(
+        request,
+        error.code == 'source_name_conflict'
+            ? HttpStatus.conflict
+            : error.code == 'resource_not_found'
+            ? HttpStatus.notFound
+            : HttpStatus.badRequest,
+        error.code,
+      );
+    } on Object {
+      if (renamed != null) {
+        await _mediaService.restoreRenamedFile(
+          renamedFile: renamed,
+          originalRelativePath: episode.relativePath,
+        );
+      }
+      return _error(request, HttpStatus.internalServerError, 'source_metadata_update_failed');
+    }
+  }
+
+  static String _sourceTitle(String sourceName) {
+    final dot = sourceName.lastIndexOf('.');
+    return dot <= 0 ? sourceName : sourceName.substring(0, dot);
+  }
+
   Future<void> _createScanJob(HttpRequest request) async {
     final body = await _readJsonBody(request);
     final categoryId = body?['categoryId'];
@@ -1225,6 +1289,7 @@ class NasHealthServer {
         'id': episode.id,
         'movieId': episode.movieId,
         'title': episode.title,
+        'sourceName': episode.relativePath.split('/').last,
         'durationMs': episode.durationMs,
         'resolutionLabel': episode.resolutionLabel,
         'videoWidth': episode.videoWidth,
@@ -1751,6 +1816,14 @@ class NasHealthServer {
       'playback_not_ready': 'The playback stream has not started.',
       'resource_not_found': 'Resource not found.',
       'service_unavailable': 'Service is unavailable.',
+      'source_rename_disabled':
+          'Source rename is disabled until the writable media deployment opt-in is enabled.',
+      'invalid_source_name':
+          'The requested source name is invalid or changes the file extension.',
+      'source_name_conflict': 'A file with the requested name already exists.',
+      'source_rename_failed': 'The source file could not be renamed.',
+      'source_metadata_update_failed':
+          'The source file rename could not be saved to the media database.',
     };
     return _writeJson(request.response, statusCode, {
       'error': {'code': code, 'message': messages[code] ?? 'Request failed.'},

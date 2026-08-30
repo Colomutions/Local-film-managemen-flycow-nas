@@ -24,6 +24,7 @@ Future<void> main() async {
     dataDir: '${directory.path}${Platform.pathSeparator}data',
     mediaDir: mediaRoot.path,
     timezone: 'Asia/Shanghai',
+    allowSourceRename: true,
   );
   final server = NasHealthServer(config);
 
@@ -223,6 +224,36 @@ Future<void> main() async {
       pathRejected = true;
     }
     _expect(pathRejected, 'relative media path rejects traversal');
+
+    final adminToken = await _pairAdmin(
+      baseUrl,
+      (info.json['data'] as Map<String, dynamic>)['serverId'] as String,
+      config.pairingCode!,
+    );
+    final sourceRename = await _request(
+      baseUrl,
+      'PATCH',
+      '/api/v1/admin/episodes/${episode['id']}/source-name',
+      token: adminToken,
+      body: {'sourceName': 'renamed.mp4'},
+    );
+    _expect(sourceRename.statusCode == HttpStatus.ok, 'admin can rename a source file in place');
+    _expect(sourceRename.json['data']['title'] == 'renamed', 'source rename updates NAS episode title');
+    _expect(await File('${mediaFile.parent.path}${Platform.pathSeparator}renamed.mp4').exists(), 'source file is renamed in the same directory');
+    _expect(!await mediaFile.exists(), 'original source file name is removed by rename');
+    final renamedDetails = await _request(baseUrl, 'GET', '/api/v1/movies/$movieId', token: token);
+    _expect(
+      ((renamedDetails.json['data'] as Map<String, dynamic>)['episodes'] as List).single['title'] == 'renamed',
+      'rename persists updated NAS SQLite episode metadata',
+    );
+    final extensionRejected = await _request(
+      baseUrl,
+      'PATCH',
+      '/api/v1/admin/episodes/${episode['id']}/source-name',
+      token: adminToken,
+      body: {'sourceName': 'renamed.mkv'},
+    );
+    _expectError(extensionRejected, HttpStatus.badRequest, 'invalid_source_name');
   } finally {
     await server.stop();
     await directory.delete(recursive: true);
@@ -237,6 +268,23 @@ Future<String> _pairViewer(Uri baseUrl, String serverId, String pairingCode) asy
     'POST',
     '/api/v1/pairing/sessions',
     body: {'serverId': serverId},
+  );
+  final sessionId = (session.json['data'] as Map<String, dynamic>)['pairingSessionId'] as String;
+  final confirmed = await _request(
+    baseUrl,
+    'POST',
+    '/api/v1/pairing/sessions/$sessionId/confirm',
+    body: {'pairingPassword': pairingCode},
+  );
+  return confirmed.json['data']['accessToken'] as String;
+}
+
+Future<String> _pairAdmin(Uri baseUrl, String serverId, String pairingCode) async {
+  final session = await _request(
+    baseUrl,
+    'POST',
+    '/api/v1/pairing/sessions',
+    body: {'serverId': serverId, 'requestedScope': 'admin'},
   );
   final sessionId = (session.json['data'] as Map<String, dynamic>)['pairingSessionId'] as String;
   final confirmed = await _request(
