@@ -9,6 +9,7 @@ class NasConfig {
     required this.fixtureMediaRelativePath,
     required this.mediaRootName,
     required this.scanOnStart,
+    this.managedCategoryLibrary = false,
     required this.dataDir,
     required this.mediaDir,
     required this.timezone,
@@ -32,7 +33,10 @@ class NasConfig {
       pairingCode: _optionalValue(environment, 'MUJING_PAIRING_CODE'),
       fixtureMediaRelativePath: _relativeMediaPath(environment),
       mediaRootName: _value(environment, 'MUJING_MEDIA_ROOT_NAME', '媒体库'),
-      scanOnStart: _boolValue(environment, 'MUJING_SCAN_ON_START', false),
+      // Category-bound scanning replaces the former process-start scan for
+      // deployments.  The constructor flag remains for isolated legacy tests.
+      scanOnStart: false,
+      managedCategoryLibrary: true,
       dataDir: _value(environment, 'MUJING_DATA_DIR', '/data'),
       mediaDir: _value(environment, 'MUJING_MEDIA_DIR', '/media'),
       timezone: _value(environment, 'MUJING_TIMEZONE', 'Asia/Shanghai'),
@@ -51,6 +55,7 @@ class NasConfig {
   final String? fixtureMediaRelativePath;
   final String mediaRootName;
   final bool scanOnStart;
+  final bool managedCategoryLibrary;
   final String dataDir;
   final String mediaDir;
   final String timezone;

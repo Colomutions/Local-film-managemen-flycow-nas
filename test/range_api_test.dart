@@ -20,7 +20,7 @@ Future<void> main() async {
     pairingCode: 'test-pairing-code',
     fixtureMediaRelativePath: 'fixture/sample.mp4',
     mediaRootName: 'test',
-    scanOnStart: false,
+    scanOnStart: true,
     dataDir: '${directory.path}${Platform.pathSeparator}data',
     mediaDir: mediaRoot.path,
     timezone: 'Asia/Shanghai',
@@ -37,10 +37,20 @@ Future<void> main() async {
       config.pairingCode!,
     );
 
+    final movies = await _request(
+      baseUrl,
+      'GET',
+      '/api/v1/movies',
+      token: token,
+    );
+    final movie = (movies.json['data'] as Map<String, dynamic>)['items'].single
+        as Map<String, dynamic>;
+    final movieId = movie['id'] as String;
+    _expect(movie['playCount'] == 0, 'scanned movie starts with no plays');
     final details = await _request(
       baseUrl,
       'GET',
-      '/api/v1/movies/${NasFixtureLibrary.movieId}',
+      '/api/v1/movies/$movieId',
       token: token,
     );
     final episode = ((details.json['data'] as Map<String, dynamic>)['episodes'] as List<dynamic>).single
@@ -54,7 +64,7 @@ Future<void> main() async {
       'POST',
       '/api/v1/playback/sessions',
       token: token,
-      body: {'contentId': NasFixtureLibrary.movieId, 'preferredPlayback': 'direct'},
+      body: {'contentId': movieId, 'preferredPlayback': 'direct'},
     );
     _expect(playback.statusCode == HttpStatus.ok, 'viewer creates playback session');
     final playbackData = playback.json['data'] as Map<String, dynamic>;
@@ -74,6 +84,28 @@ Future<void> main() async {
     _expect(full.statusCode == HttpStatus.ok, 'full GET returns 200');
     _expect(full.headers[HttpHeaders.acceptRangesHeader] == 'bytes', 'full GET advertises ranges');
     _expect(full.bytes.toString() == expectedBytes.toString(), 'full GET streams file bytes');
+
+    final started = await _request(
+      baseUrl,
+      'POST',
+      '/api/v1/playback/sessions/$sessionId/started',
+      token: token,
+    );
+    _expect(started.statusCode == HttpStatus.ok, 'formal playback start is accepted');
+    final repeatedStarted = await _request(
+      baseUrl,
+      'POST',
+      '/api/v1/playback/sessions/$sessionId/started',
+      token: token,
+    );
+    _expect(repeatedStarted.statusCode == HttpStatus.ok, 'repeated start is idempotent');
+    final afterStart = await _request(baseUrl, 'GET', '/api/v1/movies', token: token);
+    _expect(
+      ((afterStart.json['data'] as Map<String, dynamic>)['items'].single
+              as Map<String, dynamic>)['playCount'] ==
+          1,
+      'formal playback increments the NAS SQLite play count once',
+    );
 
     final headRange = await _request(
       baseUrl,
@@ -120,10 +152,54 @@ Future<void> main() async {
       'POST',
       '/api/v1/playback/sessions',
       token: token,
-      body: {'contentId': NasFixtureLibrary.movieId},
+      body: {'contentId': movieId},
     );
     _expect(resumed.json['data']['resumePositionMs'] == 45000, 'next session resumes saved position');
     _expect(resumed.json['data']['durationMs'] == 100000, 'next session keeps saved duration');
+
+    final preview = await _request(
+      baseUrl,
+      'POST',
+      '/api/v1/playback/sessions',
+      token: token,
+      body: {
+        'contentId': movieId,
+        'episodeId': episode['id'],
+        'purpose': 'preview',
+      },
+    );
+    _expect(preview.statusCode == HttpStatus.ok, 'preview creates an isolated NAS stream session');
+    final previewData = preview.json['data'] as Map<String, dynamic>;
+    _expect(previewData['resumePositionMs'] == 0, 'preview never resumes formal playback state');
+    final previewStream = await _request(
+      baseUrl,
+      'GET',
+      previewData['playbackVariants'].single['url'] as String,
+      token: token,
+      range: 'bytes=0-9',
+    );
+    _expect(previewStream.statusCode == HttpStatus.partialContent, 'preview uses the NAS Range stream');
+    final previewProgress = await _request(
+      baseUrl,
+      'PATCH',
+      '/api/v1/playback/sessions/${previewData['sessionId']}/progress',
+      token: token,
+      body: {'positionMs': 8, 'durationMs': 100000, 'state': 'playing'},
+    );
+    _expect(previewProgress.statusCode == HttpStatus.ok, 'preview progress is ignored without failing playback');
+    await _request(
+      baseUrl,
+      'DELETE',
+      '/api/v1/playback/sessions/${previewData['sessionId']}',
+      token: token,
+    );
+    final afterPreview = await _request(baseUrl, 'GET', '/api/v1/movies', token: token);
+    _expect(
+      ((afterPreview.json['data'] as Map<String, dynamic>)['items'].single
+              as Map<String, dynamic>)['playCount'] ==
+          1,
+      'preview never increments playback count',
+    );
 
     final closed = await _request(
       baseUrl,

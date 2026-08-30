@@ -52,6 +52,12 @@ curl http://<NAS 局域网地址>:48291/health
 {"data":{"status":"ok","service":"mujing-nas","version":"0.1.0"}}
 ```
 
+以下 `dart` 命令只适用于安装了 Dart SDK 的开发机；飞牛 NAS 宿主机默认不安装 Dart，出现 `dart: command not found` 属于预期。NAS 上应使用 Docker 构建验证，Dockerfile 会在构建阶段执行 `dart pub get` 与 `dart compile exe`：
+
+```text
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml build --pull=false
+```
+
 在开发机上可不依赖 Docker 运行最小测试：
 
 ```text
@@ -110,7 +116,7 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 - `DELETE /api/v1/playback/sessions/{id}`：关闭会话。
 - `GET` / `HEAD /api/v1/playback/sessions/{id}/stream`：支持无 Range 的 `200`、单 Range 的 `206` 和非法 Range 的 `416`，不把整文件读入内存。
 
-任务 I 使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。设置 `MUJING_SCAN_ON_START=true` 后，服务只扫描容器 `/media` 中的 `mp4`、`m4v`、`mkv`、`mov` 与 `webm` 文件；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。首次扫描完成后可把该开关改回 `false`，以避免每次重启全量扫描。
+服务使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。生产环境把容器 `/media` 作为只读边界，启动时不自动扫描；在 Windows NAS 管理页创建类别并绑定其子目录后，才会显式扫描该类别中的 `mp4`、`m4v`、`mkv`、`mov` 与 `webm` 文件。类别目录不得相同、互为父子或经符号链接越出媒体根；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。`MUJING_SCAN_ON_START` 仅保留给隔离的旧测试构造，环境配置中不再启用它。
 
 任务 I 暂不调用 ffprobe，因此时长和分辨率可为空；它也不提供管理 API、重命名、移动或删除。扫码得到的 SQLite 影片会优先替代内存 fixture；尚未扫描时仍保留 fixture 用于协议测试。
 

@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'auth.dart';
+
 class NasArtworkFile {
   const NasArtworkFile({
     required this.file,
@@ -19,6 +21,8 @@ class NasArtworkService {
 
   Directory get _posterDirectory => Directory(
       '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters');
+  Directory get _carouselDirectory => Directory(
+      '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel');
 
   Future<String> savePoster({
     required String movieId,
@@ -56,6 +60,44 @@ class NasArtworkService {
 
   Future<void> deletePoster(String? fileName) async {
     final artwork = await poster(fileName);
+    if (artwork != null) await artwork.file.delete();
+  }
+
+  Future<String> saveCarouselImage({
+    required String movieId,
+    required String mimeType,
+    required List<int> bytes,
+  }) async {
+    final extension = _extensionForMimeType(mimeType);
+    if (extension == null || !isValidPosterBytes(mimeType: mimeType, bytes: bytes)) {
+      throw ArgumentError('Unsupported or invalid carousel payload.');
+    }
+    final directory = _carouselDirectory;
+    await directory.create(recursive: true);
+    final fileName = '${movieId}-${newUuidV4()}.$extension';
+    final target = File('${directory.path}${Platform.pathSeparator}$fileName');
+    final temporary = File('${target.path}.tmp');
+    await temporary.writeAsBytes(bytes, flush: true);
+    await temporary.rename(target.path);
+    return fileName;
+  }
+
+  Future<NasArtworkFile?> carouselImage(String? fileName) async {
+    if (fileName == null ||
+        !RegExp(r'^movie-[A-Za-z0-9-]+-[A-Za-z0-9-]+\.(png|jpe?g|webp)$')
+            .hasMatch(fileName)) {
+      return null;
+    }
+    final mimeType = _mimeTypeForFileName(fileName);
+    if (mimeType == null) return null;
+    final file = File('${_carouselDirectory.path}${Platform.pathSeparator}$fileName');
+    return await file.exists()
+        ? NasArtworkFile(file: file, mimeType: mimeType)
+        : null;
+  }
+
+  Future<void> deleteCarouselImage(String? fileName) async {
+    final artwork = await carouselImage(fileName);
     if (artwork != null) await artwork.file.delete();
   }
 

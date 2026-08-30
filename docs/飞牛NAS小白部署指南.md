@@ -246,30 +246,18 @@ sudo docker inspect mujing-nas \
 
 重要：启用媒体后，以后每次创建或重建容器都必须同时带上 `docker-compose.media.yml`。如果只执行基础 `docker compose up`，新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
 
-## 9. 首次扫描真实片库
+## 9. 首次建立影片类别并扫描
 
-确认只读媒体挂载正常后，在 `.env` 临时设置：
+确认只读媒体挂载正常后，服务启动时的影片库应为空。不要把
+`MUJING_SCAN_ON_START` 设为 `true`；生产环境不会再用它扫描整个媒体根。
 
-```dotenv
-MUJING_SCAN_ON_START=true
-```
+在 Windows 的“管理 NAS 影片”页中依次完成：
 
-使用媒体覆盖重新创建容器：
+1. 打开“影院分类”的设置，新建一个类别。
+2. 在 NAS 内部目录选择器中为类别选择一个媒体子目录。
+3. 点击“扫描文件夹”，选择该类别并确认。
 
-```bash
-sudo docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.yml \
-  up -d --force-recreate
-```
-
-扫描完成并确认影片进入 SQLite 后，把开关改回：
-
-```dotenv
-MUJING_SCAN_ON_START=false
-```
-
-再使用同样两个 Compose 文件重建，避免以后每次启动都执行全量扫描。
+扫描只读取这个类别绑定的只读目录，并把发现的视频归入该类别。不同类别不能绑定同一目录，也不能绑定互为父子关系的目录；变更类别目录会清除该类别旧的 NAS 影片元数据，但不会删除源视频。
 
 ## 10. Android 连接
 
@@ -296,7 +284,42 @@ http://NAS局域网地址:48291
 permission denied while trying to connect to /var/run/docker.sock
 ```
 
-使用 `sudo docker ...`，或由管理员正确配置 Docker 用户组。不要放宽 socket 权限给所有用户。
+不要修改 Docker socket 权限，也不要把普通用户加入 Docker 用户组。使用管理员身份构建：
+
+```bash
+sudo -H docker compose --env-file .env \
+  -f docker-compose.yml \
+  -f docker-compose.media.yml \
+  build --pull=false
+```
+
+### Docker CLI 无法创建用户 Home 目录
+
+```text
+mkdir /home/<用户>: permission denied
+```
+
+这是 Docker CLI 配置目录不可写，不是项目源码错误。仅在没有 `sudo` 的临时构建场景下，创建专用临时配置目录：
+
+```bash
+mkdir -p /tmp/mujing-docker-config
+
+HOME=/tmp DOCKER_CONFIG=/tmp/mujing-docker-config \
+docker compose --env-file .env \
+  -f docker-compose.yml \
+  -f docker-compose.media.yml \
+  build --pull=false
+```
+
+`/tmp/mujing-docker-config` 是本项目唯一建议创建的临时目录；正式部署前可由管理员删除该**精确目录**，不要删除整个 `/tmp`。它不包含项目数据、媒体、SQLite、海报、轮播图或 `.env`。
+
+### NAS 宿主机没有 `dart`
+
+```text
+dart: command not found
+```
+
+这是预期行为。Dart SDK 只存在于 Dockerfile 的构建阶段；用上面的 `docker compose ... build --pull=false` 编译验证，不在 NAS 宿主机运行 `dart format`、`dart analyze` 或 `dart run test`。
 
 ### `sqlite3` Dart 包找不到
 

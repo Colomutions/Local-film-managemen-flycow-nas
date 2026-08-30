@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:sqlite3/sqlite3.dart';
@@ -11,9 +13,11 @@ class NasLibraryMovie {
     required this.id,
     required this.title,
     required this.summary,
+    required this.actors,
     required this.posterFileName,
     required this.episodeCount,
     required this.durationMs,
+    required this.playCount,
     required this.updatedAt,
     this.videoWidth,
     this.videoHeight,
@@ -23,9 +27,11 @@ class NasLibraryMovie {
   final String id;
   final String title;
   final String summary;
+  final List<String> actors;
   final String? posterFileName;
   final int episodeCount;
   final int? durationMs;
+  final int playCount;
   final String updatedAt;
   final int? videoWidth;
   final int? videoHeight;
@@ -88,12 +94,14 @@ class NasLibraryCategory {
   const NasLibraryCategory({
     required this.id,
     required this.name,
+    this.mediaRelativePath,
     required this.createdAt,
     required this.updatedAt,
   });
 
   final String id;
   final String name;
+  final String? mediaRelativePath;
   final String createdAt;
   final String updatedAt;
 }
@@ -150,8 +158,22 @@ class NasScanResult {
   final int availableEpisodes;
 }
 
+class NasCarouselImage {
+  const NasCarouselImage({
+    required this.id,
+    required this.movieId,
+    required this.fileName,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String movieId;
+  final String fileName;
+  final String createdAt;
+}
+
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 5;
+  static const currentSchemaVersion = 9;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -166,6 +188,9 @@ class NasLibraryDatabase {
     await directory.create(recursive: true);
     await Directory(
             '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters')
+        .create(recursive: true);
+    await Directory(
+            '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel')
         .create(recursive: true);
     final database =
         sqlite3.open('${directory.path}${Platform.pathSeparator}mujing.sqlite');
@@ -308,6 +333,66 @@ class NasLibraryDatabase {
         [5, _now()],
       );
     }
+    if (current < 6) {
+      _db.execute('''
+        ALTER TABLE library_categories ADD COLUMN media_relative_path TEXT;
+        CREATE UNIQUE INDEX library_categories_media_relative_path_idx
+          ON library_categories(media_relative_path)
+          WHERE media_relative_path IS NOT NULL;
+        -- The previous global-root scan has no safe category assignment.
+        -- Its metadata is intentionally reset; the read-only media mount is
+        -- never touched and categories/tags are retained.
+        DELETE FROM movies;
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [6, _now()],
+      );
+    }
+    if (current < 7) {
+      _db.execute('''
+        CREATE TABLE movie_carousel_images (
+          id TEXT PRIMARY KEY,
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          file_name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX movie_carousel_images_movie_id_idx
+          ON movie_carousel_images(movie_id, created_at);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [7, _now()],
+      );
+    }
+    if (current < 8) {
+      _db.execute(
+        "ALTER TABLE movies ADD COLUMN actors_json TEXT NOT NULL DEFAULT '[]'",
+      );
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [8, _now()],
+      );
+    }
+    if (current < 9) {
+      _db.execute('''
+        ALTER TABLE movies ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE episode_playback_progress (
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+          position_ms INTEGER NOT NULL,
+          duration_ms INTEGER NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(movie_id, episode_id)
+        );
+        CREATE INDEX episode_playback_progress_movie_idx
+          ON episode_playback_progress(movie_id, updated_at);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [9, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -375,6 +460,8 @@ class NasLibraryDatabase {
   Future<NasScanResult> scanMediaRoot({
     required String mediaRootId,
     required NasMediaService mediaService,
+    String? categoryId,
+    String? directoryRelativePath,
     NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
   }) async {
     final configuredRoot = findMediaRoot(mediaRootId);
@@ -385,11 +472,29 @@ class NasLibraryDatabase {
       throw StateError(
           'Only the configured media service root can be scanned.');
     }
+    if ((categoryId == null) != (directoryRelativePath == null)) {
+      throw ArgumentError('Category scan requires both category and directory.');
+    }
     final rootId = configuredRoot.id;
-    _db.execute(
+    if (categoryId == null) {
+      _db.execute(
         'UPDATE episodes SET is_available = 0, updated_at = ? WHERE media_root_id = ?',
-        [_now(), rootId]);
-    final root = Directory(configuredRoot.containerPath);
+        [_now(), rootId],
+      );
+    } else {
+      _db.execute('''
+        UPDATE episodes SET is_available = 0, updated_at = ?
+        WHERE movie_id IN (SELECT id FROM movies WHERE category_id = ?)
+      ''', [_now(), categoryId]);
+    }
+    final root = directoryRelativePath == null
+        ? Directory(configuredRoot.containerPath)
+        : (await mediaService.directoryForRelativePath(directoryRelativePath))
+              ?.directory;
+    if (root == null) {
+      _markRootScanned(rootId);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
     if (!await root.exists()) {
       _markRootScanned(rootId);
       return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
@@ -403,9 +508,12 @@ class NasLibraryDatabase {
       if (entity is! File || !_isVideo(entity.path)) continue;
       final canonicalFile = await entity.resolveSymbolicLinks();
       if (!canonicalFile.startsWith(prefix)) continue;
-      final relativePath = canonicalFile
+      final scannedRelativePath = canonicalFile
           .substring(prefix.length)
           .replaceAll(Platform.pathSeparator, '/');
+      final relativePath = directoryRelativePath == null
+          ? scannedRelativePath
+          : '$directoryRelativePath/$scannedRelativePath';
       final checkedFile = await mediaService.fileForRelativePath(relativePath);
       if (checkedFile == null) continue;
       final stat = await checkedFile.file.stat();
@@ -431,10 +539,21 @@ class NasLibraryDatabase {
           'episode-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
       final title = _titleFromPath(relativePath);
       final timestamp = _now();
-      _db.execute('''
-        INSERT INTO movies(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO NOTHING
-      ''', [movieId, title, timestamp, timestamp]);
+      _db.execute(
+        categoryId == null
+            ? '''
+              INSERT INTO movies(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)
+              ON CONFLICT(id) DO NOTHING
+            '''
+            : '''
+              INSERT INTO movies(id, title, category_id, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET category_id = excluded.category_id
+            ''',
+        categoryId == null
+            ? [movieId, title, timestamp, timestamp]
+            : [movieId, title, categoryId, timestamp, timestamp],
+      );
       _db.execute('''
         INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, duration_ms, video_width, video_height, resolution_label, media_modified_at, file_size, is_available, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
@@ -466,10 +585,32 @@ class NasLibraryDatabase {
         scannedFiles: scannedFiles, availableEpisodes: scannedFiles);
   }
 
+  Future<NasScanResult> scanCategory({
+    required String categoryId,
+    required String mediaRootId,
+    required NasMediaService mediaService,
+    NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
+  }) {
+    final category = findCategory(categoryId);
+    final directoryRelativePath = category?.mediaRelativePath;
+    if (category == null ||
+        directoryRelativePath == null ||
+        directoryRelativePath.isEmpty) {
+      throw ArgumentError.value(categoryId, 'categoryId', 'has no media directory');
+    }
+    return scanMediaRoot(
+      mediaRootId: mediaRootId,
+      mediaService: mediaService,
+      categoryId: categoryId,
+      directoryRelativePath: directoryRelativePath,
+      metadataProbe: metadataProbe,
+    );
+  }
+
   List<NasLibraryMovie> listMovies({String query = ''}) {
     final queryLike = '%${query.trim()}%';
     final rows = _db.select('''
-      SELECT m.id, m.title, m.summary, m.poster_file_name, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.summary, m.actors_json, m.poster_file_name, m.play_count, m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m JOIN episodes e ON e.movie_id = m.id
       WHERE e.is_available = 1 AND (? = '%%' OR lower(m.title) LIKE lower(?))
@@ -480,7 +621,9 @@ class NasLibraryDatabase {
               id: row['id'] as String,
               title: row['title'] as String,
               summary: row['summary'] as String,
+              actors: _decodeActors(row['actors_json'] as String?),
               posterFileName: row['poster_file_name'] as String?,
+              playCount: row['play_count'] as int,
               episodeCount: row['episode_count'] as int,
               durationMs: (row['duration_ms'] as int?) == 0
                   ? null
@@ -508,7 +651,7 @@ class NasLibraryDatabase {
 
   NasLibraryMovie? findMovieForAdmin(String movieId) {
     final rows = _db.select('''
-      SELECT m.id, m.title, m.summary, m.poster_file_name, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.summary, m.actors_json, m.poster_file_name, m.play_count, m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m LEFT JOIN episodes e ON e.movie_id = m.id
       WHERE m.id = ?
@@ -521,9 +664,12 @@ class NasLibraryDatabase {
     required String movieId,
     String? title,
     String? summary,
+    List<String>? actors,
   }) {
     if (findMovieForAdmin(movieId) == null) return null;
-    if (title == null && summary == null) return findMovieForAdmin(movieId);
+    if (title == null && summary == null && actors == null) {
+      return findMovieForAdmin(movieId);
+    }
     final assignments = <String>[];
     final values = <Object?>[];
     if (title != null) {
@@ -533,6 +679,10 @@ class NasLibraryDatabase {
     if (summary != null) {
       assignments.add('summary = ?');
       values.add(summary);
+    }
+    if (actors != null) {
+      assignments.add('actors_json = ?');
+      values.add(jsonEncode(actors));
     }
     assignments.add('updated_at = ?');
     values.add(_now());
@@ -594,13 +744,13 @@ class NasLibraryDatabase {
 
   List<NasLibraryCategory> listCategories() => _db
       .select(
-          'SELECT id, name, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
+          'SELECT id, name, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
       .map(_mapCategory)
       .toList(growable: false);
 
   NasLibraryCategory? findCategory(String categoryId) {
     final rows = _db.select(
-      'SELECT id, name, created_at, updated_at FROM library_categories WHERE id = ?',
+      'SELECT id, name, media_relative_path, created_at, updated_at FROM library_categories WHERE id = ?',
       [categoryId],
     );
     return rows.isEmpty ? null : _mapCategory(rows.single);
@@ -614,26 +764,39 @@ class NasLibraryDatabase {
     return rows.any((row) => row['id'] != excludingId);
   }
 
-  NasLibraryCategory createCategory(String name) {
+  NasLibraryCategory createCategory(String name, {String? mediaRelativePath}) {
     final timestamp = _now();
     final category = NasLibraryCategory(
       id: newUuidV4(),
       name: name,
+      mediaRelativePath: mediaRelativePath,
       createdAt: timestamp,
       updatedAt: timestamp,
     );
     _db.execute(
-      'INSERT INTO library_categories(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
-      [category.id, category.name, category.createdAt, category.updatedAt],
+      'INSERT INTO library_categories(id, name, media_relative_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      [category.id, category.name, category.mediaRelativePath, category.createdAt, category.updatedAt],
     );
     return category;
   }
 
-  NasLibraryCategory? updateCategoryName(String categoryId, String name) {
+  NasLibraryCategory? updateCategory(
+    String categoryId, {
+    required String name,
+    String? mediaRelativePath,
+    required bool updateMediaRelativePath,
+  }) {
     if (findCategory(categoryId) == null) return null;
+    if (updateMediaRelativePath) {
+      _db.execute('DELETE FROM movies WHERE category_id = ?', [categoryId]);
+    }
     _db.execute(
-      'UPDATE library_categories SET name = ?, updated_at = ? WHERE id = ?',
-      [name, _now(), categoryId],
+      updateMediaRelativePath
+          ? 'UPDATE library_categories SET name = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
+          : 'UPDATE library_categories SET name = ?, updated_at = ? WHERE id = ?',
+      updateMediaRelativePath
+          ? [name, mediaRelativePath, _now(), categoryId]
+          : [name, _now(), categoryId],
     );
     return findCategory(categoryId);
   }
@@ -766,7 +929,7 @@ class NasLibraryDatabase {
 
   NasLibraryCategory? categoryForMovie(String movieId) {
     final rows = _db.select('''
-      SELECT c.id, c.name, c.created_at, c.updated_at
+      SELECT c.id, c.name, c.media_relative_path, c.created_at, c.updated_at
       FROM movies m JOIN library_categories c ON c.id = m.category_id
       WHERE m.id = ?
     ''', [movieId]);
@@ -837,11 +1000,97 @@ class NasLibraryDatabase {
     return findMovieForAdmin(movieId);
   }
 
+  int resumePositionMsForEpisode({
+    required String movieId,
+    required String episodeId,
+  }) {
+    final rows = _db.select('''
+      SELECT position_ms FROM episode_playback_progress
+      WHERE movie_id = ? AND episode_id = ?
+    ''', [movieId, episodeId]);
+    return rows.isEmpty ? 0 : rows.single['position_ms'] as int;
+  }
+
+  void recordPlaybackStarted(String movieId) {
+    _db.execute(
+      'UPDATE movies SET play_count = play_count + 1, updated_at = ? WHERE id = ?',
+      [_now(), movieId],
+    );
+  }
+
+  void savePlaybackProgress({
+    required String movieId,
+    required String episodeId,
+    required int positionMs,
+    required int durationMs,
+  }) {
+    final boundedPosition = positionMs > durationMs ? durationMs : positionMs;
+    _db.execute('''
+      INSERT INTO episode_playback_progress(
+        movie_id, episode_id, position_ms, duration_ms, updated_at
+      ) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(movie_id, episode_id) DO UPDATE SET
+        position_ms = excluded.position_ms,
+        duration_ms = excluded.duration_ms,
+        updated_at = excluded.updated_at
+    ''', [movieId, episodeId, boundedPosition, durationMs, _now()]);
+  }
+
+  List<NasCarouselImage> carouselImagesForMovie(String movieId) => _db
+      .select('''
+        SELECT id, movie_id, file_name, created_at
+        FROM movie_carousel_images WHERE movie_id = ? ORDER BY created_at, id
+      ''', [movieId])
+      .map(_mapCarouselImage)
+      .toList(growable: false);
+
+  NasCarouselImage? addCarouselImage({
+    required String movieId,
+    required String fileName,
+  }) {
+    if (findMovieForAdmin(movieId) == null) return null;
+    final image = NasCarouselImage(
+      id: newUuidV4(),
+      movieId: movieId,
+      fileName: fileName,
+      createdAt: _now(),
+    );
+    _db.execute(
+      'INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at) VALUES (?, ?, ?, ?)',
+      [image.id, image.movieId, image.fileName, image.createdAt],
+    );
+    return image;
+  }
+
+  NasCarouselImage? removeCarouselImage({
+    required String movieId,
+    required String imageId,
+  }) {
+    final rows = _db.select('''
+      SELECT id, movie_id, file_name, created_at FROM movie_carousel_images
+      WHERE id = ? AND movie_id = ?
+    ''', [imageId, movieId]);
+    if (rows.isEmpty) return null;
+    final image = _mapCarouselImage(rows.single);
+    _db.execute('DELETE FROM movie_carousel_images WHERE id = ?', [imageId]);
+    return image;
+  }
+
+  NasCarouselImage? findCarouselImage(String imageId) {
+    final rows = _db.select('''
+      SELECT id, movie_id, file_name, created_at FROM movie_carousel_images
+      WHERE id = ?
+    ''', [imageId]);
+    return rows.isEmpty ? null : _mapCarouselImage(rows.single);
+  }
+
   NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
         id: row['id'] as String,
         title: row['title'] as String,
         summary: row['summary'] as String,
+        actors: _decodeActors(row['actors_json'] as String?),
         posterFileName: row['poster_file_name'] as String?,
+        playCount: row['play_count'] as int,
         episodeCount: row['episode_count'] as int,
         durationMs: (row['duration_ms'] as int?) == 0
             ? null
@@ -864,14 +1113,28 @@ class NasLibraryDatabase {
       id: movie.id,
       title: movie.title,
       summary: movie.summary,
+      actors: movie.actors,
       posterFileName: movie.posterFileName,
       episodeCount: movie.episodeCount,
       durationMs: movie.durationMs,
+      playCount: movie.playCount,
       updatedAt: movie.updatedAt,
       videoWidth: row?['video_width'] as int?,
       videoHeight: row?['video_height'] as int?,
       resolutionLabel: label,
     );
+  }
+
+  List<String> _decodeActors(String? value) {
+    if (value == null || value.isEmpty) return const [];
+    try {
+      final decoded = jsonDecode(value);
+      return decoded is List
+          ? decoded.whereType<String>().toList(growable: false)
+          : const [];
+    } on FormatException {
+      return const [];
+    }
   }
 
   NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
@@ -897,8 +1160,16 @@ class NasLibraryDatabase {
   NasLibraryCategory _mapCategory(Row row) => NasLibraryCategory(
         id: row['id'] as String,
         name: row['name'] as String,
+        mediaRelativePath: row['media_relative_path'] as String?,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
+      );
+
+  NasCarouselImage _mapCarouselImage(Row row) => NasCarouselImage(
+        id: row['id'] as String,
+        movieId: row['movie_id'] as String,
+        fileName: row['file_name'] as String,
+        createdAt: row['created_at'] as String,
       );
 
   NasLibraryTag _mapTag(Row row) => NasLibraryTag(
