@@ -1,10 +1,10 @@
 import 'dart:convert';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:sqlite3/sqlite3.dart';
 
 import 'auth.dart';
+import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
 
@@ -757,14 +757,19 @@ class NasLibraryDatabase {
   }
 
   bool hasCategoryName(String name, {String? excludingId}) {
-    final rows = _db.select(
-      'SELECT id FROM library_categories WHERE name = ?',
-      [name],
+    final normalized = normalizeTaxonomyName(name);
+    return listCategories().any(
+      (category) =>
+          category.id != excludingId &&
+          normalizeTaxonomyName(category.name) == normalized,
     );
-    return rows.any((row) => row['id'] != excludingId);
   }
 
   NasLibraryCategory createCategory(String name, {String? mediaRelativePath}) {
+    _requireTaxonomyName(name, '分类');
+    if (hasCategoryName(name)) {
+      throw ArgumentError.value(name, 'name', 'already exists');
+    }
     final timestamp = _now();
     final category = NasLibraryCategory(
       id: newUuidV4(),
@@ -787,6 +792,10 @@ class NasLibraryDatabase {
     required bool updateMediaRelativePath,
   }) {
     if (findCategory(categoryId) == null) return null;
+    _requireTaxonomyName(name, '分类');
+    if (hasCategoryName(name, excludingId: categoryId)) {
+      throw ArgumentError.value(name, 'name', 'already exists');
+    }
     if (updateMediaRelativePath) {
       _db.execute('DELETE FROM movies WHERE category_id = ?', [categoryId]);
     }
@@ -807,6 +816,57 @@ class NasLibraryDatabase {
     return true;
   }
 
+  NasCategoryTaxonomyTransfer exportCategoryTaxonomy() {
+    final conflicts = categoryTaxonomyViolations();
+    if (conflicts.isNotEmpty) throw StateError(conflicts.join('\n'));
+    return NasCategoryTaxonomyTransfer(
+      categories: [
+        for (final category in listCategories())
+          NasTaxonomyCategoryDefinition(name: category.name),
+      ],
+    );
+  }
+
+  NasTaxonomyTransferResult importCategoryTaxonomy(
+    NasCategoryTaxonomyTransfer transfer,
+  ) {
+    final conflicts = categoryTaxonomyViolations();
+    if (conflicts.isNotEmpty) {
+      return NasTaxonomyTransferResult(
+        added: const [],
+        skipped: const [],
+        conflicts: conflicts,
+      );
+    }
+    final existing = {
+      for (final category in listCategories())
+        normalizeTaxonomyName(category.name): category,
+    };
+    final added = <String>[];
+    final skipped = <String>[];
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      for (final definition in transfer.categories) {
+        final normalized = normalizeTaxonomyName(definition.name);
+        if (existing.containsKey(normalized)) {
+          skipped.add('分类：${existing[normalized]!.name}');
+          continue;
+        }
+        createCategory(definition.name);
+        added.add('分类：${definition.name}');
+      }
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return NasTaxonomyTransferResult(
+      added: added,
+      skipped: skipped,
+      conflicts: const [],
+    );
+  }
+
   List<NasLibraryTag> listTags() => _db
       .select(
           'SELECT id, name, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
@@ -822,11 +882,23 @@ class NasLibraryDatabase {
   }
 
   bool hasTagName(String name, {String? excludingId}) {
-    final rows = _db.select('SELECT id FROM tags WHERE name = ?', [name]);
-    return rows.any((row) => row['id'] != excludingId);
+    final normalized = normalizeTaxonomyName(name);
+    return listTags().any(
+      (tag) =>
+          tag.id != excludingId && normalizeTaxonomyName(tag.name) == normalized,
+    );
   }
 
   NasLibraryTag createTag(String name) {
+    return createRootTag(name).$1;
+  }
+
+  (NasLibraryTag, NasTagPlacement) createRootTag(String name) {
+    _requireWritableTaxonomy();
+    _requireTaxonomyName(name, '标签');
+    if (hasTagName(name)) {
+      throw ArgumentError.value(name, 'name', 'already exists');
+    }
     final timestamp = _now();
     final tag = NasLibraryTag(
       id: newUuidV4(),
@@ -838,11 +910,44 @@ class NasLibraryDatabase {
       'INSERT INTO tags(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
       [tag.id, tag.name, tag.createdAt, tag.updatedAt],
     );
-    return tag;
+    final placement = _insertTagPlacement(tag.id, null, timestamp);
+    return (tag, placement);
+  }
+
+  (NasLibraryTag, NasTagPlacement) createChildTag({
+    required String name,
+    required String parentTagId,
+  }) {
+    _requireWritableTaxonomy();
+    _requireTaxonomyName(name, '标签');
+    if (hasTagName(name)) {
+      throw ArgumentError.value(name, 'name', 'already exists');
+    }
+    final parentPlacement = _rootPlacementForTag(parentTagId);
+    if (parentPlacement == null) {
+      throw ArgumentError.value(parentTagId, 'parentTagId', 'must be a root tag');
+    }
+    final timestamp = _now();
+    final tag = NasLibraryTag(
+      id: newUuidV4(),
+      name: name,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    );
+    _db.execute(
+      'INSERT INTO tags(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
+      [tag.id, tag.name, tag.createdAt, tag.updatedAt],
+    );
+    return (tag, _insertTagPlacement(tag.id, parentPlacement.id, timestamp));
   }
 
   NasLibraryTag? updateTagName(String tagId, String name) {
     if (findTag(tagId) == null) return null;
+    _requireWritableTaxonomy();
+    _requireTaxonomyName(name, '标签');
+    if (hasTagName(name, excludingId: tagId)) {
+      throw ArgumentError.value(name, 'name', 'already exists');
+    }
     _db.execute(
       'UPDATE tags SET name = ?, updated_at = ? WHERE id = ?',
       [name, _now(), tagId],
@@ -851,9 +956,7 @@ class NasLibraryDatabase {
   }
 
   bool deleteTag(String tagId) {
-    if (findTag(tagId) == null) return false;
-    _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
-    return true;
+    return deleteTagWithTaxonomyRules(tagId);
   }
 
   List<NasTagPlacement> listTagPlacements() => _db.select('''
@@ -873,7 +976,303 @@ class NasLibraryDatabase {
     required String tagId,
     required String? parentPlacementId,
   }) {
-    final timestamp = _now();
+    _requireWritableTaxonomy();
+    if (parentPlacementId == null) {
+      throw ArgumentError('一级标签只能通过新建一级标签创建');
+    }
+    final parent = findTagPlacement(parentPlacementId);
+    if (parent == null || parent.parentPlacementId != null) {
+      throw ArgumentError('二级标签只能归属一级标签');
+    }
+    if (_rootPlacementForTag(tagId) != null) {
+      throw ArgumentError('一级标签不能作为二级标签归属');
+    }
+    if (findTag(tagId) == null) {
+      throw ArgumentError.value(tagId, 'tagId', 'does not exist');
+    }
+    if (listTagPlacements().any(
+      (placement) =>
+          placement.tagId == tagId &&
+          placement.parentPlacementId == parentPlacementId,
+    )) {
+      throw ArgumentError('该一级归属已存在');
+    }
+    return _insertTagPlacement(tagId, parentPlacementId, _now());
+  }
+
+  NasTagPlacement? updateTagPlacementParent({
+    required String placementId,
+    required String? parentPlacementId,
+  }) {
+    _requireWritableTaxonomy();
+    final placement = findTagPlacement(placementId);
+    if (placement == null) return null;
+    if (placement.parentPlacementId == null || parentPlacementId == null) {
+      throw ArgumentError('一级标签不能移动，二级标签必须保留一级归属');
+    }
+    final parent = findTagPlacement(parentPlacementId);
+    if (parent == null || parent.parentPlacementId != null) {
+      throw ArgumentError('二级标签只能归属一级标签');
+    }
+    if (parent.tagId == placement.tagId ||
+        listTagPlacements().any(
+          (item) =>
+              item.id != placementId &&
+              item.tagId == placement.tagId &&
+              item.parentPlacementId == parentPlacementId,
+        )) {
+      throw ArgumentError('该一级归属已存在');
+    }
+    _db.execute(
+      'UPDATE tag_placements SET parent_placement_id = ?, updated_at = ? WHERE id = ?',
+      [parentPlacementId, _now(), placementId],
+    );
+    return findTagPlacement(placementId);
+  }
+
+  bool deleteTagPlacement(String placementId) {
+    _requireWritableTaxonomy();
+    final placement = findTagPlacement(placementId);
+    if (placement == null || placement.parentPlacementId == null) return false;
+    final siblingPlacements = listTagPlacements()
+        .where((item) => item.tagId == placement.tagId)
+        .toList(growable: false);
+    _db.execute('DELETE FROM tag_placements WHERE id = ?', [placementId]);
+    if (siblingPlacements.length == 1) {
+      _db.execute('DELETE FROM tags WHERE id = ?', [placement.tagId]);
+    }
+    return true;
+  }
+
+  NasTagTaxonomyTransfer exportTagTaxonomy() {
+    final conflicts = taxonomyViolations();
+    if (conflicts.isNotEmpty) throw StateError(conflicts.join('\n'));
+    final tagsById = {for (final tag in listTags()) tag.id: tag};
+    final placements = listTagPlacements();
+    final roots = <NasTaxonomyTagDefinition>[];
+    final children = <NasTaxonomyTagDefinition>[];
+    for (final placement in placements.where((item) => item.parentPlacementId == null)) {
+      roots.add(NasTaxonomyTagDefinition(name: tagsById[placement.tagId]!.name));
+    }
+    for (final tag in tagsById.values) {
+      final parents = placements
+          .where((item) => item.tagId == tag.id && item.parentPlacementId != null)
+          .map((item) => tagsById[findTagPlacement(item.parentPlacementId!)!.tagId]!.name)
+          .toList(growable: false);
+      if (parents.isNotEmpty) {
+        children.add(NasTaxonomyTagDefinition(name: tag.name, parents: parents));
+      }
+    }
+    return NasTagTaxonomyTransfer(roots: roots, children: children);
+  }
+
+  NasTaxonomyTransferResult importTagTaxonomy(NasTagTaxonomyTransfer transfer) {
+    final conflicts = taxonomyViolations();
+    if (conflicts.isNotEmpty) {
+      return NasTaxonomyTransferResult(
+        added: const [],
+        skipped: const [],
+        conflicts: conflicts,
+      );
+    }
+    final tags = {for (final tag in listTags()) normalizeTaxonomyName(tag.name): tag};
+    final rootIds = {
+      for (final placement in listTagPlacements().where((item) => item.parentPlacementId == null))
+        placement.tagId,
+    };
+    final childIds = {
+      for (final placement in listTagPlacements().where((item) => item.parentPlacementId != null))
+        placement.tagId,
+    };
+    final preflight = <String>[];
+    for (final root in transfer.roots) {
+      final existing = tags[normalizeTaxonomyName(root.name)];
+      if (existing != null && !rootIds.contains(existing.id)) {
+        preflight.add('标签角色冲突：${existing.name} 已是二级标签');
+      }
+    }
+    for (final child in transfer.children) {
+      final existing = tags[normalizeTaxonomyName(child.name)];
+      if (existing != null && !childIds.contains(existing.id)) {
+        preflight.add('标签角色冲突：${existing.name} 已是一级标签');
+      }
+    }
+    if (preflight.isNotEmpty) {
+      return NasTaxonomyTransferResult(
+        added: const [],
+        skipped: const [],
+        conflicts: preflight,
+      );
+    }
+    final added = <String>[];
+    final skipped = <String>[];
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      for (final root in transfer.roots) {
+        final key = normalizeTaxonomyName(root.name);
+        if (tags.containsKey(key)) {
+          skipped.add('一级标签：${tags[key]!.name}');
+        } else {
+          final created = createRootTag(root.name).$1;
+          tags[key] = created;
+          rootIds.add(created.id);
+          added.add('一级标签：${created.name}');
+        }
+      }
+      for (final child in transfer.children) {
+        final key = normalizeTaxonomyName(child.name);
+        final existing = tags[key];
+        final createdChild = existing == null;
+        final tag = existing ?? createChildTag(
+          name: child.name,
+          parentTagId: tags[normalizeTaxonomyName(child.parents.first)]!.id,
+        ).$1;
+        if (existing == null) {
+          tags[key] = tag;
+          childIds.add(tag.id);
+          added.add('二级标签：${tag.name}');
+        } else {
+          skipped.add('二级标签：${tag.name}');
+        }
+        final currentParents = listTagPlacements()
+            .where((item) => item.tagId == tag.id && item.parentPlacementId != null)
+            .map((item) => findTagPlacement(item.parentPlacementId!)!.tagId)
+            .toSet();
+        for (final parentName in child.parents) {
+          final parent = tags[normalizeTaxonomyName(parentName)]!;
+          if (currentParents.contains(parent.id)) {
+            // createChildTag 会原子创建第一个一级归属；它属于本次导入的新增数据。
+            if (createdChild &&
+                normalizeTaxonomyName(parentName) ==
+                    normalizeTaxonomyName(child.parents.first)) {
+              added.add('标签归属：${parent.name} → ${tag.name}');
+            } else {
+              skipped.add('标签归属：${parent.name} → ${tag.name}');
+            }
+          } else {
+            createTagPlacement(
+              tagId: tag.id,
+              parentPlacementId: _rootPlacementForTag(parent.id)!.id,
+            );
+            currentParents.add(parent.id);
+            added.add('标签归属：${parent.name} → ${tag.name}');
+          }
+        }
+      }
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return NasTaxonomyTransferResult(
+      added: added,
+      skipped: skipped,
+      conflicts: const [],
+    );
+  }
+
+  bool deleteTagWithTaxonomyRules(String tagId) {
+    _requireWritableTaxonomy();
+    final root = _rootPlacementForTag(tagId);
+    if (root == null) return false;
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      final children = listTagPlacements()
+          .where((item) => item.parentPlacementId == root.id)
+          .toList(growable: false);
+      _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
+      for (final childPlacement in children) {
+        final remaining = listTagPlacements()
+            .where((item) => item.tagId == childPlacement.tagId)
+            .toList(growable: false);
+        if (remaining.isEmpty) {
+          _db.execute('DELETE FROM tags WHERE id = ?', [childPlacement.tagId]);
+        }
+      }
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return true;
+  }
+
+  List<String> taxonomyViolations() {
+    final violations = <String>[];
+    final tags = listTags();
+    final placements = listTagPlacements();
+    final tagsById = {for (final tag in tags) tag.id: tag};
+    final names = <String, String>{};
+    for (final tag in tags) {
+      final key = normalizeTaxonomyName(tag.name);
+      final existing = names[key];
+      if (existing != null) {
+        violations.add('标签名称重复（不区分大小写）：$existing / ${tag.name}');
+      } else {
+        names[key] = tag.name;
+      }
+    }
+    final rootCount = <String, int>{};
+    final childCount = <String, int>{};
+    final childParents = <String>{};
+    for (final placement in placements) {
+      final tag = tagsById[placement.tagId];
+      if (tag == null) {
+        violations.add('标签位置引用了不存在的标签：${placement.id}');
+        continue;
+      }
+      if (placement.parentPlacementId == null) {
+        rootCount.update(tag.id, (count) => count + 1, ifAbsent: () => 1);
+        continue;
+      }
+      final parents = placements
+          .where((item) => item.id == placement.parentPlacementId)
+          .toList(growable: false);
+      final parent = parents.isEmpty ? null : parents.single;
+      if (parent == null || parent.parentPlacementId != null) {
+        violations.add('标签层级超过两级：${tag.name}');
+        continue;
+      }
+      final key = '${tag.id}:${parent.id}';
+      if (!childParents.add(key)) {
+        violations.add('标签归属重复：${tag.name}');
+      }
+      childCount.update(tag.id, (count) => count + 1, ifAbsent: () => 1);
+    }
+    for (final tag in tags) {
+      final roots = rootCount[tag.id] ?? 0;
+      final children = childCount[tag.id] ?? 0;
+      if (roots == 0 && children == 0) {
+        violations.add('标签未归属：${tag.name}');
+      } else if (roots > 1) {
+        violations.add('一级标签位置重复：${tag.name}');
+      } else if (roots > 0 && children > 0) {
+        violations.add('标签角色混用：${tag.name} 同时是一级和二级');
+      }
+    }
+    return violations;
+  }
+
+  bool isTagPlacementDescendant({
+    required String candidateParentId,
+    required String placementId,
+  }) {
+    var current = findTagPlacement(candidateParentId);
+    final visited = <String>{};
+    while (current != null && visited.add(current.id)) {
+      if (current.id == placementId) return true;
+      current = current.parentPlacementId == null
+          ? null
+          : findTagPlacement(current.parentPlacementId!);
+    }
+    return false;
+  }
+
+  NasTagPlacement _insertTagPlacement(
+    String tagId,
+    String? parentPlacementId,
+    String timestamp,
+  ) {
     final placement = NasTagPlacement(
       id: newUuidV4(),
       tagId: tagId,
@@ -894,37 +1293,40 @@ class NasLibraryDatabase {
     return placement;
   }
 
-  NasTagPlacement? updateTagPlacementParent({
-    required String placementId,
-    required String? parentPlacementId,
-  }) {
-    if (findTagPlacement(placementId) == null) return null;
-    _db.execute(
-      'UPDATE tag_placements SET parent_placement_id = ?, updated_at = ? WHERE id = ?',
-      [parentPlacementId, _now(), placementId],
-    );
-    return findTagPlacement(placementId);
+  NasTagPlacement? _rootPlacementForTag(String tagId) {
+    final roots = listTagPlacements()
+        .where((placement) =>
+            placement.tagId == tagId && placement.parentPlacementId == null)
+        .toList(growable: false);
+    return roots.length == 1 ? roots.single : null;
   }
 
-  bool deleteTagPlacement(String placementId) {
-    if (findTagPlacement(placementId) == null) return false;
-    _db.execute('DELETE FROM tag_placements WHERE id = ?', [placementId]);
-    return true;
-  }
-
-  bool isTagPlacementDescendant({
-    required String candidateParentId,
-    required String placementId,
-  }) {
-    var current = findTagPlacement(candidateParentId);
-    final visited = <String>{};
-    while (current != null && visited.add(current.id)) {
-      if (current.id == placementId) return true;
-      current = current.parentPlacementId == null
-          ? null
-          : findTagPlacement(current.parentPlacementId!);
+  List<String> _categoryViolations() {
+    final names = <String, String>{};
+    final violations = <String>[];
+    for (final category in listCategories()) {
+      final key = normalizeTaxonomyName(category.name);
+      final existing = names[key];
+      if (existing != null) {
+        violations.add('分类名称重复（不区分大小写）：$existing / ${category.name}');
+      } else {
+        names[key] = category.name;
+      }
     }
-    return false;
+    return violations;
+  }
+
+  List<String> categoryTaxonomyViolations() => _categoryViolations();
+
+  void _requireWritableTaxonomy() {
+    final violations = taxonomyViolations();
+    if (violations.isNotEmpty) throw StateError(violations.join('\n'));
+  }
+
+  static void _requireTaxonomyName(String name, String label) {
+    if (name.trim().isEmpty || name != name.trim()) {
+      throw ArgumentError.value(name, 'name', '$label 名称不能为空或含首尾空白');
+    }
   }
 
   NasLibraryCategory? categoryForMovie(String movieId) {

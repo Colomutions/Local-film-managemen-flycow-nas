@@ -10,6 +10,7 @@ import 'backup_service.dart';
 import 'config.dart';
 import 'diagnostic_log.dart';
 import 'fixture_library.dart';
+import 'library/taxonomy_transfer.dart';
 import 'library_database.dart';
 import 'media_service.dart';
 import 'persistent_state.dart';
@@ -193,6 +194,14 @@ class NasHealthServer {
       if (request.method == 'GET' && path == '/api/v1/admin/categories') {
         return await _adminCategories(request);
       }
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/taxonomy/categories') {
+        return await _exportAdminCategoryTaxonomy(request);
+      }
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/taxonomy/categories') {
+        return await _importAdminCategoryTaxonomy(request);
+      }
       if (request.method == 'POST' && path == '/api/v1/admin/categories') {
         return await _createAdminCategory(request);
       }
@@ -202,6 +211,12 @@ class NasHealthServer {
       }
       if (request.method == 'GET' && path == '/api/v1/admin/tags') {
         return await _adminTags(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/taxonomy/tags') {
+        return await _exportAdminTagTaxonomy(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/taxonomy/tags') {
+        return await _importAdminTagTaxonomy(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/tags') {
         return await _createAdminTag(request);
@@ -580,6 +595,40 @@ class NasHealthServer {
         },
       );
 
+  Future<void> _exportAdminCategoryTaxonomy(HttpRequest request) async {
+    final conflicts = _libraryDatabase.categoryTaxonomyViolations();
+    if (conflicts.isNotEmpty) {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: conflicts,
+        ),
+      );
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _libraryDatabase.exportCategoryTaxonomy().toJson(),
+    });
+  }
+
+  Future<void> _importAdminCategoryTaxonomy(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      return _writeTaxonomyResult(
+        request,
+        _libraryDatabase.importCategoryTaxonomy(
+          NasCategoryTaxonomyTransfer.decode(body),
+        ),
+      );
+    } on FormatException {
+      return _error(request, HttpStatus.badRequest, 'invalid_taxonomy');
+    }
+  }
+
   Future<void> _categories(HttpRequest request) => _writeJson(
         request.response,
         HttpStatus.ok,
@@ -627,6 +676,7 @@ class NasHealthServer {
         previous == null ||
         _libraryDatabase.hasCategoryName(name, excludingId: categoryId) ||
         (config.managedCategoryLibrary &&
+            previous.mediaRelativePath != null &&
             (!hasDirectoryKey || directoryKey == null)) ||
         (hasDirectoryKey &&
             (directoryKey == null ||
@@ -677,15 +727,74 @@ class NasHealthServer {
         },
       );
 
-  Future<void> _createAdminTag(HttpRequest request) async {
-    final name = await _requiredName(request);
-    if (name == null || _libraryDatabase.hasTagName(name)) {
+  Future<void> _exportAdminTagTaxonomy(HttpRequest request) async {
+    final conflicts = _libraryDatabase.taxonomyViolations();
+    if (conflicts.isNotEmpty) {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: conflicts,
+        ),
+      );
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _libraryDatabase.exportTagTaxonomy().toJson(),
+    });
+  }
+
+  Future<void> _importAdminTagTaxonomy(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final tag = _libraryDatabase.createTag(name);
-    await _writeJson(request.response, HttpStatus.created, {
-      'data': _tagPayload(tag),
-    });
+    try {
+      return _writeTaxonomyResult(
+        request,
+        _libraryDatabase.importTagTaxonomy(
+          NasTagTaxonomyTransfer.decode(body),
+        ),
+      );
+    } on FormatException {
+      return _error(request, HttpStatus.badRequest, 'invalid_taxonomy');
+    }
+  }
+
+  Future<void> _createAdminTag(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final name = body?['name'];
+    final parentTagId = body?['parentTagId'];
+    if (body == null ||
+        body.keys.any((key) => key != 'name' && key != 'parentTagId') ||
+        name is! String ||
+        name.trim().isEmpty ||
+        (parentTagId != null && parentTagId is! String) ||
+        _libraryDatabase.hasTagName(name.trim())) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      final tag = parentTagId == null
+          ? _libraryDatabase.createRootTag(name.trim()).$1
+          : _libraryDatabase.createChildTag(
+              name: name.trim(),
+              parentTagId: parentTagId as String,
+            ).$1;
+      await _writeJson(request.response, HttpStatus.created, {
+        'data': _tagPayload(tag),
+      });
+    } on ArgumentError catch (_) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    } on StateError catch (_) {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: _libraryDatabase.taxonomyViolations(),
+        ),
+      );
+    }
   }
 
   Future<void> _updateAdminTag(HttpRequest request) async {
@@ -694,7 +803,21 @@ class NasHealthServer {
     if (name == null || _libraryDatabase.hasTagName(name, excludingId: tagId)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final tag = _libraryDatabase.updateTagName(tagId, name);
+    NasLibraryTag? tag;
+    try {
+      tag = _libraryDatabase.updateTagName(tagId, name);
+    } on ArgumentError {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    } on StateError {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: _libraryDatabase.taxonomyViolations(),
+        ),
+      );
+    }
     if (tag == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
@@ -704,8 +827,19 @@ class NasHealthServer {
   }
 
   Future<void> _deleteAdminTag(HttpRequest request) async {
-    if (!_libraryDatabase.deleteTag(request.uri.pathSegments.last)) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    try {
+      if (!_libraryDatabase.deleteTag(request.uri.pathSegments.last)) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
+      }
+    } on StateError {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: _libraryDatabase.taxonomyViolations(),
+        ),
+      );
     }
     request.response.statusCode = HttpStatus.noContent;
     await request.response.close();
@@ -738,10 +872,24 @@ class NasHealthServer {
             _libraryDatabase.findTagPlacement(parentPlacementId) == null)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final placement = _libraryDatabase.createTagPlacement(
-      tagId: tagId,
-      parentPlacementId: parentPlacementId as String?,
-    );
+    NasTagPlacement placement;
+    try {
+      placement = _libraryDatabase.createTagPlacement(
+        tagId: tagId,
+        parentPlacementId: parentPlacementId as String?,
+      );
+    } on ArgumentError {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    } on StateError {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: _libraryDatabase.taxonomyViolations(),
+        ),
+      );
+    }
     await _writeJson(request.response, HttpStatus.created, {
       'data': _tagPlacementPayload(placement),
     });
@@ -769,18 +917,43 @@ class NasHealthServer {
             ))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final placement = _libraryDatabase.updateTagPlacementParent(
-      placementId: placementId,
-      parentPlacementId: parentPlacementId,
-    );
+    NasTagPlacement? placement;
+    try {
+      placement = _libraryDatabase.updateTagPlacementParent(
+        placementId: placementId,
+        parentPlacementId: parentPlacementId,
+      );
+    } on ArgumentError {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    } on StateError {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: _libraryDatabase.taxonomyViolations(),
+        ),
+      );
+    }
     await _writeJson(request.response, HttpStatus.ok, {
       'data': _tagPlacementPayload(placement!),
     });
   }
 
   Future<void> _deleteAdminTagPlacement(HttpRequest request) async {
-    if (!_libraryDatabase.deleteTagPlacement(request.uri.pathSegments.last)) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    try {
+      if (!_libraryDatabase.deleteTagPlacement(request.uri.pathSegments.last)) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
+      }
+    } on StateError {
+      return _writeTaxonomyResult(
+        request,
+        NasTaxonomyTransferResult(
+          added: const [],
+          skipped: const [],
+          conflicts: _libraryDatabase.taxonomyViolations(),
+        ),
+      );
     }
     request.response.statusCode = HttpStatus.noContent;
     await request.response.close();
@@ -1802,6 +1975,16 @@ class NasHealthServer {
     }
   }
 
+  Future<void> _writeTaxonomyResult(
+    HttpRequest request,
+    NasTaxonomyTransferResult result,
+  ) =>
+      _writeJson(
+        request.response,
+        result.conflicts.isEmpty ? HttpStatus.ok : HttpStatus.conflict,
+        {'data': result.toJson()},
+      );
+
   Future<void> _persistState() => _stateStore.save(_state!);
 
   Future<void> _error(HttpRequest request, int statusCode, String code) {
@@ -1809,6 +1992,7 @@ class NasHealthServer {
       'authentication_required': 'A valid device token is required.',
       'insufficient_scope': 'This device does not have the required scope.',
       'invalid_request': 'The request is invalid.',
+      'invalid_taxonomy': 'The taxonomy definition file is invalid.',
       'method_not_allowed':
           'The HTTP method is not supported for this resource.',
       'pairing_failed': 'Pairing could not be confirmed.',
