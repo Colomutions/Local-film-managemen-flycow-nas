@@ -19,6 +19,10 @@ Future<void> main() async {
     _expect(categories.conflicts.isEmpty, 'valid categories have no conflicts');
     _expect(categories.added.length == 2, 'two categories are added');
     _expect(
+      database.listCategories().singleWhere((item) => item.name == '电影').color == '#123456',
+      'category color is persisted',
+    );
+    _expect(
       database.listCategories().every((item) => item.mediaRelativePath == null),
       'imported NAS categories stay unbound and do not imply a scan',
     );
@@ -37,6 +41,7 @@ Future<void> main() async {
     );
     _expect(first.conflicts.isEmpty, 'valid tags have no conflicts');
     _expect(first.added.length == 7, 'four definitions and three relationships are added');
+    _expect(tagsAreColored(database), 'tag color is persisted');
 
     final repeated = database.importTagTaxonomy(
       const NasTagTaxonomyTransfer(
@@ -90,6 +95,9 @@ Future<void> main() async {
     await directory.delete(recursive: true);
   }
 }
+
+bool tagsAreColored(NasLibraryDatabase database) =>
+    database.listTags().singleWhere((item) => item.name == '题材').color == '#654321';
 
 void _expect(bool value, String description) {
   if (!value) throw StateError('Assertion failed: $description');

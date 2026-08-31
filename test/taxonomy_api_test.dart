@@ -42,8 +42,14 @@ Future<void> main() async {
       token: viewerToken,
     );
     _expectError(viewerCategories, HttpStatus.forbidden, 'insufficient_scope');
-    final category =
-        await _createNamed(base, '/api/v1/admin/categories', '刑侦', adminToken);
+    final category = await _createNamed(
+      base,
+      '/api/v1/admin/categories',
+      '刑侦',
+      adminToken,
+      color: '#123456',
+    );
+    _expect(category['color'] == '#123456', 'category create returns color');
     final duplicateCategory = await _request(
       base,
       'POST',
@@ -57,22 +63,31 @@ Future<void> main() async {
       'PATCH',
       '/api/v1/admin/categories/${category['id']}',
       token: adminToken,
-      body: {'name': '犯罪'},
+      body: {'name': '犯罪', 'color': '#654321'},
     );
     _expect(
         renamedCategory.statusCode == HttpStatus.ok, 'admin renames category');
+    _expect(
+      (renamedCategory.json['data'] as Map<String, dynamic>)['color'] ==
+          '#654321',
+      'category update persists color',
+    );
 
-    final rootTag =
-        await _createNamed(base, '/api/v1/admin/tags', '题材', adminToken);
-    final childTag =
-        await _createNamed(base, '/api/v1/admin/tags', '刑侦', adminToken);
-    final rootPlacement =
-        await _createPlacement(base, rootTag['id'] as String, null, adminToken);
-    final childPlacement = await _createPlacement(
+    final rootTag = await _createNamed(
       base,
-      childTag['id'] as String,
-      rootPlacement['id'] as String,
+      '/api/v1/admin/tags',
+      '题材',
       adminToken,
+      color: '#0FAF8F',
+    );
+    _expect(rootTag['color'] == '#0FAF8F', 'tag create returns color');
+    final childTag = await _createNamed(
+      base,
+      '/api/v1/admin/tags',
+      '刑侦',
+      adminToken,
+      color: '#E86A33',
+      parentTagId: rootTag['id'] as String,
     );
     final placements = await _request(
       base,
@@ -80,11 +95,16 @@ Future<void> main() async {
       '/api/v1/admin/tag-placements',
       token: adminToken,
     );
-    final childPlacementDto = ((placements.json['data']
+    final placementItems = ((placements.json['data']
             as Map<String, dynamic>)['items'] as List<dynamic>)
-        .cast<Map<String, dynamic>>()
-        .firstWhere((item) => item['id'] == childPlacement['id']);
-    _expect(childPlacementDto['path'].toString() == '[题材, 刑侦]',
+        .cast<Map<String, dynamic>>();
+    final rootPlacement = placementItems.singleWhere(
+      (item) => item['tagId'] == rootTag['id'],
+    );
+    final childPlacement = placementItems.singleWhere(
+      (item) => item['tagId'] == childTag['id'],
+    );
+    _expect(childPlacement['path'].toString() == '[题材, 刑侦]',
         'placement returns hierarchy path');
     final cycle = await _request(
       base,
@@ -127,15 +147,41 @@ Future<void> main() async {
         'viewer receives hierarchy path');
     _expect(!jsonEncode(data).contains(mediaRoot.path),
         'viewer taxonomy response hides media path');
+    final categories = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/categories',
+      token: adminToken,
+    );
+    final categoryDto = ((categories.json['data'] as Map<String, dynamic>)['items']
+            as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .singleWhere((item) => item['id'] == category['id']);
+    _expect(categoryDto['color'] == '#654321', 'category list returns color');
+    final tags = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/tags',
+      token: adminToken,
+    );
+    final rootTagDto = ((tags.json['data'] as Map<String, dynamic>)['items']
+            as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .singleWhere((item) => item['id'] == rootTag['id']);
+    _expect(rootTagDto['color'] == '#0FAF8F', 'tag list returns color');
 
     final renamedTag = await _request(
       base,
       'PATCH',
       '/api/v1/admin/tags/${childTag['id']}',
       token: adminToken,
-      body: {'name': '推理'},
+      body: {'name': '推理', 'color': null},
     );
     _expect(renamedTag.statusCode == HttpStatus.ok, 'admin renames tag');
+    _expect(
+      (renamedTag.json['data'] as Map<String, dynamic>)['color'] == null,
+      'tag color can be cleared without changing its placement',
+    );
     final renamedDetails = await _request(
       base,
       'GET',
@@ -165,14 +211,27 @@ Future<void> main() async {
     );
     _expect(deletedCategory.statusCode == HttpStatus.noContent,
         'admin deletes category');
-    final deletedTag = await _request(
+    final directTagDelete = await _request(
       base,
       'DELETE',
       '/api/v1/admin/tags/${childTag['id']}',
       token: adminToken,
     );
-    _expect(deletedTag.statusCode == HttpStatus.noContent,
-        'admin deletes tag and its placements');
+    _expectError(
+      directTagDelete,
+      HttpStatus.badRequest,
+      'invalid_request',
+    );
+    final deletedTagPlacement = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/tag-placements/${childPlacement['id']}',
+      token: adminToken,
+    );
+    _expect(
+      deletedTagPlacement.statusCode == HttpStatus.noContent,
+      'deleting the last child placement deletes the tag',
+    );
     final clearedDetails = await _request(
       base,
       'GET',
@@ -192,27 +251,29 @@ Future<void> main() async {
 }
 
 Future<Map<String, dynamic>> _createNamed(
-    Uri base, String path, String name, String token) async {
-  final response =
-      await _request(base, 'POST', path, token: token, body: {'name': name});
+  Uri base,
+  String path,
+  String name,
+  String token, {
+  String? color,
+  String? parentTagId,
+}) async {
+  final response = await _request(
+    base,
+    'POST',
+    path,
+    token: token,
+    body: {
+      'name': name,
+      if (color != null) 'color': color,
+      if (parentTagId != null) 'parentTagId': parentTagId,
+    },
+  );
   _expect(response.statusCode == HttpStatus.created,
       'admin creates named taxonomy entity');
   return response.json['data'] as Map<String, dynamic>;
 }
 
-Future<Map<String, dynamic>> _createPlacement(
-    Uri base, String tagId, String? parentId, String token) async {
-  final response = await _request(
-    base,
-    'POST',
-    '/api/v1/admin/tag-placements',
-    token: token,
-    body: {'tagId': tagId, 'parentPlacementId': parentId},
-  );
-  _expect(
-      response.statusCode == HttpStatus.created, 'admin creates tag placement');
-  return response.json['data'] as Map<String, dynamic>;
-}
 
 Future<String> _pair(Uri base, String serverId, {String? scope}) async {
   final session = await _request(

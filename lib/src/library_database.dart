@@ -72,6 +72,7 @@ class NasMediaRoot {
   const NasMediaRoot({
     required this.id,
     required this.name,
+    this.color,
     required this.containerPath,
     required this.readOnly,
     required this.enabled,
@@ -82,6 +83,7 @@ class NasMediaRoot {
 
   final String id;
   final String name;
+  final String? color;
   final String containerPath;
   final bool readOnly;
   final bool enabled;
@@ -94,6 +96,7 @@ class NasLibraryCategory {
   const NasLibraryCategory({
     required this.id,
     required this.name,
+    this.color,
     this.mediaRelativePath,
     required this.createdAt,
     required this.updatedAt,
@@ -101,6 +104,7 @@ class NasLibraryCategory {
 
   final String id;
   final String name;
+  final String? color;
   final String? mediaRelativePath;
   final String createdAt;
   final String updatedAt;
@@ -110,12 +114,14 @@ class NasLibraryTag {
   const NasLibraryTag({
     required this.id,
     required this.name,
+    this.color,
     required this.createdAt,
     required this.updatedAt,
   });
 
   final String id;
   final String name;
+  final String? color;
   final String createdAt;
   final String updatedAt;
 }
@@ -173,7 +179,7 @@ class NasCarouselImage {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 9;
+  static const currentSchemaVersion = 10;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -391,6 +397,16 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [9, _now()],
+      );
+    }
+    if (current < 10) {
+      _db.execute('''
+        ALTER TABLE library_categories ADD COLUMN color TEXT;
+        ALTER TABLE tags ADD COLUMN color TEXT;
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [10, _now()],
       );
     }
   }
@@ -744,13 +760,13 @@ class NasLibraryDatabase {
 
   List<NasLibraryCategory> listCategories() => _db
       .select(
-          'SELECT id, name, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
+           'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
       .map(_mapCategory)
       .toList(growable: false);
 
   NasLibraryCategory? findCategory(String categoryId) {
     final rows = _db.select(
-      'SELECT id, name, media_relative_path, created_at, updated_at FROM library_categories WHERE id = ?',
+      'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories WHERE id = ?',
       [categoryId],
     );
     return rows.isEmpty ? null : _mapCategory(rows.single);
@@ -765,7 +781,7 @@ class NasLibraryDatabase {
     );
   }
 
-  NasLibraryCategory createCategory(String name, {String? mediaRelativePath}) {
+  NasLibraryCategory createCategory(String name, {String? mediaRelativePath, String? color}) {
     _requireTaxonomyName(name, '分类');
     if (hasCategoryName(name)) {
       throw ArgumentError.value(name, 'name', 'already exists');
@@ -774,13 +790,14 @@ class NasLibraryDatabase {
     final category = NasLibraryCategory(
       id: newUuidV4(),
       name: name,
+      color: color,
       mediaRelativePath: mediaRelativePath,
       createdAt: timestamp,
       updatedAt: timestamp,
     );
     _db.execute(
-      'INSERT INTO library_categories(id, name, media_relative_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
-      [category.id, category.name, category.mediaRelativePath, category.createdAt, category.updatedAt],
+      'INSERT INTO library_categories(id, name, color, media_relative_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [category.id, category.name, category.color, category.mediaRelativePath, category.createdAt, category.updatedAt],
     );
     return category;
   }
@@ -789,6 +806,8 @@ class NasLibraryDatabase {
     String categoryId, {
     required String name,
     String? mediaRelativePath,
+    String? color,
+    bool updateColor = false,
     required bool updateMediaRelativePath,
   }) {
     if (findCategory(categoryId) == null) return null;
@@ -801,11 +820,11 @@ class NasLibraryDatabase {
     }
     _db.execute(
       updateMediaRelativePath
-          ? 'UPDATE library_categories SET name = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
-          : 'UPDATE library_categories SET name = ?, updated_at = ? WHERE id = ?',
+        ? 'UPDATE library_categories SET name = ?, color = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
+        : 'UPDATE library_categories SET name = ?, color = ?, updated_at = ? WHERE id = ?',
       updateMediaRelativePath
-          ? [name, mediaRelativePath, _now(), categoryId]
-          : [name, _now(), categoryId],
+          ? [name, updateColor ? color : findCategory(categoryId)!.color, mediaRelativePath, _now(), categoryId]
+          : [name, updateColor ? color : findCategory(categoryId)!.color, _now(), categoryId],
     );
     return findCategory(categoryId);
   }
@@ -822,7 +841,7 @@ class NasLibraryDatabase {
     return NasCategoryTaxonomyTransfer(
       categories: [
         for (final category in listCategories())
-          NasTaxonomyCategoryDefinition(name: category.name),
+          NasTaxonomyCategoryDefinition(name: category.name, color: category.color),
       ],
     );
   }
@@ -852,7 +871,7 @@ class NasLibraryDatabase {
           skipped.add('分类：${existing[normalized]!.name}');
           continue;
         }
-        createCategory(definition.name);
+        createCategory(definition.name, color: definition.color);
         added.add('分类：${definition.name}');
       }
       _db.execute('COMMIT');
@@ -869,13 +888,13 @@ class NasLibraryDatabase {
 
   List<NasLibraryTag> listTags() => _db
       .select(
-          'SELECT id, name, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
+           'SELECT id, name, color, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
       .map(_mapTag)
       .toList(growable: false);
 
   NasLibraryTag? findTag(String tagId) {
     final rows = _db.select(
-      'SELECT id, name, created_at, updated_at FROM tags WHERE id = ?',
+      'SELECT id, name, color, created_at, updated_at FROM tags WHERE id = ?',
       [tagId],
     );
     return rows.isEmpty ? null : _mapTag(rows.single);
@@ -889,11 +908,11 @@ class NasLibraryDatabase {
     );
   }
 
-  NasLibraryTag createTag(String name) {
-    return createRootTag(name).$1;
+  NasLibraryTag createTag(String name, {String? color}) {
+    return createRootTag(name, color: color).$1;
   }
 
-  (NasLibraryTag, NasTagPlacement) createRootTag(String name) {
+  (NasLibraryTag, NasTagPlacement) createRootTag(String name, {String? color}) {
     _requireWritableTaxonomy();
     _requireTaxonomyName(name, '标签');
     if (hasTagName(name)) {
@@ -903,12 +922,13 @@ class NasLibraryDatabase {
     final tag = NasLibraryTag(
       id: newUuidV4(),
       name: name,
+      color: color,
       createdAt: timestamp,
       updatedAt: timestamp,
     );
     _db.execute(
-      'INSERT INTO tags(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
-      [tag.id, tag.name, tag.createdAt, tag.updatedAt],
+      'INSERT INTO tags(id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      [tag.id, tag.name, tag.color, tag.createdAt, tag.updatedAt],
     );
     final placement = _insertTagPlacement(tag.id, null, timestamp);
     return (tag, placement);
@@ -917,6 +937,7 @@ class NasLibraryDatabase {
   (NasLibraryTag, NasTagPlacement) createChildTag({
     required String name,
     required String parentTagId,
+    String? color,
   }) {
     _requireWritableTaxonomy();
     _requireTaxonomyName(name, '标签');
@@ -931,17 +952,18 @@ class NasLibraryDatabase {
     final tag = NasLibraryTag(
       id: newUuidV4(),
       name: name,
+      color: color,
       createdAt: timestamp,
       updatedAt: timestamp,
     );
     _db.execute(
-      'INSERT INTO tags(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)',
-      [tag.id, tag.name, tag.createdAt, tag.updatedAt],
+      'INSERT INTO tags(id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      [tag.id, tag.name, tag.color, tag.createdAt, tag.updatedAt],
     );
     return (tag, _insertTagPlacement(tag.id, parentPlacement.id, timestamp));
   }
 
-  NasLibraryTag? updateTagName(String tagId, String name) {
+  NasLibraryTag? updateTagName(String tagId, String name, {String? color, bool updateColor = false}) {
     if (findTag(tagId) == null) return null;
     _requireWritableTaxonomy();
     _requireTaxonomyName(name, '标签');
@@ -949,8 +971,8 @@ class NasLibraryDatabase {
       throw ArgumentError.value(name, 'name', 'already exists');
     }
     _db.execute(
-      'UPDATE tags SET name = ?, updated_at = ? WHERE id = ?',
-      [name, _now(), tagId],
+      'UPDATE tags SET name = ?, color = ?, updated_at = ? WHERE id = ?',
+      [name, updateColor ? color : findTag(tagId)!.color, _now(), tagId],
     );
     return findTag(tagId);
   }
@@ -1052,7 +1074,8 @@ class NasLibraryDatabase {
     final roots = <NasTaxonomyTagDefinition>[];
     final children = <NasTaxonomyTagDefinition>[];
     for (final placement in placements.where((item) => item.parentPlacementId == null)) {
-      roots.add(NasTaxonomyTagDefinition(name: tagsById[placement.tagId]!.name));
+      final tag = tagsById[placement.tagId]!;
+      roots.add(NasTaxonomyTagDefinition(name: tag.name, color: tag.color));
     }
     for (final tag in tagsById.values) {
       final parents = placements
@@ -1060,7 +1083,7 @@ class NasLibraryDatabase {
           .map((item) => tagsById[findTagPlacement(item.parentPlacementId!)!.tagId]!.name)
           .toList(growable: false);
       if (parents.isNotEmpty) {
-        children.add(NasTaxonomyTagDefinition(name: tag.name, parents: parents));
+        children.add(NasTaxonomyTagDefinition(name: tag.name, color: tag.color, parents: parents));
       }
     }
     return NasTagTaxonomyTransfer(roots: roots, children: children);
@@ -1113,7 +1136,7 @@ class NasLibraryDatabase {
         if (tags.containsKey(key)) {
           skipped.add('一级标签：${tags[key]!.name}');
         } else {
-          final created = createRootTag(root.name).$1;
+          final created = createRootTag(root.name, color: root.color).$1;
           tags[key] = created;
           rootIds.add(created.id);
           added.add('一级标签：${created.name}');
@@ -1126,6 +1149,7 @@ class NasLibraryDatabase {
         final tag = existing ?? createChildTag(
           name: child.name,
           parentTagId: tags[normalizeTaxonomyName(child.parents.first)]!.id,
+          color: child.color,
         ).$1;
         if (existing == null) {
           tags[key] = tag;
@@ -1595,6 +1619,7 @@ class NasLibraryDatabase {
   NasLibraryCategory _mapCategory(Row row) => NasLibraryCategory(
         id: row['id'] as String,
         name: row['name'] as String,
+        color: row['color'] as String?,
         mediaRelativePath: row['media_relative_path'] as String?,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
@@ -1610,6 +1635,7 @@ class NasLibraryDatabase {
   NasLibraryTag _mapTag(Row row) => NasLibraryTag(
         id: row['id'] as String,
         name: row['name'] as String,
+        color: row['color'] as String?,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
       );

@@ -598,7 +598,7 @@ class NasHealthServer {
   Future<void> _exportAdminCategoryTaxonomy(HttpRequest request) async {
     final conflicts = _libraryDatabase.categoryTaxonomyViolations();
     if (conflicts.isNotEmpty) {
-      return _writeTaxonomyResult(
+      return await _writeTaxonomyResult(
         request,
         NasTaxonomyTransferResult(
           added: const [],
@@ -618,7 +618,7 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     try {
-      return _writeTaxonomyResult(
+      return await _writeTaxonomyResult(
         request,
         _libraryDatabase.importCategoryTaxonomy(
           NasCategoryTaxonomyTransfer.decode(body),
@@ -646,7 +646,9 @@ class NasHealthServer {
     final body = await _readJsonBody(request);
     final name = _categoryName(body);
     final directoryKey = _categoryDirectoryKey(body);
+    final color = _taxonomyColor(body);
     if (name == null ||
+        color == _invalidTaxonomyColor ||
         _libraryDatabase.hasCategoryName(name) ||
         (config.managedCategoryLibrary && directoryKey == null) ||
         (directoryKey != null && !await _canBindCategoryDirectory(directoryKey))) {
@@ -655,6 +657,7 @@ class NasHealthServer {
     final category = _libraryDatabase.createCategory(
       name,
       mediaRelativePath: directoryKey,
+      color: color,
     );
     final scanJob = _scheduleCategoryScan(category.id);
     await _writeJson(request.response, HttpStatus.created, {
@@ -671,8 +674,10 @@ class NasHealthServer {
     final categoryId = request.uri.pathSegments.last;
     final hasDirectoryKey = body?.containsKey('directoryKey') ?? false;
     final directoryKey = _categoryDirectoryKey(body);
+    final color = _taxonomyColor(body);
     final previous = _libraryDatabase.findCategory(categoryId);
     if (name == null ||
+        color == _invalidTaxonomyColor ||
         previous == null ||
         _libraryDatabase.hasCategoryName(name, excludingId: categoryId) ||
         (config.managedCategoryLibrary &&
@@ -693,6 +698,8 @@ class NasHealthServer {
       name: name,
       mediaRelativePath: directoryKey,
       updateMediaRelativePath: directoryChanged,
+      color: color,
+      updateColor: body?.containsKey('color') ?? false,
     );
     if (category == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
@@ -750,7 +757,7 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     try {
-      return _writeTaxonomyResult(
+      return await _writeTaxonomyResult(
         request,
         _libraryDatabase.importTagTaxonomy(
           NasTagTaxonomyTransfer.decode(body),
@@ -765,20 +772,23 @@ class NasHealthServer {
     final body = await _readJsonBody(request);
     final name = body?['name'];
     final parentTagId = body?['parentTagId'];
+    final color = _taxonomyColor(body);
     if (body == null ||
-        body.keys.any((key) => key != 'name' && key != 'parentTagId') ||
+        body.keys.any((key) => key != 'name' && key != 'parentTagId' && key != 'color') ||
         name is! String ||
         name.trim().isEmpty ||
         (parentTagId != null && parentTagId is! String) ||
-        _libraryDatabase.hasTagName(name.trim())) {
+        _libraryDatabase.hasTagName(name.trim()) ||
+        color == _invalidTaxonomyColor) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     try {
       final tag = parentTagId == null
-          ? _libraryDatabase.createRootTag(name.trim()).$1
+          ? _libraryDatabase.createRootTag(name.trim(), color: color).$1
           : _libraryDatabase.createChildTag(
               name: name.trim(),
               parentTagId: parentTagId as String,
+              color: color,
             ).$1;
       await _writeJson(request.response, HttpStatus.created, {
         'data': _tagPayload(tag),
@@ -798,14 +808,23 @@ class NasHealthServer {
   }
 
   Future<void> _updateAdminTag(HttpRequest request) async {
-    final name = await _requiredName(request);
+    final body = await _readJsonBody(request);
+    final name = _taxonomyName(body, allowed: const {'name', 'color'});
+    final color = _taxonomyColor(body);
     final tagId = request.uri.pathSegments.last;
-    if (name == null || _libraryDatabase.hasTagName(name, excludingId: tagId)) {
+    if (name == null ||
+        color == _invalidTaxonomyColor ||
+        _libraryDatabase.hasTagName(name, excludingId: tagId)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     NasLibraryTag? tag;
     try {
-      tag = _libraryDatabase.updateTagName(tagId, name);
+      tag = _libraryDatabase.updateTagName(
+        tagId,
+        name,
+        color: color,
+        updateColor: body?.containsKey('color') ?? false,
+      );
     } on ArgumentError {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     } on StateError {
@@ -829,7 +848,7 @@ class NasHealthServer {
   Future<void> _deleteAdminTag(HttpRequest request) async {
     try {
       if (!_libraryDatabase.deleteTag(request.uri.pathSegments.last)) {
-        return _error(request, HttpStatus.badRequest, 'invalid_request');
+        return await _error(request, HttpStatus.badRequest, 'invalid_request');
       }
     } on StateError {
       return _writeTaxonomyResult(
@@ -943,7 +962,7 @@ class NasHealthServer {
   Future<void> _deleteAdminTagPlacement(HttpRequest request) async {
     try {
       if (!_libraryDatabase.deleteTagPlacement(request.uri.pathSegments.last)) {
-        return _error(request, HttpStatus.badRequest, 'invalid_request');
+        return await _error(request, HttpStatus.badRequest, 'invalid_request');
       }
     } on StateError {
       return _writeTaxonomyResult(
@@ -1368,6 +1387,7 @@ class NasHealthServer {
   Map<String, Object?> _categoryPayload(NasLibraryCategory category) => {
         'id': category.id,
         'name': category.name,
+        'color': category.color,
         'directoryKey': category.mediaRelativePath,
         'directoryName': category.mediaRelativePath?.split('/').last,
         'createdAt': category.createdAt,
@@ -1382,6 +1402,7 @@ class NasHealthServer {
   Map<String, Object?> _tagPayload(NasLibraryTag tag) => {
         'id': tag.id,
         'name': tag.name,
+        'color': tag.color,
         'createdAt': tag.createdAt,
         'updatedAt': tag.updatedAt,
       };
@@ -1400,21 +1421,33 @@ class NasHealthServer {
     };
   }
 
-  Future<String?> _requiredName(HttpRequest request) async {
-    final body = await _readJsonBody(request);
-    if (body == null || body.length != 1 || body['name'] is! String)
-      return null;
-    final name = (body['name'] as String).trim();
-    return name.isEmpty ? null : name;
-  }
+  static const _invalidTaxonomyColor = '\u0000';
 
-  String? _categoryName(Map<String, dynamic>? body) {
-    if (body == null || body['name'] is! String) return null;
-    if (body.keys.any((key) => key != 'name' && key != 'directoryKey')) {
+  String? _taxonomyName(
+    Map<String, dynamic>? body, {
+    required Set<String> allowed,
+  }) {
+    if (body == null || body['name'] is! String || body.keys.any((key) => !allowed.contains(key))) {
       return null;
     }
     final name = (body['name'] as String).trim();
     return name.isEmpty ? null : name;
+  }
+
+  String? _taxonomyColor(Map<String, dynamic>? body) {
+    if (body == null || !body.containsKey('color')) return null;
+    final color = body['color'];
+    if (color == null) return null;
+    return color is String && isValidTaxonomyColor(color)
+        ? color
+        : _invalidTaxonomyColor;
+  }
+
+  String? _categoryName(Map<String, dynamic>? body) {
+    return _taxonomyName(
+      body,
+      allowed: const {'name', 'directoryKey', 'color'},
+    );
   }
 
   String? _categoryDirectoryKey(Map<String, dynamic>? body) {
@@ -1487,7 +1520,7 @@ class NasHealthServer {
       final artwork =
           await _artworkService.poster(databaseMovie.posterFileName);
       if (artwork == null) {
-        return _error(request, HttpStatus.notFound, 'resource_not_found');
+        return await _error(request, HttpStatus.notFound, 'resource_not_found');
       }
       request.response.statusCode = HttpStatus.ok;
       request.response.headers.contentType =
@@ -1587,7 +1620,11 @@ class NasHealthServer {
       );
       if (image == null) {
         await _artworkService.deleteCarouselImage(fileName);
-        return _error(request, HttpStatus.notFound, 'resource_not_found');
+        return await _error(
+          request,
+          HttpStatus.notFound,
+          'resource_not_found',
+        );
       }
       await _writeJson(request.response, HttpStatus.created, {
         'data': {
