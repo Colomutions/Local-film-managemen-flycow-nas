@@ -404,7 +404,6 @@ class NasHealthServer {
         'movies': true,
         'comics': false,
         'novels': false,
-        'hiddenContent': false,
         'transcoding': false,
         'management': true,
       },
