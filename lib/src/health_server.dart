@@ -402,8 +402,6 @@ class NasHealthServer {
       'pairingRequired': true,
       'capabilities': {
         'movies': true,
-        'comics': false,
-        'novels': false,
         'transcoding': false,
         'management': true,
       },
