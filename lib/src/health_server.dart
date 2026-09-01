@@ -288,7 +288,7 @@ class NasHealthServer {
         return await _emptyItems(request);
       }
       if (request.method == 'GET' && path == '/api/v1/history') {
-        return await _emptyItems(request);
+        return await _history(request);
       }
       if ((request.method == 'GET' || request.method == 'HEAD') &&
           RegExp(r'^/api/v1/assets/posters/[^/]+$').hasMatch(path)) {
@@ -1510,6 +1510,34 @@ class NasHealthServer {
         },
       );
 
+  Future<void> _history(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': {
+            'items': _libraryDatabase
+                .listPlaybackHistory(
+                  titleQuery: request.uri.queryParameters['q'] ?? '',
+                )
+                .map(
+                  (item) => {
+                    'id': item.id,
+                    'movieId': item.movieId,
+                    'episodeId': item.episodeId,
+                    'title': item.title,
+                    if (item.posterFileName != null)
+                      'posterUrl': '/api/v1/assets/posters/${item.movieId}',
+                    'startedAt': item.startedAt,
+                    'endedAt': item.endedAt,
+                    'endPositionMs': item.endPositionMs,
+                    'durationMs': item.durationMs,
+                  },
+                )
+                .toList(growable: false),
+          },
+        },
+      );
+
   Future<void> _poster(HttpRequest request) async {
     final movieId = request.uri.pathSegments.last;
     final databaseMovie = _libraryDatabase.findMovie(movieId);
@@ -1819,6 +1847,8 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     if (session.purpose == 'playback' && session.started) {
+      session.endPositionMs = positionMs > durationMs ? durationMs : positionMs;
+      session.durationMs = durationMs;
       _libraryDatabase.savePlaybackProgress(
         movieId: session.movieId,
         episodeId: session.episodeId,
@@ -1853,7 +1883,12 @@ class NasHealthServer {
     }
     if (session.purpose == 'playback' && !session.started) {
       session.started = true;
-      _libraryDatabase.recordPlaybackStarted(session.movieId);
+      if (_libraryDatabase.findMovie(session.movieId) != null) {
+        session.historyId = _libraryDatabase.recordPlaybackStarted(
+          movieId: session.movieId,
+          episodeId: session.episodeId,
+        );
+      }
       _logger.event('playback.started', fields: {
         'component': 'nas.playback',
         'playbackSessionId': nasShortId(request.uri.pathSegments[4]),
@@ -1874,6 +1909,14 @@ class NasHealthServer {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     _playbackSessions.remove(sessionId);
+    final historyId = session.historyId;
+    if (historyId != null) {
+      _libraryDatabase.finishPlaybackHistory(
+        historyId: historyId,
+        endPositionMs: session.endPositionMs,
+        durationMs: session.durationMs,
+      );
+    }
     _logger.event('playback.session.close', fields: {
       'component': 'nas.playback',
       'playbackSessionId': nasShortId(sessionId),
@@ -2089,6 +2132,9 @@ class _PlaybackSession {
   final String purpose;
   bool started = false;
   bool streamRequested = false;
+  String? historyId;
+  int? endPositionMs;
+  int? durationMs;
 }
 
 class _FixturePlaybackState {

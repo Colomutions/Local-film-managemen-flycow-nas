@@ -178,8 +178,33 @@ class NasCarouselImage {
   final String createdAt;
 }
 
+/// NAS 自身持久化的播放历史；不包含任何 Windows 本地路径或客户端令牌。
+class NasPlaybackHistoryItem {
+  const NasPlaybackHistoryItem({
+    required this.id,
+    required this.movieId,
+    required this.episodeId,
+    required this.title,
+    required this.posterFileName,
+    required this.startedAt,
+    required this.endedAt,
+    required this.endPositionMs,
+    required this.durationMs,
+  });
+
+  final String id;
+  final String movieId;
+  final String episodeId;
+  final String title;
+  final String? posterFileName;
+  final String startedAt;
+  final String? endedAt;
+  final int? endPositionMs;
+  final int? durationMs;
+}
+
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 10;
+  static const currentSchemaVersion = 11;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -407,6 +432,25 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [10, _now()],
+      );
+    }
+    if (current < 11) {
+      _db.execute('''
+        CREATE TABLE playback_history (
+          id TEXT PRIMARY KEY,
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          end_position_ms INTEGER,
+          duration_ms INTEGER
+        );
+        CREATE INDEX playback_history_started_idx
+          ON playback_history(started_at DESC, id DESC);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [11, _now()],
       );
     }
   }
@@ -1470,11 +1514,63 @@ class NasLibraryDatabase {
     return rows.isEmpty ? 0 : rows.single['position_ms'] as int;
   }
 
-  void recordPlaybackStarted(String movieId) {
+  String recordPlaybackStarted({
+    required String movieId,
+    required String episodeId,
+  }) {
+    final historyId = newUuidV4();
+    final timestamp = _now();
     _db.execute(
       'UPDATE movies SET play_count = play_count + 1, updated_at = ? WHERE id = ?',
-      [_now(), movieId],
+      [timestamp, movieId],
     );
+    _db.execute(
+      '''INSERT INTO playback_history(id, movie_id, episode_id, started_at)
+         VALUES (?, ?, ?, ?)''',
+      [historyId, movieId, episodeId, timestamp],
+    );
+    return historyId;
+  }
+
+  void finishPlaybackHistory({
+    required String historyId,
+    required int? endPositionMs,
+    required int? durationMs,
+  }) {
+    _db.execute(
+      '''UPDATE playback_history
+         SET ended_at = ?, end_position_ms = ?, duration_ms = ?
+         WHERE id = ?''',
+      [_now(), endPositionMs, durationMs, historyId],
+    );
+  }
+
+  List<NasPlaybackHistoryItem> listPlaybackHistory({String titleQuery = ''}) {
+    final query = titleQuery.trim();
+    final like = '%$query%';
+    final rows = _db.select('''
+      SELECT h.id, h.movie_id, h.episode_id, m.title, m.poster_file_name,
+             h.started_at, h.ended_at, h.end_position_ms, h.duration_ms
+        FROM playback_history h
+        JOIN movies m ON m.id = h.movie_id
+       WHERE (? = '' OR lower(m.title) LIKE lower(?))
+       ORDER BY h.started_at DESC, h.id DESC
+    ''', [query, like]);
+    return rows
+        .map(
+          (row) => NasPlaybackHistoryItem(
+            id: row['id'] as String,
+            movieId: row['movie_id'] as String,
+            episodeId: row['episode_id'] as String,
+            title: row['title'] as String,
+            posterFileName: row['poster_file_name'] as String?,
+            startedAt: row['started_at'] as String,
+            endedAt: row['ended_at'] as String?,
+            endPositionMs: row['end_position_ms'] as int?,
+            durationMs: row['duration_ms'] as int?,
+          ),
+        )
+        .toList(growable: false);
   }
 
   void savePlaybackProgress({
