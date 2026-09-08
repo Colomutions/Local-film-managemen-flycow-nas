@@ -33,6 +33,8 @@ mujing-nas/
 
 `.env` 和 `data` 不在 Git 仓库中出现是正常的：`.env` 保存私密部署参数，`data` 保存 NAS 身份、SQLite、海报和备份。
 
+DeepSeek 资料识别不需要在 NAS 部署或配置：API Key 仅由 Windows 当前用户的安全凭据库保存，绝不能写入 NAS 的 `.env`、`data`、Docker 配置或截图。
+
 ## 2. 部署前检查
 
 进入 NAS 终端或 SSH：

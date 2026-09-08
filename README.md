@@ -12,6 +12,10 @@
 
 NAS 使用独立 Dart 进程和独立 SQLite，不复制 Windows/Android 工程，也不与其它端共享数据库文件。Windows 管理端只能通过认证的 `/api/v1` HTTP API 管理 NAS 数据，不得直接读写 NAS SQLite。
 
+## AI 资料识别边界
+
+DeepSeek 影片资料识别仅在 Windows 本机影片编辑流程中运行。NAS 不运行模型、不保存 API Key，也不需要为 AI 配置环境变量或 Docker 服务；Android 只读取已保存的正式资料。当前远程 NAS 影片尚未接入 AI 候选或确认写入，现有管理员 API 仍只处理用户明确保存的影片资料。
+
 ## 配置与卷
 
 1. 在 NAS 上将本目录放在应用数据位置（例如飞牛 Docker 的项目目录）。
