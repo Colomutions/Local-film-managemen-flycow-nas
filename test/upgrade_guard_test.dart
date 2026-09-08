@@ -18,14 +18,22 @@ Future<void> main() async {
     _expect(
         await databaseFile.exists(), 'migration creates a persistent database');
     _expect(
-      _schemaVersions(databaseFile.path).join(',') == '1,2,3,4',
+      _schemaVersions(databaseFile.path).join(',') ==
+          List<int>.generate(
+            NasLibraryDatabase.currentSchemaVersion,
+            (index) => index + 1,
+          ).join(','),
       'fresh database applies each schema version once',
     );
 
     await database.open();
     await database.close();
     _expect(
-      _schemaVersions(databaseFile.path).join(',') == '1,2,3,4',
+      _schemaVersions(databaseFile.path).join(',') ==
+          List<int>.generate(
+            NasLibraryDatabase.currentSchemaVersion,
+            (index) => index + 1,
+          ).join(','),
       'reopening does not repeat or duplicate migrations',
     );
 

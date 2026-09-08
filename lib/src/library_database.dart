@@ -8,10 +8,20 @@ import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
 
+String _normalizeCatalogNumber(String value) =>
+    value.trim().toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
+
+String? _nullableTrimmed(String? value) {
+  final normalized = value?.trim();
+  return normalized == null || normalized.isEmpty ? null : normalized;
+}
+
 class NasLibraryMovie {
   const NasLibraryMovie({
     required this.id,
     required this.title,
+    this.originalTitle,
+    this.catalogNumber,
     required this.summary,
     required this.actors,
     required this.posterFileName,
@@ -26,6 +36,8 @@ class NasLibraryMovie {
 
   final String id;
   final String title;
+  final String? originalTitle;
+  final String? catalogNumber;
   final String summary;
   final List<String> actors;
   final String? posterFileName;
@@ -185,6 +197,8 @@ class NasPlaybackHistoryItem {
     required this.movieId,
     required this.episodeId,
     required this.title,
+    this.originalTitle,
+    this.catalogNumber,
     required this.posterFileName,
     required this.startedAt,
     required this.endedAt,
@@ -196,6 +210,8 @@ class NasPlaybackHistoryItem {
   final String movieId;
   final String episodeId;
   final String title;
+  final String? originalTitle;
+  final String? catalogNumber;
   final String? posterFileName;
   final String startedAt;
   final String? endedAt;
@@ -204,7 +220,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 11;
+  static const currentSchemaVersion = 12;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -453,6 +469,16 @@ class NasLibraryDatabase {
         [11, _now()],
       );
     }
+    if (current < 12) {
+      _db.execute('''
+        ALTER TABLE movies ADD COLUMN original_title TEXT;
+        ALTER TABLE movies ADD COLUMN catalog_number TEXT;
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [12, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -669,17 +695,35 @@ class NasLibraryDatabase {
 
   List<NasLibraryMovie> listMovies({String query = ''}) {
     final queryLike = '%${query.trim()}%';
+    final normalizedCatalogQuery = _normalizeCatalogNumber(query);
+    final catalogQueryLike = '%$normalizedCatalogQuery%';
     final rows = _db.select('''
-      SELECT m.id, m.title, m.summary, m.actors_json, m.poster_file_name, m.play_count, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.original_title, m.catalog_number,
+             m.summary, m.actors_json, m.poster_file_name, m.play_count,
+             m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m JOIN episodes e ON e.movie_id = m.id
-      WHERE e.is_available = 1 AND (? = '%%' OR lower(m.title) LIKE lower(?))
+      WHERE e.is_available = 1 AND (
+        ? = '%%'
+        OR lower(m.title) LIKE lower(?)
+        OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
+        OR (? != '' AND lower(REPLACE(REPLACE(REPLACE(
+          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE ?)
+      )
       GROUP BY m.id ORDER BY m.title COLLATE NOCASE
-    ''', [queryLike, queryLike]);
+    ''', [
+      queryLike,
+      queryLike,
+      queryLike,
+      normalizedCatalogQuery,
+      catalogQueryLike,
+    ]);
     return rows
         .map((row) => _withResolution(NasLibraryMovie(
               id: row['id'] as String,
               title: row['title'] as String,
+              originalTitle: row['original_title'] as String?,
+              catalogNumber: row['catalog_number'] as String?,
               summary: row['summary'] as String,
               actors: _decodeActors(row['actors_json'] as String?),
               posterFileName: row['poster_file_name'] as String?,
@@ -711,7 +755,9 @@ class NasLibraryDatabase {
 
   NasLibraryMovie? findMovieForAdmin(String movieId) {
     final rows = _db.select('''
-      SELECT m.id, m.title, m.summary, m.actors_json, m.poster_file_name, m.play_count, m.updated_at, COUNT(e.id) AS episode_count,
+      SELECT m.id, m.title, m.original_title, m.catalog_number,
+             m.summary, m.actors_json, m.poster_file_name, m.play_count,
+             m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m LEFT JOIN episodes e ON e.movie_id = m.id
       WHERE m.id = ?
@@ -720,14 +766,23 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _withResolution(_mapMovie(rows.single));
   }
 
+  /// 统一替换影片可编辑元数据，供 Windows 手动管理与未来 AI 富化共用。
   NasLibraryMovie? updateMovieMetadata({
     required String movieId,
     String? title,
+    String? originalTitle,
+    bool updateOriginalTitle = false,
+    String? catalogNumber,
+    bool updateCatalogNumber = false,
     String? summary,
     List<String>? actors,
   }) {
     if (findMovieForAdmin(movieId) == null) return null;
-    if (title == null && summary == null && actors == null) {
+    if (title == null &&
+        !updateOriginalTitle &&
+        !updateCatalogNumber &&
+        summary == null &&
+        actors == null) {
       return findMovieForAdmin(movieId);
     }
     final assignments = <String>[];
@@ -735,6 +790,14 @@ class NasLibraryDatabase {
     if (title != null) {
       assignments.add('title = ?');
       values.add(title);
+    }
+    if (updateOriginalTitle) {
+      assignments.add('original_title = ?');
+      values.add(_nullableTrimmed(originalTitle));
+    }
+    if (updateCatalogNumber) {
+      assignments.add('catalog_number = ?');
+      values.add(_nullableTrimmed(catalogNumber));
     }
     if (summary != null) {
       assignments.add('summary = ?');
@@ -1548,14 +1611,23 @@ class NasLibraryDatabase {
   List<NasPlaybackHistoryItem> listPlaybackHistory({String titleQuery = ''}) {
     final query = titleQuery.trim();
     final like = '%$query%';
+    final normalizedCatalogQuery = _normalizeCatalogNumber(query);
+    final catalogLike = '%$normalizedCatalogQuery%';
     final rows = _db.select('''
-      SELECT h.id, h.movie_id, h.episode_id, m.title, m.poster_file_name,
+      SELECT h.id, h.movie_id, h.episode_id, m.title, m.original_title,
+             m.catalog_number, m.poster_file_name,
              h.started_at, h.ended_at, h.end_position_ms, h.duration_ms
         FROM playback_history h
         JOIN movies m ON m.id = h.movie_id
-       WHERE (? = '' OR lower(m.title) LIKE lower(?))
+       WHERE (
+         ? = ''
+         OR lower(m.title) LIKE lower(?)
+         OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
+         OR (? != '' AND lower(REPLACE(REPLACE(REPLACE(
+           COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE ?)
+       )
        ORDER BY h.started_at DESC, h.id DESC
-    ''', [query, like]);
+    ''', [query, like, like, normalizedCatalogQuery, catalogLike]);
     return rows
         .map(
           (row) => NasPlaybackHistoryItem(
@@ -1563,6 +1635,8 @@ class NasLibraryDatabase {
             movieId: row['movie_id'] as String,
             episodeId: row['episode_id'] as String,
             title: row['title'] as String,
+            originalTitle: row['original_title'] as String?,
+            catalogNumber: row['catalog_number'] as String?,
             posterFileName: row['poster_file_name'] as String?,
             startedAt: row['started_at'] as String,
             endedAt: row['ended_at'] as String?,
@@ -1642,6 +1716,8 @@ class NasLibraryDatabase {
   NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
         id: row['id'] as String,
         title: row['title'] as String,
+        originalTitle: row['original_title'] as String?,
+        catalogNumber: row['catalog_number'] as String?,
         summary: row['summary'] as String,
         actors: _decodeActors(row['actors_json'] as String?),
         posterFileName: row['poster_file_name'] as String?,
@@ -1667,6 +1743,8 @@ class NasLibraryDatabase {
     return NasLibraryMovie(
       id: movie.id,
       title: movie.title,
+      originalTitle: movie.originalTitle,
+      catalogNumber: movie.catalogNumber,
       summary: movie.summary,
       actors: movie.actors,
       posterFileName: movie.posterFileName,

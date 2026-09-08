@@ -41,6 +41,21 @@ Future<void> main() async {
     _expect(scan.scannedFiles == 1, 'scanner imports supported video files');
     final movie = database.listMovies().single;
     _expect(movie.title == 'sample', 'scanner derives a display title');
+    final enriched = database.updateMovieMetadata(
+      movieId: movie.id,
+      originalTitle: 'Sample Original',
+      updateOriginalTitle: true,
+      catalogNumber: 'ABC-001',
+      updateCatalogNumber: true,
+    )!;
+    _expect(enriched.originalTitle == 'Sample Original',
+        'database stores the original title');
+    _expect(enriched.catalogNumber == 'ABC-001',
+        'database stores the catalog number');
+    _expect(database.listMovies(query: 'sample original').length == 1,
+        'database searches the original title');
+    _expect(database.listMovies(query: 'abc001').length == 1,
+        'database searches normalized catalog numbers');
     final episode = database.episodesForMovie(movie.id).single;
     _expect(episode.relativePath == '真人/sample.mp4',
         'database stores a relative path');
@@ -71,6 +86,9 @@ Future<void> main() async {
     final reopenedMovie = database.listMovies().single;
     _expect(reopenedMovie.id == movie.id,
         'SQLite data survives reopen');
+    _expect(reopenedMovie.originalTitle == 'Sample Original' &&
+        reopenedMovie.catalogNumber == 'ABC-001',
+        'movie identity metadata survives reopen');
     final reopenedEpisode = database.episodesForMovie(movie.id).single;
     _expect(reopenedEpisode.durationMs == 12500 &&
         reopenedEpisode.videoWidth == 1920 &&

@@ -506,6 +506,8 @@ class NasHealthServer {
   Map<String, Object?> _databaseSummary(NasLibraryMovie movie) => {
         'id': movie.id,
         'title': movie.title,
+        'originalTitle': movie.originalTitle,
+        'catalogNumber': movie.catalogNumber,
         'actors': movie.actors,
         'category': _categoryForMoviePayload(movie.id),
         'tags': _libraryDatabase
@@ -1092,6 +1094,8 @@ class NasHealthServer {
     if (body == null ||
         body.keys.any((key) =>
             key != 'title' &&
+            key != 'originalTitle' &&
+            key != 'catalogNumber' &&
             key != 'summary' &&
             key != 'actors' &&
             key != 'categoryId' &&
@@ -1099,6 +1103,10 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final rawTitle = body['title'];
+    final hasOriginalTitle = body.containsKey('originalTitle');
+    final rawOriginalTitle = body['originalTitle'];
+    final hasCatalogNumber = body.containsKey('catalogNumber');
+    final rawCatalogNumber = body['catalogNumber'];
     final rawSummary = body['summary'];
     final hasActors = body.containsKey('actors');
     final rawActors = body['actors'];
@@ -1107,9 +1115,17 @@ class NasHealthServer {
     final hasTagPlacementIds = body.containsKey('tagPlacementIds');
     final rawTagPlacementIds = body['tagPlacementIds'];
     if ((rawTitle != null && rawTitle is! String) ||
+        (hasOriginalTitle &&
+            rawOriginalTitle != null &&
+            rawOriginalTitle is! String) ||
+        (hasCatalogNumber &&
+            rawCatalogNumber != null &&
+            rawCatalogNumber is! String) ||
         (rawSummary != null && rawSummary is! String) ||
         (hasActors && rawActors is! List) ||
         (rawTitle == null &&
+            !hasOriginalTitle &&
+            !hasCatalogNumber &&
             rawSummary == null &&
             !hasActors &&
             !hasCategoryId &&
@@ -1122,6 +1138,8 @@ class NasHealthServer {
     if (title != null && title.isEmpty) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final originalTitle = (rawOriginalTitle as String?)?.trim();
+    final catalogNumber = (rawCatalogNumber as String?)?.trim();
     final actors = hasActors
         ? (rawActors as List)
             .map((value) => value is String ? value.trim() : null)
@@ -1154,6 +1172,12 @@ class NasHealthServer {
     final movie = _libraryDatabase.updateMovieMetadata(
       movieId: request.uri.pathSegments.last,
       title: title,
+      originalTitle:
+          originalTitle == null || originalTitle.isEmpty ? null : originalTitle,
+      updateOriginalTitle: hasOriginalTitle,
+      catalogNumber:
+          catalogNumber == null || catalogNumber.isEmpty ? null : catalogNumber,
+      updateCatalogNumber: hasCatalogNumber,
       summary: rawSummary as String?,
       actors: hasActors ? actors.cast<String>() : null,
     );
@@ -1525,6 +1549,8 @@ class NasHealthServer {
                     'movieId': item.movieId,
                     'episodeId': item.episodeId,
                     'title': item.title,
+                    'originalTitle': item.originalTitle,
+                    'catalogNumber': item.catalogNumber,
                     if (item.posterFileName != null)
                       'posterUrl': '/api/v1/assets/posters/${item.movieId}',
                     'startedAt': item.startedAt,

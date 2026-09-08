@@ -158,16 +158,38 @@ Future<void> main() async {
       'PATCH',
       '/api/v1/admin/movies/${movie['id']}',
       token: adminToken,
-      body: {'title': '管理员标题', 'summary': '仅写入 NAS SQLite。'},
+      body: {
+        'title': '管理员标题',
+        'originalTitle': 'Administrator Original',
+        'catalogNumber': 'ABC-001',
+        'summary': '仅写入 NAS SQLite。',
+      },
     );
     _expect(movieUpdate.statusCode == HttpStatus.ok,
         'admin updates scanned movie metadata');
     _expect(movieUpdate.json['data']['title'] == '管理员标题',
         'movie update returns title');
+    _expect(
+        movieUpdate.json['data']['originalTitle'] == 'Administrator Original',
+        'movie update returns original title');
+    _expect(movieUpdate.json['data']['catalogNumber'] == 'ABC-001',
+        'movie update returns catalog number');
     _expect(movieUpdate.json['data']['summary'] == '仅写入 NAS SQLite。',
         'movie update returns summary');
     _expect(!jsonEncode(movieUpdate.json).contains(mediaRoot.path),
         'movie update hides container path');
+    final catalogSearch = await _request(
+      base,
+      'GET',
+      '/api/v1/movies?query=abc001',
+      token: viewerToken,
+    );
+    _expect(
+        ((catalogSearch.json['data'] as Map<String, dynamic>)['items']
+                as List<dynamic>)
+            .length ==
+            1,
+        'catalog search ignores separators and case');
     final missingMovieUpdate = await _request(
       base,
       'PATCH',
@@ -232,6 +254,12 @@ Future<void> main() async {
         .single as Map<String, dynamic>;
     _expect(persistedDetails.json['data']['title'] == '管理员标题',
         'rescan does not overwrite movie title');
+    _expect(
+        persistedDetails.json['data']['originalTitle'] ==
+            'Administrator Original',
+        'rescan does not overwrite movie original title');
+    _expect(persistedDetails.json['data']['catalogNumber'] == 'ABC-001',
+        'rescan does not overwrite movie catalog number');
     _expect(persistedDetails.json['data']['summary'] == '仅写入 NAS SQLite。',
         'rescan does not overwrite movie summary');
     _expect(persistedEpisode['title'] == '管理员分集标题',
