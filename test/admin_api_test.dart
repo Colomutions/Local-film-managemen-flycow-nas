@@ -162,6 +162,10 @@ Future<void> main() async {
         'title': '管理员标题',
         'originalTitle': 'Administrator Original',
         'catalogNumber': 'ABC-001',
+        'actors': [
+          {'name': '演员甲', 'gender': 'female'},
+          {'name': '演员乙', 'gender': 'male'},
+        ],
         'summary': '仅写入 NAS SQLite。',
       },
     );
@@ -174,6 +178,10 @@ Future<void> main() async {
         'movie update returns original title');
     _expect(movieUpdate.json['data']['catalogNumber'] == 'ABC-001',
         'movie update returns catalog number');
+    _expect(
+        jsonEncode(movieUpdate.json['data']['actors']) ==
+            '[{"name":"演员甲","gender":"female"},{"name":"演员乙","gender":"male"}]',
+        'movie update returns structured actors');
     _expect(movieUpdate.json['data']['summary'] == '仅写入 NAS SQLite。',
         'movie update returns summary');
     _expect(!jsonEncode(movieUpdate.json).contains(mediaRoot.path),

@@ -13,6 +13,7 @@ import 'fixture_library.dart';
 import 'library/taxonomy_transfer.dart';
 import 'library_database.dart';
 import 'media_service.dart';
+import 'movie_actor.dart';
 import 'persistent_state.dart';
 import 'range.dart';
 
@@ -508,7 +509,7 @@ class NasHealthServer {
         'title': movie.title,
         'originalTitle': movie.originalTitle,
         'catalogNumber': movie.catalogNumber,
-        'actors': movie.actors,
+        'actors': nasMovieActorsToJson(movie.actors),
         'category': _categoryForMoviePayload(movie.id),
         'tags': _libraryDatabase
             .tagsForMovie(movie.id)
@@ -1140,15 +1141,31 @@ class NasHealthServer {
     }
     final originalTitle = (rawOriginalTitle as String?)?.trim();
     final catalogNumber = (rawCatalogNumber as String?)?.trim();
-    final actors = hasActors
-        ? (rawActors as List)
-            .map((value) => value is String ? value.trim() : null)
-            .toList(growable: false)
-        : const <String?>[];
-    if (actors.length > 80 ||
-        actors.any((actor) => actor == null || actor.isEmpty || actor.length > 120) ||
-        actors.toSet().length != actors.length) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    List<NasMovieActor>? actors;
+    if (hasActors) {
+      final rawList = rawActors as List;
+      if (rawList.length > 80) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
+      }
+      final parsed = <NasMovieActor>[];
+      final actorNames = <String>{};
+      for (final value in rawList) {
+        if (value is! Map ||
+            value.keys.any((key) => key != 'name' && key != 'gender')) {
+          return _error(request, HttpStatus.badRequest, 'invalid_request');
+        }
+        final rawName = value['name'];
+        final gender = NasActorGender.tryParse(value['gender']);
+        if (rawName is! String ||
+            rawName.trim().isEmpty ||
+            rawName.trim().length > 120 ||
+            gender == null ||
+            !actorNames.add(rawName.trim().toLowerCase())) {
+          return _error(request, HttpStatus.badRequest, 'invalid_request');
+        }
+        parsed.add(NasMovieActor(name: rawName.trim(), gender: gender));
+      }
+      actors = parsed;
     }
     final categoryId = rawCategoryId as String?;
     if (hasCategoryId &&
@@ -1179,7 +1196,7 @@ class NasHealthServer {
           catalogNumber == null || catalogNumber.isEmpty ? null : catalogNumber,
       updateCatalogNumber: hasCatalogNumber,
       summary: rawSummary as String?,
-      actors: hasActors ? actors.cast<String>() : null,
+      actors: actors,
     );
     if (movie == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');

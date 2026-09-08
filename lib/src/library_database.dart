@@ -7,6 +7,7 @@ import 'auth.dart';
 import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
+import 'movie_actor.dart';
 
 String _normalizeCatalogNumber(String value) =>
     value.trim().toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
@@ -39,7 +40,7 @@ class NasLibraryMovie {
   final String? originalTitle;
   final String? catalogNumber;
   final String summary;
-  final List<String> actors;
+  final List<NasMovieActor> actors;
   final String? posterFileName;
   final int episodeCount;
   final int? durationMs;
@@ -220,7 +221,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 12;
+  static const currentSchemaVersion = 13;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -477,6 +478,20 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [12, _now()],
+      );
+    }
+    if (current < 13) {
+      final rows = _db.select('SELECT id, actors_json FROM movies');
+      for (final row in rows) {
+        final actors = decodeNasMovieActors(row['actors_json'] as String?);
+        _db.execute(
+          'UPDATE movies SET actors_json = ? WHERE id = ?',
+          [encodeNasMovieActors(actors), row['id']],
+        );
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [13, _now()],
       );
     }
   }
@@ -775,7 +790,7 @@ class NasLibraryDatabase {
     String? catalogNumber,
     bool updateCatalogNumber = false,
     String? summary,
-    List<String>? actors,
+    List<NasMovieActor>? actors,
   }) {
     if (findMovieForAdmin(movieId) == null) return null;
     if (title == null &&
@@ -805,7 +820,7 @@ class NasLibraryDatabase {
     }
     if (actors != null) {
       assignments.add('actors_json = ?');
-      values.add(jsonEncode(actors));
+      values.add(encodeNasMovieActors(actors));
     }
     assignments.add('updated_at = ?');
     values.add(_now());
@@ -1758,17 +1773,8 @@ class NasLibraryDatabase {
     );
   }
 
-  List<String> _decodeActors(String? value) {
-    if (value == null || value.isEmpty) return const [];
-    try {
-      final decoded = jsonDecode(value);
-      return decoded is List
-          ? decoded.whereType<String>().toList(growable: false)
-          : const [];
-    } on FormatException {
-      return const [];
-    }
-  }
+  List<NasMovieActor> _decodeActors(String? value) =>
+      decodeNasMovieActors(value);
 
   NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
     final rows = _db.select('''

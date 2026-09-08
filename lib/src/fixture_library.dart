@@ -43,7 +43,9 @@ class NasFixtureLibrary {
   Map<String, Object?> _summary() => {
         'id': movieId,
         'title': '幕境 NAS 示例影片',
-        'actors': const ['示例演员'],
+        'actors': const [
+          {'name': '示例演员', 'gender': 'unknown'},
+        ],
         'category': const {'id': 'fixture-category', 'name': '示例'},
         'tags': const [
           {'id': 'fixture-tag-scifi', 'name': '科幻'},

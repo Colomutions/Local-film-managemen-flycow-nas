@@ -1,16 +1,16 @@
-# 幕境 NAS 服务（任务 I）
+# 幕境 NAS 服务
 
-这是飞牛 NAS 的无界面服务基础。它提供不鉴权的 `GET`/`HEAD /health`、持久 `serverId`、Android 1.x 兼容的 server-info、viewer/admin 配对、受 token 保护的播放会话和 Range 流，以及 SQLite 媒体根扫描。任务 K 已提供受 admin scope 保护的媒体根、扫描、影片/分集元数据、分类、标签、标签层级、海报、设备管理与备份 API；它尚未实现源文件管理 API。
+这是飞牛 NAS 的无界面影片服务。它提供健康检查、持久 `serverId`、viewer/admin 配对、受 token 保护的影片浏览、播放会话、Range 流和观看历史，并以 SQLite 管理媒体根、扫描结果、影片/分集元数据、分类、标签、海报、设备与备份。管理员影片 PATCH 已支持译名、原名、番号、结构化演员、简介、分类和标签；可选的受控源文件同目录改名默认关闭。
 
 第一次部署请先阅读 [`docs/飞牛NAS小白部署指南.md`](docs/飞牛NAS小白部署指南.md)，其中包含目录说明、`.env`、镜像加速、最小启动、只读媒体挂载、扫描和常见故障处理。
 
 ## 技术选型
 
 - **运行时：Dart 3.13.2 + `dart:io` HTTP。** 当前 Windows 服务已将协议核心的依赖边界抽离为 Dart 接口；本项目使用独立 Dart 进程与 `sqlite3` 持久层，避免引入 Flutter、Drift、Windows 路径或桌面生命周期。
-- **镜像：`dart:3.3-sdk` 构建，Debian Bookworm 运行。** Intel N150 使用 `linux/amd64`；镜像不需要 NAS 的 GUI 或 Docker Socket。
+- **镜像：`dart:3.13.2-sdk` 构建，Debian Bookworm 运行。** Intel N150 使用 `linux/amd64`；镜像不需要 NAS 的 GUI 或 Docker Socket。
 - **安全：** 容器没有特权模式，使用可配置的 `PUID:PGID`，并启用 `no-new-privileges`。
 
-后续任务会在这个进程中逐步加入持久状态、鉴权和 `/api/v1` 兼容路由；不会复制 Windows/Android 工程或共享 SQLite。
+NAS 使用独立 Dart 进程和独立 SQLite，不复制 Windows/Android 工程，也不与其它端共享数据库文件。Windows 管理端只能通过认证的 `/api/v1` HTTP API 管理 NAS 数据，不得直接读写 NAS SQLite。
 
 ## 配置与卷
 
@@ -94,26 +94,26 @@ dart run test/startup_integrity_test.dart
 
 首次部署还要在未跟踪的 `.env` 设置 `MUJING_PAIRING_CODE`。它仅用于确认五分钟内有效的配对会话，不能提交或写入日志。
 
-## 任务 E/F API 与权限
+## 认证、浏览与播放 API
 
 - `GET` / `HEAD /health`：无需鉴权；只返回状态、服务名和版本，不返回卷路径、令牌或连接地址。
 - `GET /api/v1/server-info`：返回 Android 当前 DTO 所需的 `serverId`、`serverName`、`apiVersion`、`minimumClientVersion`、`pairingRequired` 和 capabilities。显式配置 `MUJING_ADVERTISE_URL` 时才额外返回 `connection.endpoint`。
 - `POST /api/v1/pairing/sessions`：请求必须包含 `serverId`；可选 `requestedScope` 只能是 `viewer` 或 `admin`。省略 scope（Android 当前行为）固定创建 `viewer` 会话。
 - `POST /api/v1/pairing/sessions/{id}/confirm`：请求 `pairingPassword`，成功响应包含 `deviceId`、`accessToken`、`expiresAt` 和 `scope`。令牌有效期当前为一年，持久化时仅保存 SHA-256 哈希。
 
-`viewer` 可用于后续浏览、播放和观看状态 API；`admin` 只由显式请求的未来 Windows 管理客户端取得。尚未实现的 `/api/v1/admin/*` 路由会拒绝 viewer 为 `403 insufficient_scope`，不会把 Android 默认升级为 admin。
+`viewer` 用于 Android 浏览、播放和观看状态 API；`admin` 由 Windows 管理端显式请求。所有 `/api/v1/admin/*` 路由都会拒绝 viewer 为 `403 insufficient_scope`，不会把 Android 默认升级为 admin。
 
-任务 F 提供一条仅用于协议验证的内存 fixture：
+浏览 API 由 NAS SQLite 和扫描结果提供：
 
-- `GET /api/v1/movies`：一条 Android DTO 兼容的摘要；支持可选 `query`。
-- `GET /api/v1/movies/{movieId}`：同一影片的详情和不可播放的示例分集。
-- `GET /api/v1/tag-paths`：示例标签树路径。
-- `GET` / `HEAD /api/v1/assets/posters/{movieId}`：受 Bearer token 保护的内存 PNG，使用相对 `posterUrl`。
-- `GET /api/v1/favorites`、`GET /api/v1/history`：返回空列表，等待真实观看状态任务实现。
+- `GET /api/v1/movies`：返回影片摘要并支持查询译名、原名、番号、演员、简介、分类和标签；演员响应为 `{ "name": "姓名", "gender": "male|female|unknown" }` 对象数组，番号查询忽略大小写、空白、短横线和下划线。
+- `GET /api/v1/movies/{movieId}`：返回影片详情与已扫描分集。
+- `GET /api/v1/tag-paths`：返回当前标签层级路径。
+- `GET` / `HEAD /api/v1/assets/posters/{movieId}`：受 Bearer token 保护，使用相对 `posterUrl`。
+- `GET /api/v1/favorites`：当前返回空列表；`GET /api/v1/history`：返回持久化观看历史。
 
-所有上述路由都不会读取媒体卷、返回宿主机路径，或宣称示例分集可播放。任务 I 会用 NAS SQLite 和扫描结果替换此 fixture。
+生产配置不会向浏览 API 暴露协议 fixture，也不会返回宿主机路径或容器内媒体路径。fixture 只保留给隔离的协议测试构造。
 
-任务 G 允许把这条 fixture 显式绑定到一个真实媒体文件，用于部署验证。必须同时启用媒体覆盖文件，并在未跟踪 `.env` 中设置：
+隔离的协议测试还可以把 fixture 显式绑定到一个真实媒体文件。该能力不用于生产影片库；必须同时启用媒体覆盖文件，并在未跟踪 `.env` 中设置：
 
 ```dotenv
 MEDIA_ROOT=/NAS/上的实际媒体目录
@@ -123,31 +123,32 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 服务端只接受相对路径，拒绝绝对路径、`..` 路径逃逸，并在每次流请求时解析符号链接，确保最终文件仍位于容器 `/media` 根内。该配置可在部署时手动提供；本任务没有配置页面，也不会把宿主机路径返回给客户端。
 
 - `POST /api/v1/playback/sessions`：viewer 创建直接播放会话，返回相对流 URL。
-- `PATCH /api/v1/playback/sessions/{id}/progress`：viewer 写入当前进度；任务 G 中进度只保存在内存，容器重启后清空。
+- `PATCH /api/v1/playback/sessions/{id}/progress`：viewer 写入当前进度，并更新持久化观看历史。
 - `DELETE /api/v1/playback/sessions/{id}`：关闭会话。
 - `GET` / `HEAD /api/v1/playback/sessions/{id}/stream`：支持无 Range 的 `200`、单 Range 的 `206` 和非法 Range 的 `416`，不把整文件读入内存。
 
 服务使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。生产环境把容器 `/media` 作为只读边界，启动时不自动扫描；在 Windows NAS 管理页创建类别并绑定其子目录后，才会显式扫描该类别中的 `mp4`、`m4v`、`mkv`、`mov` 与 `webm` 文件。类别目录不得相同、互为父子或经符号链接越出媒体根；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。`MUJING_SCAN_ON_START` 仅保留给隔离的旧测试构造，环境配置中不再启用它。
 
-任务 I 暂不调用 ffprobe，因此时长和分辨率可为空；它也不提供管理 API、重命名、移动或删除。扫码得到的 SQLite 影片会优先替代内存 fixture；尚未扫描时仍保留 fixture 用于协议测试。
+扫描会通过有界 `ffprobe` 进程读取白名单媒体字段；探测失败时仍可保留影片，时长和分辨率允许为空。服务已经提供管理员 API，以及默认关闭的分集源文件同目录改名；不提供任意移动或删除源媒体的能力。生产配置始终以 SQLite 影片库为准。
 
-## 任务 K：管理员媒体根、扫描、元数据、分类标签与海报
+## 管理员媒体根、扫描、元数据、分类标签与海报
 
 当前仅实现以下管理员路由，所有路由都要求显式 `admin` token；缺少 token 为 `401 authentication_required`，viewer token 为 `403 insufficient_scope`：
 
 - `GET /api/v1/admin/media-roots`：返回当前容器 `/media` 对应的服务内 `id`、名称、只读状态、启用状态和时间戳。响应不返回 `containerPath`、宿主机路径或容器路径。
 - `POST /api/v1/admin/scan-jobs`：请求体仅接受服务端返回的 `{ "mediaRootId": "..." }`，创建一个 `202` 扫描任务。服务不接受、猜测或创建任意文件系统路径。
 - `GET /api/v1/admin/scan-jobs` 与 `GET /api/v1/admin/scan-jobs/{id}`：读取当前进程内扫描任务的状态、文件数和可用分集数。扫描结果写入 NAS SQLite；任务状态本身在容器重启后不保留。
-- `PATCH /api/v1/admin/movies/{id}`：仅接受 `title` 和/或 `summary`，更新已扫描影片的 NAS SQLite 元数据并返回浏览兼容的影片详情。
+- `PATCH /api/v1/admin/movies/{id}`：接受 `title`、`originalTitle`、`catalogNumber`、`actors`、`summary`、`categoryId` 和 `tagPlacementIds` 中至少一项，经统一业务入口更新 NAS SQLite，并返回浏览兼容的影片详情。`actors` 必须是 `{ "name": "姓名", "gender": "male|female|unknown" }` 对象数组，姓名忽略大小写后不得重复。
 - `PATCH /api/v1/admin/episodes/{id}`：仅接受 `title`，更新已扫描分集的 NAS SQLite 元数据；响应不包含 `relativePath`。
+- `PATCH /api/v1/admin/episodes/{id}/source-name`：仅在可写媒体覆盖和 `MUJING_ALLOW_SOURCE_RENAME=true` 同时启用时执行同目录改名；保留扩展名、拒绝冲突和路径逃逸，并同步更新 SQLite。
 - `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/categories`：管理 NAS 节点内的分类名称。删除分类会清空影片上的该分类关联，不影响媒体文件。
 - `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/tags`：管理 NAS 节点内的标签名称。删除标签会级联删除其 placement 与影片关联，不影响媒体文件。
 - `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/tag-placements`：用 `tagId` 与可空 `parentPlacementId` 管理标签层级；服务拒绝循环层级。
 - `POST /api/v1/admin/movies/{id}/poster`：admin 将 PNG、JPEG 或 WebP 原始 bytes 上传为已扫描影片的海报。请求必须使用对应的 `Content-Type`，最大 10 MiB；响应仅返回相对 `posterUrl`。
 
-媒体覆盖保持只读。扫描任务只能扫描当前已配置的 `/media` 根，使用媒体根 ID 和相对路径，不会执行源文件写操作。数据库 migration v2 为媒体根增加扫描时间，用于区分“尚未扫描时的协议 fixture”和“已扫描但目录为空”的真实 SQLite 结果。
+默认媒体覆盖保持只读。扫描任务只能扫描当前已配置的 `/media` 根，使用媒体根 ID 和相对路径，本身不会执行源文件写操作。当前数据库 schema 为 v13；v13 会把旧的演员字符串数组转换为性别 `unknown` 的结构化演员，升级仍按顺序执行版本化 migration，并拒绝高于服务支持版本的数据库。
 
-重复扫描同一媒体根时仅刷新文件大小、可用性和扫描时间，不会覆盖管理员写入的影片标题、简介或分集标题。
+重复扫描同一媒体根时只刷新扫描得到的文件与媒体探测信息，不会覆盖管理员维护的影片译名、原名、番号、演员、简介或分集标题。
 
 影片 PATCH 还可设置可空 `categoryId` 和完整替换的 `tagPlacementIds`。这些字段只能是服务端已有 ID；浏览 API 仍只返回分类 DTO、标签 DTO 和名称路径，Android 按名称做跨节点聚合时不使用这些节点内 ID。
 
@@ -169,7 +170,7 @@ dart run test/backups_api_test.dart
 {"error":{"code":"authentication_required","message":"A valid device token is required."}}
 ```
 
-## 任务 K：设备与备份
+## 设备与备份
 
 - `GET /api/v1/admin/devices` 与 `DELETE /api/v1/admin/devices/{deviceId}`：仅 admin 可查看脱敏的设备 ID、scope 和过期时间，或撤销指定设备。撤销后该设备的原令牌立即失效；响应不返回令牌、令牌哈希或配对码。
 - `POST /api/v1/admin/backups`：仅 admin 可创建备份，成功返回服务生成的备份 ID、创建时间与数据大小。备份使用 SQLite `VACUUM INTO` 生成一致性快照，并复制 `/data` 内的服务身份状态、可选配置和海报资产。
@@ -184,5 +185,6 @@ bin/                  进程入口
 lib/src/              配置和健康服务
 test/                 不依赖第三方包的本地测试
 docker-compose.yml    最小服务与持久数据卷
-docker-compose.media.yml  显式启用的读写媒体卷
+docker-compose.media.yml  默认只读媒体卷
+docker-compose.media-writable.yml  显式启用的可写媒体卷
 ```

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:sqlite3/sqlite3.dart';
 
 import '../lib/src/library_database.dart';
+import '../lib/src/movie_actor.dart';
 
 Future<void> main() async {
   final directory =
@@ -26,7 +27,27 @@ Future<void> main() async {
       'fresh database applies each schema version once',
     );
 
+    final legacyActorsDatabase = sqlite3.open(databaseFile.path);
+    try {
+      legacyActorsDatabase.execute('''
+        INSERT INTO movies(id, title, summary, actors_json, created_at, updated_at)
+        VALUES ('legacy-actors', '旧演员影片', '', '["演员甲"," 演员乙 "]',
+                '2026-09-08T00:00:00.000Z', '2026-09-08T00:00:00.000Z');
+        DELETE FROM schema_migrations WHERE version = 13;
+      ''');
+    } finally {
+      legacyActorsDatabase.dispose();
+    }
+
     await database.open();
+    final migratedActors = database.findMovie('legacy-actors')!.actors;
+    _expect(
+      migratedActors.length == 2 &&
+          migratedActors.every(
+            (actor) => actor.gender == NasActorGender.unknown,
+          ),
+      'schema 13 converts legacy actor strings to structured values',
+    );
     await database.close();
     _expect(
       _schemaVersions(databaseFile.path).join(',') ==

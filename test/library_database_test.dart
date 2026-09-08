@@ -3,6 +3,7 @@ import 'dart:io';
 import '../lib/src/library_database.dart';
 import '../lib/src/media_service.dart';
 import '../lib/src/metadata_probe.dart';
+import '../lib/src/movie_actor.dart';
 
 Future<void> main() async {
   final directory =
@@ -47,15 +48,26 @@ Future<void> main() async {
       updateOriginalTitle: true,
       catalogNumber: 'ABC-001',
       updateCatalogNumber: true,
+      actors: const [
+        NasMovieActor(name: '演员甲', gender: NasActorGender.female),
+        NasMovieActor(name: '演员乙', gender: NasActorGender.male),
+      ],
     )!;
     _expect(enriched.originalTitle == 'Sample Original',
         'database stores the original title');
     _expect(enriched.catalogNumber == 'ABC-001',
         'database stores the catalog number');
+    _expect(
+        enriched.actors.length == 2 &&
+            enriched.actors.first.name == '演员甲' &&
+            enriched.actors.first.gender == NasActorGender.female,
+        'database stores structured actors');
     _expect(database.listMovies(query: 'sample original').length == 1,
         'database searches the original title');
     _expect(database.listMovies(query: 'abc001').length == 1,
         'database searches normalized catalog numbers');
+    _expect(database.listMovies(query: '演员乙').length == 1,
+        'database searches structured actor names');
     final episode = database.episodesForMovie(movie.id).single;
     _expect(episode.relativePath == '真人/sample.mp4',
         'database stores a relative path');
@@ -89,6 +101,9 @@ Future<void> main() async {
     _expect(reopenedMovie.originalTitle == 'Sample Original' &&
         reopenedMovie.catalogNumber == 'ABC-001',
         'movie identity metadata survives reopen');
+    _expect(
+        reopenedMovie.actors.last.gender == NasActorGender.male,
+        'structured actors survive reopen');
     final reopenedEpisode = database.episodesForMovie(movie.id).single;
     _expect(reopenedEpisode.durationMs == 12500 &&
         reopenedEpisode.videoWidth == 1920 &&
