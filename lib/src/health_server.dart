@@ -1523,7 +1523,10 @@ class NasHealthServer {
   }
 
   Future<void> _deleteAdminCategory(HttpRequest request) async {
-    if (!_libraryDatabase.deleteCategory(request.uri.pathSegments.last)) {
+    if (!_libraryDatabase.deleteCategory(
+      request.uri.pathSegments.last,
+      deleteMovies: config.managedCategoryLibrary,
+    )) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     request.response.statusCode = HttpStatus.noContent;

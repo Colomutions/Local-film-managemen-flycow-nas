@@ -145,7 +145,7 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
 - `PATCH /api/v1/admin/movies/{id}`：接受 `title`、`originalTitle`、`catalogNumber`、`actors`、`summary`、`categoryId` 和 `tagPlacementIds` 中至少一项，经统一业务入口更新 NAS SQLite，并返回浏览兼容的影片详情。`actors` 必须是 `{ "name": "姓名", "gender": "male|female|unknown" }` 对象数组，姓名忽略大小写后不得重复。
 - `PATCH /api/v1/admin/episodes/{id}`：仅接受 `title`，更新已扫描分集的 NAS SQLite 元数据；响应不包含 `relativePath`。
 - `PATCH /api/v1/admin/episodes/{id}/source-name`：仅在可写媒体覆盖和 `MUJING_ALLOW_SOURCE_RENAME=true` 同时启用时执行同目录改名；保留扩展名、拒绝冲突和路径逃逸，并同步更新 SQLite。
-- `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/categories`：管理 NAS 节点内的分类名称。删除分类会清空影片上的该分类关联，不影响媒体文件。
+- `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/categories`：管理 NAS 节点内的分类名称。分类绑定目录模式下，删除分类会清除该目录的影片索引但不影响媒体文件；传统元数据分类模式仅清空影片上的分类关联。
 - `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/tags`：管理 NAS 节点内的标签名称。删除标签会级联删除其 placement 与影片关联，不影响媒体文件。
 - `GET`/`POST`/`PATCH`/`DELETE /api/v1/admin/tag-placements`：用 `tagId` 与可空 `parentPlacementId` 管理标签层级；服务拒绝循环层级。
 - `POST /api/v1/admin/movies/{id}/poster`：admin 将 PNG、JPEG 或 WebP 原始 bytes 上传为已扫描影片的海报。请求必须使用对应的 `Content-Type`，最大 10 MiB；响应仅返回相对 `posterUrl`。

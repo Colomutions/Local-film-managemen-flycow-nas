@@ -1456,8 +1456,11 @@ class NasLibraryDatabase {
     return findCategory(categoryId);
   }
 
-  bool deleteCategory(String categoryId) {
+  bool deleteCategory(String categoryId, {bool deleteMovies = false}) {
     if (findCategory(categoryId) == null) return false;
+    if (deleteMovies) {
+      _db.execute('DELETE FROM movies WHERE category_id = ?', [categoryId]);
+    }
     _db.execute('DELETE FROM library_categories WHERE id = ?', [categoryId]);
     return true;
   }
