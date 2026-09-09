@@ -23,6 +23,49 @@ class NasArtworkService {
       '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters');
   Directory get _carouselDirectory => Directory(
       '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel');
+  Directory get _managedAssetDirectory => Directory(
+      '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}assets');
+
+  /// 将客户端上传的图片复制到 NAS 受管理目录，后续不依赖客户端源文件。
+  Future<String> saveManagedAsset({
+    required String assetId,
+    required String mimeType,
+    required List<int> bytes,
+  }) async {
+    final extension = _extensionForMimeType(mimeType);
+    if (extension == null ||
+        !isValidPosterBytes(mimeType: mimeType, bytes: bytes)) {
+      throw ArgumentError('Unsupported or invalid managed asset payload.');
+    }
+    final directory = _managedAssetDirectory;
+    await directory.create(recursive: true);
+    final fileName = '$assetId.$extension';
+    final target = File('${directory.path}${Platform.pathSeparator}$fileName');
+    final temporary = File('${target.path}.tmp');
+    await temporary.writeAsBytes(bytes, flush: true);
+    await temporary.rename(target.path);
+    return fileName;
+  }
+
+  Future<NasArtworkFile?> managedAsset(String? fileName) async {
+    if (fileName == null ||
+        !RegExp(r'^[A-Za-z0-9-]+\.(png|jpe?g|webp)$').hasMatch(fileName)) {
+      return null;
+    }
+    final mimeType = _mimeTypeForFileName(fileName);
+    if (mimeType == null) return null;
+    final file = File(
+      '${_managedAssetDirectory.path}${Platform.pathSeparator}$fileName',
+    );
+    return await file.exists()
+        ? NasArtworkFile(file: file, mimeType: mimeType)
+        : null;
+  }
+
+  Future<void> deleteManagedAsset(String? fileName) async {
+    final asset = await managedAsset(fileName);
+    if (asset != null) await asset.file.delete();
+  }
 
   Future<String> savePoster({
     required String movieId,
@@ -69,7 +112,8 @@ class NasArtworkService {
     required List<int> bytes,
   }) async {
     final extension = _extensionForMimeType(mimeType);
-    if (extension == null || !isValidPosterBytes(mimeType: mimeType, bytes: bytes)) {
+    if (extension == null ||
+        !isValidPosterBytes(mimeType: mimeType, bytes: bytes)) {
       throw ArgumentError('Unsupported or invalid carousel payload.');
     }
     final directory = _carouselDirectory;
@@ -90,7 +134,8 @@ class NasArtworkService {
     }
     final mimeType = _mimeTypeForFileName(fileName);
     if (mimeType == null) return null;
-    final file = File('${_carouselDirectory.path}${Platform.pathSeparator}$fileName');
+    final file =
+        File('${_carouselDirectory.path}${Platform.pathSeparator}$fileName');
     return await file.exists()
         ? NasArtworkFile(file: file, mimeType: mimeType)
         : null;

@@ -191,6 +191,101 @@ class NasCarouselImage {
   final String createdAt;
 }
 
+/// NAS 原生演员资料，不依赖任何客户端本地数据库或路径。
+class NasActor {
+  const NasActor({
+    required this.id,
+    required this.stageName,
+    this.originalName,
+    this.translatedName,
+    required this.aliases,
+    this.gender,
+    this.birthMonth,
+    this.heightCm,
+    this.weightKg,
+    this.measurements,
+    this.bodyType,
+    this.country,
+    this.debutMonth,
+    this.debutDescription,
+    this.photoAssetId,
+    required this.publisherNames,
+    required this.movieCount,
+    required this.createdAt,
+    required this.updatedAt,
+    this.archivedAt,
+  });
+
+  final String id;
+  final String? stageName;
+  final String? originalName;
+  final String? translatedName;
+  final List<String> aliases;
+  final String? gender;
+  final String? birthMonth;
+  final int? heightCm;
+  final int? weightKg;
+  final String? measurements;
+  final String? bodyType;
+  final String? country;
+  final String? debutMonth;
+  final String? debutDescription;
+  final String? photoAssetId;
+  final List<String> publisherNames;
+  final int movieCount;
+  final String createdAt;
+  final String updatedAt;
+  final String? archivedAt;
+}
+
+/// 由 NAS 受管理目录保存的图片资产；文件系统绝对路径从不经 API 暴露。
+class NasManagedAsset {
+  const NasManagedAsset({
+    required this.id,
+    required this.purpose,
+    required this.fileName,
+    required this.mimeType,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String purpose;
+  final String fileName;
+  final String mimeType;
+  final String createdAt;
+}
+
+/// 由共同影片关系推导出的合作演员，不能手工写入。
+class NasActorCoactor {
+  const NasActorCoactor({required this.actor, required this.movieCount});
+
+  final NasActor actor;
+  final int movieCount;
+}
+
+/// NAS 持久化的 AI 元数据任务；任务结果由 NAS 保存后再由管理员应用。
+class NasAiTask {
+  const NasAiTask({
+    required this.id,
+    required this.movieId,
+    required this.instructions,
+    required this.status,
+    required this.createdAt,
+    this.resultJson,
+    this.errorCode,
+    this.finishedAt,
+  });
+
+  final String id;
+  final String movieId;
+  final String instructions;
+  final String status;
+  final String createdAt;
+  final String? resultJson;
+  final String? errorCode;
+  final String? finishedAt;
+}
+
 /// NAS 自身持久化的播放历史；不包含任何 Windows 本地路径或客户端令牌。
 class NasPlaybackHistoryItem {
   const NasPlaybackHistoryItem({
@@ -221,7 +316,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 13;
+  static const currentSchemaVersion = 15;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -494,6 +589,69 @@ class NasLibraryDatabase {
         [13, _now()],
       );
     }
+    if (current < 14) {
+      _db.execute('''
+        CREATE TABLE managed_assets (
+          id TEXT PRIMARY KEY,
+          purpose TEXT NOT NULL CHECK(purpose IN ('actor_photo', 'movie_poster')),
+          file_name TEXT NOT NULL UNIQUE,
+          mime_type TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE actors (
+          id TEXT PRIMARY KEY,
+          stage_name TEXT,
+          original_name TEXT,
+          translated_name TEXT,
+          aliases_json TEXT NOT NULL DEFAULT '[]',
+          gender TEXT CHECK(gender IN ('female', 'intersex', 'male')),
+          birth_month TEXT,
+          height_cm INTEGER,
+          weight_kg INTEGER,
+          measurements TEXT,
+          body_type TEXT,
+          country TEXT,
+          debut_month TEXT,
+          debut_description TEXT,
+          photo_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
+          publisher_names_json TEXT NOT NULL DEFAULT '[]',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          archived_at TEXT
+        );
+        CREATE TABLE movie_actor_links (
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+          PRIMARY KEY(movie_id, actor_id)
+        );
+        CREATE INDEX actors_archived_created_idx ON actors(archived_at, created_at DESC);
+        CREATE INDEX movie_actor_links_actor_idx ON movie_actor_links(actor_id, movie_id);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [14, _now()],
+      );
+    }
+    if (current < 15) {
+      _db.execute('''
+        CREATE TABLE ai_metadata_tasks (
+          id TEXT PRIMARY KEY,
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          instructions TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'succeeded', 'failed')),
+          result_json TEXT,
+          error_code TEXT,
+          created_at TEXT NOT NULL,
+          finished_at TEXT
+        );
+        CREATE INDEX ai_metadata_tasks_movie_created_idx
+          ON ai_metadata_tasks(movie_id, created_at DESC);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [15, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -574,7 +732,8 @@ class NasLibraryDatabase {
           'Only the configured media service root can be scanned.');
     }
     if ((categoryId == null) != (directoryRelativePath == null)) {
-      throw ArgumentError('Category scan requires both category and directory.');
+      throw ArgumentError(
+          'Category scan requires both category and directory.');
     }
     final rootId = configuredRoot.id;
     if (categoryId == null) {
@@ -591,7 +750,7 @@ class NasLibraryDatabase {
     final root = directoryRelativePath == null
         ? Directory(configuredRoot.containerPath)
         : (await mediaService.directoryForRelativePath(directoryRelativePath))
-              ?.directory;
+            ?.directory;
     if (root == null) {
       _markRootScanned(rootId);
       return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
@@ -674,7 +833,9 @@ class NasLibraryDatabase {
         unchanged ? existing.first['duration_ms'] : metadata?.durationMs,
         unchanged ? existing.first['video_width'] : metadata?.width,
         unchanged ? existing.first['video_height'] : metadata?.height,
-        unchanged ? existing.first['resolution_label'] : metadata?.resolutionLabel,
+        unchanged
+            ? existing.first['resolution_label']
+            : metadata?.resolutionLabel,
         mediaModifiedAt,
         fileSize,
         timestamp,
@@ -697,7 +858,8 @@ class NasLibraryDatabase {
     if (category == null ||
         directoryRelativePath == null ||
         directoryRelativePath.isEmpty) {
-      throw ArgumentError.value(categoryId, 'categoryId', 'has no media directory');
+      throw ArgumentError.value(
+          categoryId, 'categoryId', 'has no media directory');
     }
     return scanMediaRoot(
       mediaRootId: mediaRootId,
@@ -740,7 +902,7 @@ class NasLibraryDatabase {
               originalTitle: row['original_title'] as String?,
               catalogNumber: row['catalog_number'] as String?,
               summary: row['summary'] as String,
-              actors: _decodeActors(row['actors_json'] as String?),
+              actors: _movieActors(row['id'] as String),
               posterFileName: row['poster_file_name'] as String?,
               playCount: row['play_count'] as int,
               episodeCount: row['episode_count'] as int,
@@ -750,6 +912,341 @@ class NasLibraryDatabase {
               updatedAt: row['updated_at'] as String,
             )))
         .toList(growable: false);
+  }
+
+  List<NasActor> listActors({
+    String query = '',
+    String? gender,
+    bool includeArchived = false,
+  }) {
+    final rows = _db.select('''
+      SELECT a.id, a.stage_name, a.original_name, a.translated_name,
+             a.aliases_json, a.gender, a.birth_month, a.height_cm, a.weight_kg,
+             a.measurements, a.body_type, a.country, a.debut_month,
+             a.debut_description, a.photo_asset_id, a.publisher_names_json,
+             a.created_at, a.updated_at, a.archived_at,
+             COUNT(l.movie_id) AS movie_count
+      FROM actors a
+      LEFT JOIN movie_actor_links l ON l.actor_id = a.id
+      WHERE (? = 1 OR a.archived_at IS NULL)
+        AND (? IS NULL OR a.gender = ?)
+      GROUP BY a.id
+      ORDER BY a.created_at DESC, a.id DESC
+    ''', [includeArchived ? 1 : 0, gender, gender]);
+    final normalizedQuery = _normalizeActorSearch(query);
+    return rows
+        .map(_mapActor)
+        .where((actor) =>
+            normalizedQuery.isEmpty ||
+            _actorSearchText(actor).contains(normalizedQuery))
+        .toList(growable: false);
+  }
+
+  NasActor? findActor(String actorId) {
+    final rows = _db.select('''
+      SELECT a.id, a.stage_name, a.original_name, a.translated_name,
+             a.aliases_json, a.gender, a.birth_month, a.height_cm, a.weight_kg,
+             a.measurements, a.body_type, a.country, a.debut_month,
+             a.debut_description, a.photo_asset_id, a.publisher_names_json,
+             a.created_at, a.updated_at, a.archived_at,
+             COUNT(l.movie_id) AS movie_count
+      FROM actors a
+      LEFT JOIN movie_actor_links l ON l.actor_id = a.id
+      WHERE a.id = ?
+      GROUP BY a.id
+    ''', [actorId]);
+    return rows.isEmpty ? null : _mapActor(rows.single);
+  }
+
+  List<NasActor> actorsForMovie(String movieId) {
+    final ids = _db.select('''
+      SELECT actor_id FROM movie_actor_links
+      WHERE movie_id = ? ORDER BY actor_id
+    ''', [movieId]);
+    return ids
+        .map((row) => findActor(row['actor_id'] as String))
+        .whereType<NasActor>()
+        .toList(growable: false);
+  }
+
+  List<NasLibraryMovie> moviesForActor(String actorId, {String query = ''}) {
+    final movieIds = _db.select('''
+      SELECT movie_id FROM movie_actor_links WHERE actor_id = ?
+    ''', [actorId]).map((row) => row['movie_id'] as String).toSet();
+    if (movieIds.isEmpty) return const [];
+    return listMovies(query: query)
+        .where((movie) => movieIds.contains(movie.id))
+        .toList(growable: false);
+  }
+
+  List<NasActorCoactor> coactorsForActor(String actorId) {
+    final rows = _db.select('''
+      SELECT l2.actor_id, COUNT(*) AS movie_count
+      FROM movie_actor_links l1
+      JOIN movie_actor_links l2 ON l2.movie_id = l1.movie_id
+      WHERE l1.actor_id = ? AND l2.actor_id != ?
+      GROUP BY l2.actor_id
+      ORDER BY movie_count DESC, l2.actor_id ASC
+    ''', [actorId, actorId]);
+    return rows
+        .map((row) {
+          final actor = findActor(row['actor_id'] as String);
+          return actor == null
+              ? null
+              : NasActorCoactor(
+                  actor: actor,
+                  movieCount: row['movie_count'] as int,
+                );
+        })
+        .whereType<NasActorCoactor>()
+        .toList(growable: false);
+  }
+
+  List<NasActor> findSimilarActors({
+    String? stageName,
+    String? originalName,
+    String? translatedName,
+    List<String> aliases = const [],
+  }) {
+    final names = <String?>[
+      stageName,
+      originalName,
+      translatedName,
+      ...aliases,
+    ];
+    final queries = names
+        .map(_nullableTrimmed)
+        .whereType<String>()
+        .map(_normalizeActorSearch)
+        .where((value) => value.isNotEmpty)
+        .toSet();
+    if (queries.isEmpty) return const [];
+    return listActors(includeArchived: true)
+        .where((actor) => queries.any(_actorSearchText(actor).contains))
+        .toList(growable: false);
+  }
+
+  NasActor createActor({
+    String? stageName,
+    String? originalName,
+    String? translatedName,
+    List<String> aliases = const [],
+    String? gender,
+    String? birthMonth,
+    int? heightCm,
+    int? weightKg,
+    String? measurements,
+    String? bodyType,
+    String? country,
+    String? debutMonth,
+    String? debutDescription,
+    String? photoAssetId,
+    List<String> publisherNames = const [],
+  }) {
+    final timestamp = _now();
+    final id = newUuidV4();
+    _db.execute('''
+      INSERT INTO actors(
+        id, stage_name, original_name, translated_name, aliases_json, gender,
+        birth_month, height_cm, weight_kg, measurements, body_type, country,
+        debut_month, debut_description, photo_asset_id, publisher_names_json,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      id,
+      _nullableTrimmed(stageName),
+      _nullableTrimmed(originalName),
+      _nullableTrimmed(translatedName),
+      jsonEncode(_cleanTextList(aliases)),
+      gender,
+      _nullableTrimmed(birthMonth),
+      heightCm,
+      weightKg,
+      _nullableTrimmed(measurements),
+      _nullableTrimmed(bodyType),
+      _nullableTrimmed(country),
+      _nullableTrimmed(debutMonth),
+      _nullableTrimmed(debutDescription),
+      photoAssetId,
+      jsonEncode(_cleanTextList(publisherNames)),
+      timestamp,
+      timestamp,
+    ]);
+    return findActor(id)!;
+  }
+
+  NasActor? updateActor(String actorId, Map<String, Object?> values) {
+    if (findActor(actorId) == null) return null;
+    if (values.isEmpty) return findActor(actorId);
+    final assignments = <String>[];
+    final parameters = <Object?>[];
+    values.forEach((key, value) {
+      assignments.add('$key = ?');
+      parameters.add(value);
+    });
+    assignments.add('updated_at = ?');
+    parameters
+      ..add(_now())
+      ..add(actorId);
+    _db.execute(
+      'UPDATE actors SET ${assignments.join(', ')} WHERE id = ?',
+      parameters,
+    );
+    return findActor(actorId);
+  }
+
+  NasActor? archiveActor(String actorId) => updateActor(actorId, {
+        'archived_at': _now(),
+      });
+
+  bool setMovieActorIds({
+    required String movieId,
+    required List<String> actorIds,
+  }) {
+    if (findMovieForAdmin(movieId) == null ||
+        actorIds.toSet().length != actorIds.length ||
+        actorIds.any((id) => findActor(id) == null)) {
+      return false;
+    }
+    _db.execute('BEGIN');
+    try {
+      _db.execute(
+          'DELETE FROM movie_actor_links WHERE movie_id = ?', [movieId]);
+      for (final actorId in actorIds) {
+        _db.execute(
+          'INSERT INTO movie_actor_links(movie_id, actor_id) VALUES (?, ?)',
+          [movieId, actorId],
+        );
+      }
+      _db.execute('COMMIT');
+      return true;
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
+  NasManagedAsset addManagedAsset({
+    required String id,
+    required String purpose,
+    required String fileName,
+    required String mimeType,
+  }) {
+    final asset = NasManagedAsset(
+      id: id,
+      purpose: purpose,
+      fileName: fileName,
+      mimeType: mimeType,
+      createdAt: _now(),
+    );
+    _db.execute('''
+      INSERT INTO managed_assets(id, purpose, file_name, mime_type, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    ''', [
+      asset.id,
+      asset.purpose,
+      asset.fileName,
+      asset.mimeType,
+      asset.createdAt
+    ]);
+    return asset;
+  }
+
+  NasManagedAsset? findManagedAsset(String assetId) {
+    final rows = _db.select('''
+      SELECT id, purpose, file_name, mime_type, created_at
+      FROM managed_assets WHERE id = ?
+    ''', [assetId]);
+    if (rows.isEmpty) return null;
+    final row = rows.single;
+    return NasManagedAsset(
+      id: row['id'] as String,
+      purpose: row['purpose'] as String,
+      fileName: row['file_name'] as String,
+      mimeType: row['mime_type'] as String,
+      createdAt: row['created_at'] as String,
+    );
+  }
+
+  NasAiTask? createAiTask({
+    required String movieId,
+    required String instructions,
+  }) {
+    if (findMovieForAdmin(movieId) == null) return null;
+    final task = NasAiTask(
+      id: newUuidV4(),
+      movieId: movieId,
+      instructions: instructions,
+      status: 'queued',
+      createdAt: _now(),
+    );
+    _db.execute('''
+      INSERT INTO ai_metadata_tasks(
+        id, movie_id, instructions, status, created_at
+      ) VALUES (?, ?, ?, ?, ?)
+    ''', [
+      task.id,
+      task.movieId,
+      task.instructions,
+      task.status,
+      task.createdAt
+    ]);
+    return task;
+  }
+
+  NasAiTask? findAiTask(String taskId) {
+    final rows = _db.select('''
+      SELECT id, movie_id, instructions, status, result_json, error_code,
+             created_at, finished_at
+      FROM ai_metadata_tasks WHERE id = ?
+    ''', [taskId]);
+    if (rows.isEmpty) return null;
+    final row = rows.single;
+    return NasAiTask(
+      id: row['id'] as String,
+      movieId: row['movie_id'] as String,
+      instructions: row['instructions'] as String,
+      status: row['status'] as String,
+      resultJson: row['result_json'] as String?,
+      errorCode: row['error_code'] as String?,
+      createdAt: row['created_at'] as String,
+      finishedAt: row['finished_at'] as String?,
+    );
+  }
+
+  NasAiTask? markAiTaskRunning(String taskId) {
+    final existing = findAiTask(taskId);
+    if (existing == null || existing.status != 'queued') return null;
+    _db.execute('''
+      UPDATE ai_metadata_tasks
+      SET status = 'running', error_code = NULL, result_json = NULL,
+          finished_at = NULL
+      WHERE id = ? AND status = 'queued'
+    ''', [taskId]);
+    return findAiTask(taskId);
+  }
+
+  NasAiTask? completeAiTask(String taskId, Map<String, Object?> result) {
+    final existing = findAiTask(taskId);
+    if (existing == null || existing.status != 'running') return null;
+    _db.execute('''
+      UPDATE ai_metadata_tasks
+      SET status = 'succeeded', result_json = ?, error_code = NULL,
+          finished_at = ?
+      WHERE id = ? AND status = 'running'
+    ''', [jsonEncode(result), _now(), taskId]);
+    return findAiTask(taskId);
+  }
+
+  NasAiTask? failAiTask(String taskId, String errorCode) {
+    final existing = findAiTask(taskId);
+    if (existing == null || existing.status != 'running') return null;
+    _db.execute('''
+      UPDATE ai_metadata_tasks
+      SET status = 'failed', result_json = NULL, error_code = ?, finished_at = ?
+      WHERE id = ? AND status = 'running'
+    ''', [errorCode, _now(), taskId]);
+    return findAiTask(taskId);
   }
 
   bool get hasMediaRoots =>
@@ -790,14 +1287,12 @@ class NasLibraryDatabase {
     String? catalogNumber,
     bool updateCatalogNumber = false,
     String? summary,
-    List<NasMovieActor>? actors,
   }) {
     if (findMovieForAdmin(movieId) == null) return null;
     if (title == null &&
         !updateOriginalTitle &&
         !updateCatalogNumber &&
-        summary == null &&
-        actors == null) {
+        summary == null) {
       return findMovieForAdmin(movieId);
     }
     final assignments = <String>[];
@@ -817,10 +1312,6 @@ class NasLibraryDatabase {
     if (summary != null) {
       assignments.add('summary = ?');
       values.add(summary);
-    }
-    if (actors != null) {
-      assignments.add('actors_json = ?');
-      values.add(encodeNasMovieActors(actors));
     }
     assignments.add('updated_at = ?');
     values.add(_now());
@@ -882,7 +1373,7 @@ class NasLibraryDatabase {
 
   List<NasLibraryCategory> listCategories() => _db
       .select(
-           'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
+          'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
       .map(_mapCategory)
       .toList(growable: false);
 
@@ -903,7 +1394,8 @@ class NasLibraryDatabase {
     );
   }
 
-  NasLibraryCategory createCategory(String name, {String? mediaRelativePath, String? color}) {
+  NasLibraryCategory createCategory(String name,
+      {String? mediaRelativePath, String? color}) {
     _requireTaxonomyName(name, '分类');
     if (hasCategoryName(name)) {
       throw ArgumentError.value(name, 'name', 'already exists');
@@ -919,7 +1411,14 @@ class NasLibraryDatabase {
     );
     _db.execute(
       'INSERT INTO library_categories(id, name, color, media_relative_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [category.id, category.name, category.color, category.mediaRelativePath, category.createdAt, category.updatedAt],
+      [
+        category.id,
+        category.name,
+        category.color,
+        category.mediaRelativePath,
+        category.createdAt,
+        category.updatedAt
+      ],
     );
     return category;
   }
@@ -942,11 +1441,22 @@ class NasLibraryDatabase {
     }
     _db.execute(
       updateMediaRelativePath
-        ? 'UPDATE library_categories SET name = ?, color = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
-        : 'UPDATE library_categories SET name = ?, color = ?, updated_at = ? WHERE id = ?',
+          ? 'UPDATE library_categories SET name = ?, color = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
+          : 'UPDATE library_categories SET name = ?, color = ?, updated_at = ? WHERE id = ?',
       updateMediaRelativePath
-          ? [name, updateColor ? color : findCategory(categoryId)!.color, mediaRelativePath, _now(), categoryId]
-          : [name, updateColor ? color : findCategory(categoryId)!.color, _now(), categoryId],
+          ? [
+              name,
+              updateColor ? color : findCategory(categoryId)!.color,
+              mediaRelativePath,
+              _now(),
+              categoryId
+            ]
+          : [
+              name,
+              updateColor ? color : findCategory(categoryId)!.color,
+              _now(),
+              categoryId
+            ],
     );
     return findCategory(categoryId);
   }
@@ -963,7 +1473,8 @@ class NasLibraryDatabase {
     return NasCategoryTaxonomyTransfer(
       categories: [
         for (final category in listCategories())
-          NasTaxonomyCategoryDefinition(name: category.name, color: category.color),
+          NasTaxonomyCategoryDefinition(
+              name: category.name, color: category.color),
       ],
     );
   }
@@ -1010,7 +1521,7 @@ class NasLibraryDatabase {
 
   List<NasLibraryTag> listTags() => _db
       .select(
-           'SELECT id, name, color, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
+          'SELECT id, name, color, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
       .map(_mapTag)
       .toList(growable: false);
 
@@ -1026,7 +1537,8 @@ class NasLibraryDatabase {
     final normalized = normalizeTaxonomyName(name);
     return listTags().any(
       (tag) =>
-          tag.id != excludingId && normalizeTaxonomyName(tag.name) == normalized,
+          tag.id != excludingId &&
+          normalizeTaxonomyName(tag.name) == normalized,
     );
   }
 
@@ -1068,7 +1580,8 @@ class NasLibraryDatabase {
     }
     final parentPlacement = _rootPlacementForTag(parentTagId);
     if (parentPlacement == null) {
-      throw ArgumentError.value(parentTagId, 'parentTagId', 'must be a root tag');
+      throw ArgumentError.value(
+          parentTagId, 'parentTagId', 'must be a root tag');
     }
     final timestamp = _now();
     final tag = NasLibraryTag(
@@ -1085,7 +1598,8 @@ class NasLibraryDatabase {
     return (tag, _insertTagPlacement(tag.id, parentPlacement.id, timestamp));
   }
 
-  NasLibraryTag? updateTagName(String tagId, String name, {String? color, bool updateColor = false}) {
+  NasLibraryTag? updateTagName(String tagId, String name,
+      {String? color, bool updateColor = false}) {
     if (findTag(tagId) == null) return null;
     _requireWritableTaxonomy();
     _requireTaxonomyName(name, '标签');
@@ -1195,17 +1709,21 @@ class NasLibraryDatabase {
     final placements = listTagPlacements();
     final roots = <NasTaxonomyTagDefinition>[];
     final children = <NasTaxonomyTagDefinition>[];
-    for (final placement in placements.where((item) => item.parentPlacementId == null)) {
+    for (final placement
+        in placements.where((item) => item.parentPlacementId == null)) {
       final tag = tagsById[placement.tagId]!;
       roots.add(NasTaxonomyTagDefinition(name: tag.name, color: tag.color));
     }
     for (final tag in tagsById.values) {
       final parents = placements
-          .where((item) => item.tagId == tag.id && item.parentPlacementId != null)
-          .map((item) => tagsById[findTagPlacement(item.parentPlacementId!)!.tagId]!.name)
+          .where(
+              (item) => item.tagId == tag.id && item.parentPlacementId != null)
+          .map((item) =>
+              tagsById[findTagPlacement(item.parentPlacementId!)!.tagId]!.name)
           .toList(growable: false);
       if (parents.isNotEmpty) {
-        children.add(NasTaxonomyTagDefinition(name: tag.name, color: tag.color, parents: parents));
+        children.add(NasTaxonomyTagDefinition(
+            name: tag.name, color: tag.color, parents: parents));
       }
     }
     return NasTagTaxonomyTransfer(roots: roots, children: children);
@@ -1220,13 +1738,17 @@ class NasLibraryDatabase {
         conflicts: conflicts,
       );
     }
-    final tags = {for (final tag in listTags()) normalizeTaxonomyName(tag.name): tag};
+    final tags = {
+      for (final tag in listTags()) normalizeTaxonomyName(tag.name): tag
+    };
     final rootIds = {
-      for (final placement in listTagPlacements().where((item) => item.parentPlacementId == null))
+      for (final placement in listTagPlacements()
+          .where((item) => item.parentPlacementId == null))
         placement.tagId,
     };
     final childIds = {
-      for (final placement in listTagPlacements().where((item) => item.parentPlacementId != null))
+      for (final placement in listTagPlacements()
+          .where((item) => item.parentPlacementId != null))
         placement.tagId,
     };
     final preflight = <String>[];
@@ -1268,11 +1790,12 @@ class NasLibraryDatabase {
         final key = normalizeTaxonomyName(child.name);
         final existing = tags[key];
         final createdChild = existing == null;
-        final tag = existing ?? createChildTag(
-          name: child.name,
-          parentTagId: tags[normalizeTaxonomyName(child.parents.first)]!.id,
-          color: child.color,
-        ).$1;
+        final tag = existing ??
+            createChildTag(
+              name: child.name,
+              parentTagId: tags[normalizeTaxonomyName(child.parents.first)]!.id,
+              color: child.color,
+            ).$1;
         if (existing == null) {
           tags[key] = tag;
           childIds.add(tag.id);
@@ -1281,7 +1804,8 @@ class NasLibraryDatabase {
           skipped.add('二级标签：${tag.name}');
         }
         final currentParents = listTagPlacements()
-            .where((item) => item.tagId == tag.id && item.parentPlacementId != null)
+            .where((item) =>
+                item.tagId == tag.id && item.parentPlacementId != null)
             .map((item) => findTagPlacement(item.parentPlacementId!)!.tagId)
             .toSet();
         for (final parentName in child.parents) {
@@ -1680,13 +2204,11 @@ class NasLibraryDatabase {
     ''', [movieId, episodeId, boundedPosition, durationMs, _now()]);
   }
 
-  List<NasCarouselImage> carouselImagesForMovie(String movieId) => _db
-      .select('''
+  List<NasCarouselImage> carouselImagesForMovie(String movieId) =>
+      _db.select('''
         SELECT id, movie_id, file_name, created_at
         FROM movie_carousel_images WHERE movie_id = ? ORDER BY created_at, id
-      ''', [movieId])
-      .map(_mapCarouselImage)
-      .toList(growable: false);
+      ''', [movieId]).map(_mapCarouselImage).toList(growable: false);
 
   NasCarouselImage? addCarouselImage({
     required String movieId,
@@ -1728,13 +2250,36 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _mapCarouselImage(rows.single);
   }
 
+  NasActor _mapActor(Row row) => NasActor(
+        id: row['id'] as String,
+        stageName: row['stage_name'] as String?,
+        originalName: row['original_name'] as String?,
+        translatedName: row['translated_name'] as String?,
+        aliases: _decodeTextList(row['aliases_json'] as String?),
+        gender: row['gender'] as String?,
+        birthMonth: row['birth_month'] as String?,
+        heightCm: row['height_cm'] as int?,
+        weightKg: row['weight_kg'] as int?,
+        measurements: row['measurements'] as String?,
+        bodyType: row['body_type'] as String?,
+        country: row['country'] as String?,
+        debutMonth: row['debut_month'] as String?,
+        debutDescription: row['debut_description'] as String?,
+        photoAssetId: row['photo_asset_id'] as String?,
+        publisherNames: _decodeTextList(row['publisher_names_json'] as String?),
+        movieCount: row['movie_count'] as int,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+        archivedAt: row['archived_at'] as String?,
+      );
+
   NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
         id: row['id'] as String,
         title: row['title'] as String,
         originalTitle: row['original_title'] as String?,
         catalogNumber: row['catalog_number'] as String?,
         summary: row['summary'] as String,
-        actors: _decodeActors(row['actors_json'] as String?),
+        actors: _movieActors(row['id'] as String),
         posterFileName: row['poster_file_name'] as String?,
         playCount: row['play_count'] as int,
         episodeCount: row['episode_count'] as int,
@@ -1773,8 +2318,19 @@ class NasLibraryDatabase {
     );
   }
 
-  List<NasMovieActor> _decodeActors(String? value) =>
-      decodeNasMovieActors(value);
+  List<NasMovieActor> _movieActors(String movieId) => actorsForMovie(movieId)
+      .map(
+        (actor) => NasMovieActor(
+          id: actor.id,
+          name: actor.translatedName ??
+              actor.stageName ??
+              actor.originalName ??
+              '未命名演员',
+          gender:
+              NasActorGender.tryParse(actor.gender) ?? NasActorGender.unknown,
+        ),
+      )
+      .toList(growable: false);
 
   NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
     final rows = _db.select('''
@@ -1869,3 +2425,31 @@ class NasLibraryDatabase {
 
   static String _now() => DateTime.now().toUtc().toIso8601String();
 }
+
+List<String> _decodeTextList(String? value) {
+  if (value == null || value.isEmpty) return const [];
+  try {
+    final decoded = jsonDecode(value);
+    if (decoded is! List) return const [];
+    return _cleanTextList(decoded.whereType<String>());
+  } on FormatException {
+    return const [];
+  }
+}
+
+List<String> _cleanTextList(Iterable<String> values) => values
+    .map((value) => value.trim())
+    .where((value) => value.isNotEmpty)
+    .toSet()
+    .toList(growable: false);
+
+String _normalizeActorSearch(String value) =>
+    value.trim().toLowerCase().replaceAll(RegExp(r'[\s\-_.·•]+'), '');
+
+String _actorSearchText(NasActor actor) => _normalizeActorSearch([
+      actor.stageName,
+      actor.originalName,
+      actor.translatedName,
+      actor.bodyType,
+      ...actor.aliases,
+    ].whereType<String>().join(' '));

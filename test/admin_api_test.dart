@@ -26,7 +26,10 @@ Future<void> main() async {
     mediaDir: mediaRoot.path,
     timezone: 'Asia/Shanghai',
   );
-  final server = NasHealthServer(config);
+  final server = NasHealthServer(
+    config,
+    aiMetadataClient: const _FakeAiMetadataClient(),
+  );
 
   try {
     await server.start();
@@ -36,6 +39,33 @@ Future<void> main() async {
         (serverInfo.json['data'] as Map<String, dynamic>)['serverId'] as String;
     final viewerToken = await _pair(base, serverId);
     final adminToken = await _pair(base, serverId, requestedScope: 'admin');
+
+    final initialAiSettings = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/ai/settings',
+      token: adminToken,
+    );
+    _expect(initialAiSettings.json['data']['isConfigured'] == false,
+        'AI is initially not configured');
+    final updatedAiSettings = await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/ai/settings',
+      token: adminToken,
+      body: {
+        'provider': 'test-provider',
+        'endpoint': 'https://ai.example.test/v1',
+        'model': 'test-model',
+        'apiKey': 'secret-is-nas-only',
+      },
+    );
+    _expect(updatedAiSettings.statusCode == HttpStatus.ok,
+        'admin configures NAS AI settings');
+    _expect(updatedAiSettings.json['data']['apiKeyConfigured'] == true,
+        'AI settings expose key presence only');
+    _expect(!jsonEncode(updatedAiSettings.json).contains('secret-is-nas-only'),
+        'AI API key is never returned to a client');
 
     final unauthenticatedRoots =
         await _request(base, 'GET', '/api/v1/admin/media-roots');
@@ -153,6 +183,28 @@ Future<void> main() async {
       body: {'title': '   '},
     );
     _expectError(invalidMovieUpdate, HttpStatus.badRequest, 'invalid_request');
+    final actorOne = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: adminToken,
+      body: {'translatedName': '演员甲', 'gender': 'female'},
+    );
+    final actorTwo = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: adminToken,
+      body: {'translatedName': '演员乙', 'gender': 'male'},
+    );
+    _expect(actorOne.statusCode == HttpStatus.created,
+        'admin creates native actor one');
+    _expect(actorTwo.statusCode == HttpStatus.created,
+        'admin creates native actor two');
+    final actorOneId = ((actorOne.json['data'] as Map<String, dynamic>)['actor']
+        as Map<String, dynamic>)['id'] as String;
+    final actorTwoId = ((actorTwo.json['data'] as Map<String, dynamic>)['actor']
+        as Map<String, dynamic>)['id'] as String;
     final movieUpdate = await _request(
       base,
       'PATCH',
@@ -162,10 +214,7 @@ Future<void> main() async {
         'title': '管理员标题',
         'originalTitle': 'Administrator Original',
         'catalogNumber': 'ABC-001',
-        'actors': [
-          {'name': '演员甲', 'gender': 'female'},
-          {'name': '演员乙', 'gender': 'male'},
-        ],
+        'actorIds': [actorOneId, actorTwoId],
         'summary': '仅写入 NAS SQLite。',
       },
     );
@@ -178,14 +227,71 @@ Future<void> main() async {
         'movie update returns original title');
     _expect(movieUpdate.json['data']['catalogNumber'] == 'ABC-001',
         'movie update returns catalog number');
+    final returnedActors = movieUpdate.json['data']['actors'] as List<dynamic>;
     _expect(
-        jsonEncode(movieUpdate.json['data']['actors']) ==
-            '[{"name":"演员甲","gender":"female"},{"name":"演员乙","gender":"male"}]',
-        'movie update returns structured actors');
+      returnedActors.length == 2 &&
+          returnedActors.any((actor) =>
+              actor['name'] == '演员甲' && actor['gender'] == 'female') &&
+          returnedActors.any(
+              (actor) => actor['name'] == '演员乙' && actor['gender'] == 'male'),
+      'movie update returns native actor display names',
+    );
     _expect(movieUpdate.json['data']['summary'] == '仅写入 NAS SQLite。',
         'movie update returns summary');
+    final coactors = await _request(
+      base,
+      'GET',
+      '/api/v1/actors/$actorOneId/coactors?page=1&pageSize=9',
+      token: viewerToken,
+    );
+    final coactorItems = (coactors.json['data']
+        as Map<String, dynamic>)['items'] as List<dynamic>;
+    _expect(coactorItems.length == 1, 'coactors are derived from movie links');
+    _expect((coactorItems.single as Map<String, dynamic>)['movieCount'] == 1,
+        'coactor count is derived from shared movies');
+    final actorMovies = await _request(
+      base,
+      'GET',
+      '/api/v1/actors/$actorOneId/movies?q=管理员&sort=title&page=1&pageSize=14',
+      token: viewerToken,
+    );
+    _expect(
+      ((actorMovies.json['data'] as Map<String, dynamic>)['items']
+                  as List<dynamic>)
+              .length ==
+          1,
+      'actor movie search reads only native movie links',
+    );
     _expect(!jsonEncode(movieUpdate.json).contains(mediaRoot.path),
         'movie update hides container path');
+    final aiTask = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/ai/tasks',
+      token: adminToken,
+      body: {'movieId': movie['id'], 'instructions': '补全影片简介'},
+    );
+    _expect(aiTask.statusCode == HttpStatus.accepted,
+        'admin queues an NAS AI task');
+    final aiTaskId =
+        (aiTask.json['data'] as Map<String, dynamic>)['id'] as String;
+    final loadedAiTask =
+        await _waitForFinishedAiTask(base, aiTaskId, adminToken);
+    _expect(loadedAiTask['status'] == 'succeeded',
+        'AI task executes and persists on NAS');
+    final applyCompletedTask = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/ai/tasks/$aiTaskId/apply',
+      token: adminToken,
+      body: const {},
+    );
+    _expect(applyCompletedTask.statusCode == HttpStatus.ok,
+        'admin applies completed NAS AI metadata');
+    _expect(applyCompletedTask.json['data']['title'] == 'AI 补全标题',
+        'AI title is applied through NAS metadata storage');
+    _expect(applyCompletedTask.json['data']['summary'] == '由 NAS AI 任务补全。',
+        'AI summary is applied through NAS metadata storage');
     final catalogSearch = await _request(
       base,
       'GET',
@@ -194,8 +300,8 @@ Future<void> main() async {
     );
     _expect(
         ((catalogSearch.json['data'] as Map<String, dynamic>)['items']
-                as List<dynamic>)
-            .length ==
+                    as List<dynamic>)
+                .length ==
             1,
         'catalog search ignores separators and case');
     final missingMovieUpdate = await _request(
@@ -260,16 +366,16 @@ Future<void> main() async {
     final persistedEpisode = ((persistedDetails.json['data']
             as Map<String, dynamic>)['episodes'] as List<dynamic>)
         .single as Map<String, dynamic>;
-    _expect(persistedDetails.json['data']['title'] == '管理员标题',
-        'rescan does not overwrite movie title');
+    _expect(persistedDetails.json['data']['title'] == 'AI 补全标题',
+        'rescan does not overwrite AI-applied movie title');
     _expect(
         persistedDetails.json['data']['originalTitle'] ==
             'Administrator Original',
         'rescan does not overwrite movie original title');
     _expect(persistedDetails.json['data']['catalogNumber'] == 'ABC-001',
         'rescan does not overwrite movie catalog number');
-    _expect(persistedDetails.json['data']['summary'] == '仅写入 NAS SQLite。',
-        'rescan does not overwrite movie summary');
+    _expect(persistedDetails.json['data']['summary'] == '由 NAS AI 任务补全。',
+        'rescan does not overwrite AI-applied movie summary');
     _expect(persistedEpisode['title'] == '管理员分集标题',
         'rescan does not overwrite episode title');
   } finally {
@@ -319,6 +425,38 @@ Future<Map<String, dynamic>> _waitForFinishedJob(
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
   throw StateError('Scan job did not finish in time.');
+}
+
+Future<Map<String, dynamic>> _waitForFinishedAiTask(
+    Uri base, String taskId, String token) async {
+  for (var attempt = 0; attempt < 40; attempt++) {
+    final response = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/ai/tasks/$taskId',
+      token: token,
+    );
+    _expect(response.statusCode == HttpStatus.ok, 'admin can read AI task');
+    final task = response.json['data'] as Map<String, dynamic>;
+    if (task['status'] == 'succeeded' || task['status'] == 'failed') return task;
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  throw StateError('AI task did not finish in time.');
+}
+
+class _FakeAiMetadataClient implements NasAiMetadataClient {
+  const _FakeAiMetadataClient();
+
+  @override
+  Future<Map<String, Object?>> generate({
+    required NasAiSettings settings,
+    required NasLibraryMovie movie,
+    required String instructions,
+  }) async =>
+      const {
+        'title': 'AI 补全标题',
+        'summary': '由 NAS AI 任务补全。',
+      };
 }
 
 Future<_Response> _request(

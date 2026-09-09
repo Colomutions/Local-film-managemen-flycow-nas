@@ -1,5 +1,6 @@
 export 'src/config.dart';
 export 'src/diagnostic_log.dart';
+export 'src/ai_metadata_service.dart';
 export 'src/artwork_service.dart';
 export 'src/backup_service.dart';
 export 'src/backup_recovery_harness.dart';
@@ -8,4 +9,5 @@ export 'src/health_server.dart';
 export 'src/media_service.dart';
 export 'src/library_database.dart';
 export 'src/metadata_probe.dart';
+export 'src/persistent_state.dart';
 export 'src/range.dart';

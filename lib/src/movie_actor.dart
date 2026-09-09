@@ -18,12 +18,15 @@ enum NasActorGender {
 }
 
 class NasMovieActor {
-  const NasMovieActor({required this.name, required this.gender});
+  const NasMovieActor({required this.name, required this.gender, this.id});
 
+  /// Native NAS actor identity. Legacy stored actor JSON has no ID.
+  final String? id;
   final String name;
   final NasActorGender gender;
 
   Map<String, Object> toJson() => {
+    if (id != null) 'id': id!,
     'name': name,
     'gender': gender.wireValue,
   };
@@ -39,6 +42,9 @@ class NasMovieActor {
     final rawName = value['name'];
     if (rawName is! String || rawName.trim().isEmpty) return null;
     return NasMovieActor(
+      id: value['id'] is String && (value['id'] as String).isNotEmpty
+          ? value['id'] as String
+          : null,
       name: rawName.trim(),
       gender: NasActorGender.tryParse(value['gender']) ?? NasActorGender.unknown,
     );
@@ -51,7 +57,11 @@ List<NasMovieActor> normalizeNasMovieActors(Iterable<NasMovieActor> actors) {
     final name = actor.name.trim();
     if (name.isEmpty) continue;
     final key = name.toLowerCase();
-    final candidate = NasMovieActor(name: name, gender: actor.gender);
+    final candidate = NasMovieActor(
+      id: actor.id,
+      name: name,
+      gender: actor.gender,
+    );
     final existing = normalized[key];
     if (existing == null ||
         (existing.gender == NasActorGender.unknown &&

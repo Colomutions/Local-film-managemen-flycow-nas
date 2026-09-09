@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'ai_metadata_service.dart';
 import 'artwork_service.dart';
 import 'auth.dart';
 import 'backup_service.dart';
@@ -27,6 +28,7 @@ class NasHealthServer {
     NasArtworkService? artworkService,
     NasBackupService? backupService,
     NasDiagnosticLogger? logger,
+    NasAiMetadataClient? aiMetadataClient,
   })  : _stateStore = stateStore ?? NasPersistentStateStore(config.dataDir),
         _library = library ?? NasFixtureLibrary(),
         _mediaService = mediaService ??
@@ -38,7 +40,9 @@ class NasHealthServer {
             libraryDatabase ?? NasLibraryDatabase(config.dataDir),
         _artworkService = artworkService ?? NasArtworkService(config.dataDir),
         _backupService = backupService ?? NasBackupService(config.dataDir),
-        _logger = logger ?? NasDiagnosticLogger();
+        _logger = logger ?? NasDiagnosticLogger(),
+        _aiMetadataClient =
+            aiMetadataClient ?? const NasDisabledAiMetadataClient();
 
   final NasConfig config;
   final NasPersistentStateStore _stateStore;
@@ -48,6 +52,7 @@ class NasHealthServer {
   final NasArtworkService _artworkService;
   final NasBackupService _backupService;
   final NasDiagnosticLogger _logger;
+  final NasAiMetadataClient _aiMetadataClient;
   HttpServer? _server;
   NasPersistentState? _state;
   final Map<String, _PairingSession> _pairingSessions = {};
@@ -65,7 +70,8 @@ class NasHealthServer {
     if (_server != null) {
       throw StateError('NAS health server is already running.');
     }
-    _logger.event('service.start', fields: {'component': 'nas.service', 'phase': 'startup'});
+    _logger.event('service.start',
+        fields: {'component': 'nas.service', 'phase': 'startup'});
     _state =
         await _stateStore.load() ?? NasPersistentState(serverId: newUuidV4());
     await _persistState();
@@ -126,8 +132,10 @@ class NasHealthServer {
 
   Future<void> _handle(HttpRequest request) async {
     final stopwatch = Stopwatch()..start();
-    final traceId = _safeIncomingId(request.headers.value('x-mujing-trace-id'), 't');
-    final requestId = _safeIncomingId(request.headers.value('x-mujing-request-id'), 'r');
+    final traceId =
+        _safeIncomingId(request.headers.value('x-mujing-trace-id'), 't');
+    final requestId =
+        _safeIncomingId(request.headers.value('x-mujing-request-id'), 'r');
     final route = nasRouteTemplate(request.uri.path);
     _activeRequests++;
     _logger.event('http.request.start', fields: {
@@ -167,12 +175,14 @@ class NasHealthServer {
             request, HttpStatus.unauthorized, 'authentication_required');
       }
       if (path.startsWith('/api/v1/admin/') && device.scope != 'admin') {
-        return await _error(request, HttpStatus.forbidden, 'insufficient_scope');
+        return await _error(
+            request, HttpStatus.forbidden, 'insufficient_scope');
       }
       if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
         return await _adminMediaRoots(request);
       }
-      if (request.method == 'GET' && path == '/api/v1/admin/media-directories') {
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/media-directories') {
         return await _adminMediaDirectories(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/devices') {
@@ -207,8 +217,10 @@ class NasHealthServer {
         return await _createAdminCategory(request);
       }
       if (RegExp(r'^/api/v1/admin/categories/[^/]+$').hasMatch(path)) {
-        if (request.method == 'PATCH') return await _updateAdminCategory(request);
-        if (request.method == 'DELETE') return await _deleteAdminCategory(request);
+        if (request.method == 'PATCH')
+          return await _updateAdminCategory(request);
+        if (request.method == 'DELETE')
+          return await _deleteAdminCategory(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/tags') {
         return await _adminTags(request);
@@ -233,7 +245,8 @@ class NasHealthServer {
         return await _createAdminTagPlacement(request);
       }
       if (RegExp(r'^/api/v1/admin/tag-placements/[^/]+$').hasMatch(path)) {
-        if (request.method == 'PATCH') return await _updateAdminTagPlacement(request);
+        if (request.method == 'PATCH')
+          return await _updateAdminTagPlacement(request);
         if (request.method == 'DELETE')
           return await _deleteAdminTagPlacement(request);
       }
@@ -246,7 +259,8 @@ class NasHealthServer {
         return await _uploadAdminMoviePoster(request);
       }
       if (request.method == 'POST' &&
-          RegExp(r'^/api/v1/admin/movies/[^/]+/carousel-images$').hasMatch(path)) {
+          RegExp(r'^/api/v1/admin/movies/[^/]+/carousel-images$')
+              .hasMatch(path)) {
         return await _uploadAdminMovieCarouselImage(request);
       }
       if (request.method == 'DELETE' &&
@@ -255,7 +269,8 @@ class NasHealthServer {
         return await _deleteAdminMovieCarouselImage(request);
       }
       if (request.method == 'PATCH' &&
-          RegExp(r'^/api/v1/admin/episodes/[^/]+/source-name$').hasMatch(path)) {
+          RegExp(r'^/api/v1/admin/episodes/[^/]+/source-name$')
+              .hasMatch(path)) {
         return await _renameAdminEpisodeSource(request);
       }
       if (request.method == 'PATCH' &&
@@ -272,11 +287,57 @@ class NasHealthServer {
           RegExp(r'^/api/v1/admin/scan-jobs/[^/]+$').hasMatch(path)) {
         return await _scanJob(request);
       }
+      if (request.method == 'POST' && path == '/api/v1/admin/assets/images') {
+        return await _uploadManagedImage(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/admin/ai/settings') {
+        return await _aiSettings(request);
+      }
+      if (request.method == 'PUT' && path == '/api/v1/admin/ai/settings') {
+        return await _updateAiSettings(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/ai/tasks') {
+        return await _createAiTask(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/admin/ai/tasks/[^/]+$').hasMatch(path)) {
+        return await _aiTask(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/ai/tasks/[^/]+/apply$').hasMatch(path)) {
+        return await _applyAiTask(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/actors') {
+        return await _createAdminActor(request);
+      }
+      if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/actors/[^/]+$').hasMatch(path)) {
+        return await _updateAdminActor(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/actors/[^/]+/archive$').hasMatch(path)) {
+        return await _archiveAdminActor(request);
+      }
       if (request.method == 'GET' && path == '/api/v1/movies') {
         return await _movies(request);
       }
       if (request.method == 'GET' && path == '/api/v1/categories') {
         return await _categories(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/actors') {
+        return await _actors(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/actors/[^/]+/coactors$').hasMatch(path)) {
+        return await _actorCoactors(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/actors/[^/]+/movies$').hasMatch(path)) {
+        return await _actorMovies(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/actors/[^/]+$').hasMatch(path)) {
+        return await _actorDetails(request);
       }
       if (request.method == 'GET' &&
           RegExp(r'^/api/v1/movies/[^/]+$').hasMatch(path)) {
@@ -299,12 +360,15 @@ class NasHealthServer {
           RegExp(r'^/api/v1/assets/carousel-images/[^/]+$').hasMatch(path)) {
         return await _carouselImage(request);
       }
+      if ((request.method == 'GET' || request.method == 'HEAD') &&
+          RegExp(r'^/api/v1/assets/[^/]+$').hasMatch(path)) {
+        return await _managedAsset(request);
+      }
       if (request.method == 'POST' && path == '/api/v1/playback/sessions') {
         return await _createPlaybackSession(request, tokenHash);
       }
       if (request.method == 'POST' &&
-          RegExp(r'^/api/v1/playback/sessions/[^/]+/started$')
-              .hasMatch(path)) {
+          RegExp(r'^/api/v1/playback/sessions/[^/]+/started$').hasMatch(path)) {
         return await _markPlaybackStarted(request, tokenHash);
       }
       if (request.method == 'PATCH' &&
@@ -343,7 +407,9 @@ class NasHealthServer {
       stopwatch.stop();
       final response = request.response;
       final status = response.statusCode;
-      final bytes = response.headers.contentLength >= 0 ? response.headers.contentLength : null;
+      final bytes = response.headers.contentLength >= 0
+          ? response.headers.contentLength
+          : null;
       _logger.event('http.response.headers', fields: {
         'component': 'nas.http',
         'traceId': traceId,
@@ -355,24 +421,27 @@ class NasHealthServer {
         'activeRequests': _activeRequests,
         'activeStreams': _activeStreams,
       });
-      _logger.event('http.response.end', level: status >= 500 ? 'ERROR' : (status >= 400 ? 'WARN' : 'DEBUG'), fields: {
-        'component': 'nas.http',
-        'traceId': traceId,
-        'requestId': requestId,
-        'method': request.method,
-        'route': route,
-        'status': status,
-        'outcome': status >= 400 ? 'http_error' : 'success',
-        'durationMs': stopwatch.elapsedMilliseconds,
-        'bytes': bytes,
-        'phase': 'handler_end',
-      });
+      _logger.event('http.response.end',
+          level: status >= 500 ? 'ERROR' : (status >= 400 ? 'WARN' : 'DEBUG'),
+          fields: {
+            'component': 'nas.http',
+            'traceId': traceId,
+            'requestId': requestId,
+            'method': request.method,
+            'route': route,
+            'status': status,
+            'outcome': status >= 400 ? 'http_error' : 'success',
+            'durationMs': stopwatch.elapsedMilliseconds,
+            'bytes': bytes,
+            'phase': 'handler_end',
+          });
       _activeRequests--;
     }
   }
 
   String _safeIncomingId(String? value, String prefix) {
-    if (value != null && RegExp(r'^[A-Za-z0-9_-]{1,64}$').hasMatch(value)) return value;
+    if (value != null && RegExp(r'^[A-Za-z0-9_-]{1,64}$').hasMatch(value))
+      return value;
     return _logger.newId(prefix);
   }
 
@@ -474,16 +543,79 @@ class NasHealthServer {
   Future<void> _movies(HttpRequest request) {
     final hasDatabaseLibrary =
         config.managedCategoryLibrary || _libraryDatabase.hasScannedMediaRoots;
-    final query = request.uri.queryParameters['query'] ?? '';
-    final items = !hasDatabaseLibrary
-        ? _library.listMovies(query: query)
-        : _libraryDatabase
-            .listMovies(query: query)
-            .map(_databaseSummary)
-            .toList();
+    final parameters = request.uri.queryParameters;
+    final query = parameters['q'] ?? parameters['query'] ?? '';
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '24') ?? 0;
+    final sort = parameters['sort'] ?? 'title';
+    final order = parameters['order'] ?? 'asc';
+    final categoryId = parameters['categoryId'];
+    final tagIds = parameters['tagIds']
+        ?.split(',')
+        .where((value) => value.isNotEmpty)
+        .toSet();
+    final resolutions = parameters['resolutions']
+        ?.split(',')
+        .where((value) => value.isNotEmpty)
+        .toSet();
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        !const {'title', 'updatedAt', 'durationMs', 'recent'}.contains(sort) ||
+        !const {'asc', 'desc'}.contains(order) ||
+        (hasDatabaseLibrary &&
+            categoryId != null &&
+            _libraryDatabase.findCategory(categoryId) == null) ||
+        (!hasDatabaseLibrary &&
+            (categoryId != null ||
+                (tagIds?.isNotEmpty ?? false) ||
+                (resolutions?.isNotEmpty ?? false)))) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    if (!hasDatabaseLibrary) {
+      final items = _library.listMovies(query: query);
+      final offset = (page - 1) * pageSize;
+      final paged = offset >= items.length
+          ? const <Map<String, Object?>>[]
+          : items.skip(offset).take(pageSize).toList(growable: false);
+      return _writeJson(request.response, HttpStatus.ok, {
+        'data': {'items': paged},
+        'page': {
+          'number': page,
+          'size': pageSize,
+          'total': items.length,
+          'hasMore': offset + paged.length < items.length,
+        },
+      });
+    }
+    final movies = _libraryDatabase
+        .listMovies(query: query)
+        .where((movie) =>
+            (categoryId == null ||
+                _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
+            (tagIds == null ||
+                tagIds.isEmpty ||
+                _libraryDatabase
+                    .tagsForMovie(movie.id)
+                    .any((tag) => tagIds.contains(tag.id))) &&
+            (resolutions == null ||
+                resolutions.isEmpty ||
+                (movie.resolutionLabel != null &&
+                    resolutions.contains(movie.resolutionLabel))))
+        .toList();
+    movies.sort((left, right) => _compareMovies(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final paged = offset >= movies.length
+        ? const <NasLibraryMovie>[]
+        : movies.skip(offset).take(pageSize).toList(growable: false);
     return _writeJson(request.response, HttpStatus.ok, {
-      'data': {'items': items},
-      'page': {'nextCursor': null, 'hasMore': false},
+      'data': {'items': paged.map(_databaseSummary).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': movies.length,
+        'hasMore': offset + paged.length < movies.length,
+      },
     });
   }
 
@@ -492,7 +624,8 @@ class NasHealthServer {
     final databaseMovie = _libraryDatabase.findMovie(movieId);
     final movie = databaseMovie != null
         ? await _databaseDetails(databaseMovie)
-        : !config.managedCategoryLibrary && !_libraryDatabase.hasScannedMediaRoots
+        : !config.managedCategoryLibrary &&
+                !_libraryDatabase.hasScannedMediaRoots
             ? _library.movieDetails(
                 movieId,
                 isAvailable: await _mediaService.fixtureFile() != null,
@@ -502,6 +635,680 @@ class NasHealthServer {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     await _writeJson(request.response, HttpStatus.ok, {'data': movie});
+  }
+
+  Future<void> _actors(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final gender = parameters['gender'];
+    final includeArchived = parameters['includeArchived'] == 'true';
+    final allowedGenders = const {'female', 'intersex', 'male'};
+    if (gender != null && !allowedGenders.contains(gender)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '24') ?? 0;
+    final sort = parameters['sort'] ?? 'createdAt';
+    final order = parameters['order'] ?? 'desc';
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        !const {'age', 'movieCount', 'createdAt', 'debutMonth'}
+            .contains(sort) ||
+        !const {'asc', 'desc'}.contains(order)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final actors = _libraryDatabase
+        .listActors(
+          query: parameters['q'] ?? '',
+          gender: gender,
+          includeArchived: includeArchived,
+        )
+        .toList();
+    actors.sort((left, right) => _compareActors(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final items = offset >= actors.length
+        ? const <NasActor>[]
+        : actors.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': items.map(_actorPayload).toList(growable: false),
+      },
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': actors.length,
+        'hasMore': offset + items.length < actors.length,
+      },
+    });
+  }
+
+  Future<void> _actorDetails(HttpRequest request) async {
+    final actor = _libraryDatabase.findActor(request.uri.pathSegments.last);
+    if (actor == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _actorPayload(actor),
+    });
+  }
+
+  Future<void> _actorCoactors(HttpRequest request) async {
+    final actorId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findActor(actorId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final page = int.tryParse(request.uri.queryParameters['page'] ?? '1') ?? 0;
+    final pageSize =
+        int.tryParse(request.uri.queryParameters['pageSize'] ?? '9') ?? 0;
+    if (page < 1 || pageSize < 1 || pageSize > 9) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final coactors = _libraryDatabase.coactorsForActor(actorId);
+    final offset = (page - 1) * pageSize;
+    final items = offset >= coactors.length
+        ? const <NasActorCoactor>[]
+        : coactors.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': items
+            .map(
+              (item) => {
+                'actor': _actorPayload(item.actor),
+                'movieCount': item.movieCount,
+              },
+            )
+            .toList(growable: false),
+      },
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': coactors.length,
+        'hasMore': offset + items.length < coactors.length,
+      },
+    });
+  }
+
+  Future<void> _actorMovies(HttpRequest request) async {
+    final actorId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findActor(actorId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '14') ?? 0;
+    final sort = parameters['sort'] ?? 'recent';
+    final order = parameters['order'] ?? 'desc';
+    final categoryId = parameters['categoryId'];
+    final resolutions = parameters['resolutions']
+        ?.split(',')
+        .where((value) => value.isNotEmpty)
+        .toSet();
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 14 ||
+        !const {'recent', 'createdAt', 'title', 'durationMs'}.contains(sort) ||
+        !const {'asc', 'desc'}.contains(order) ||
+        (categoryId != null &&
+            _libraryDatabase.findCategory(categoryId) == null)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movies = _libraryDatabase
+        .moviesForActor(actorId, query: parameters['q'] ?? '')
+        .where((movie) =>
+            (categoryId == null ||
+                _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
+            (resolutions == null ||
+                resolutions.isEmpty ||
+                (movie.resolutionLabel != null &&
+                    resolutions.contains(movie.resolutionLabel))))
+        .toList();
+    movies.sort((left, right) => _compareActorMovies(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final items = offset >= movies.length
+        ? const <NasLibraryMovie>[]
+        : movies.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': items.map(_databaseSummary).toList(growable: false),
+      },
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': movies.length,
+        'hasMore': offset + items.length < movies.length,
+      },
+    });
+  }
+
+  Future<void> _createAdminActor(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final values = _actorInputValues(body, creating: true);
+    if (values == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final photoAssetId = values['photo_asset_id'] as String?;
+    if (photoAssetId != null &&
+        _libraryDatabase.findManagedAsset(photoAssetId)?.purpose !=
+            'actor_photo') {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final aliases = _stringListFromJson(values['aliases_json'] as String?);
+    final similarActors = _libraryDatabase.findSimilarActors(
+      stageName: values['stage_name'] as String?,
+      originalName: values['original_name'] as String?,
+      translatedName: values['translated_name'] as String?,
+      aliases: aliases,
+    );
+    final actor = _libraryDatabase.createActor(
+      stageName: values['stage_name'] as String?,
+      originalName: values['original_name'] as String?,
+      translatedName: values['translated_name'] as String?,
+      aliases: aliases,
+      gender: values['gender'] as String?,
+      birthMonth: values['birth_month'] as String?,
+      heightCm: values['height_cm'] as int?,
+      weightKg: values['weight_kg'] as int?,
+      measurements: values['measurements'] as String?,
+      bodyType: values['body_type'] as String?,
+      country: values['country'] as String?,
+      debutMonth: values['debut_month'] as String?,
+      debutDescription: values['debut_description'] as String?,
+      photoAssetId: photoAssetId,
+      publisherNames:
+          _stringListFromJson(values['publisher_names_json'] as String?),
+    );
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': {
+        'actor': _actorPayload(actor),
+        'similarActors':
+            similarActors.map(_actorPayload).toList(growable: false),
+      },
+    });
+  }
+
+  Future<void> _updateAdminActor(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final values = _actorInputValues(body, creating: false);
+    if (values == null || values.isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final photoAssetId = values['photo_asset_id'] as String?;
+    if (values.containsKey('photo_asset_id') &&
+        photoAssetId != null &&
+        _libraryDatabase.findManagedAsset(photoAssetId)?.purpose !=
+            'actor_photo') {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final actor = _libraryDatabase.updateActor(
+      request.uri.pathSegments.last,
+      values,
+    );
+    if (actor == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _actorPayload(actor),
+    });
+  }
+
+  Future<void> _archiveAdminActor(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null || body.isNotEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final actor = _libraryDatabase.archiveActor(request.uri.pathSegments[4]);
+    if (actor == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _actorPayload(actor),
+    });
+  }
+
+  Future<void> _uploadManagedImage(HttpRequest request) async {
+    final purpose = request.uri.queryParameters['purpose'];
+    final mimeType = request.headers.contentType?.mimeType;
+    if (!const {'actor_photo', 'movie_poster'}.contains(purpose)) {
+      await request.drain<void>();
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final bytes = await _readArtworkBytes(request, mimeType);
+    if (bytes == null || mimeType == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final assetId = newUuidV4();
+    String? fileName;
+    try {
+      fileName = await _artworkService.saveManagedAsset(
+        assetId: assetId,
+        mimeType: mimeType,
+        bytes: bytes,
+      );
+      final asset = _libraryDatabase.addManagedAsset(
+        id: assetId,
+        purpose: purpose!,
+        fileName: fileName,
+        mimeType: mimeType,
+      );
+      await _writeJson(request.response, HttpStatus.created, {
+        'data': _managedAssetPayload(asset),
+      });
+    } on ArgumentError {
+      if (fileName != null) await _artworkService.deleteManagedAsset(fileName);
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  Future<void> _aiSettings(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {'data': _aiSettingsPayload(_state!.aiSettings)},
+      );
+
+  Future<void> _updateAiSettings(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    const fields = {'provider', 'endpoint', 'model', 'apiKey'};
+    if (body == null ||
+        body.keys.any((key) => !fields.contains(key)) ||
+        fields.any((key) =>
+            body[key] is! String || (body[key] as String).trim().isEmpty)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final endpoint = Uri.tryParse((body['endpoint'] as String).trim());
+    if (endpoint == null ||
+        !endpoint.hasAuthority ||
+        !const {'http', 'https'}.contains(endpoint.scheme)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final settings = NasAiSettings(
+      provider: (body['provider'] as String).trim(),
+      endpoint: endpoint.toString(),
+      model: (body['model'] as String).trim(),
+      apiKey: (body['apiKey'] as String).trim(),
+    );
+    _state = NasPersistentState(
+      serverId: _state!.serverId,
+      tokens: _state!.tokens,
+      aiSettings: settings,
+    );
+    await _persistState();
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _aiSettingsPayload(settings),
+    });
+  }
+
+  Future<void> _createAiTask(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final movieId = body?['movieId'];
+    final instructions = body?['instructions'] ?? '';
+    if (body == null ||
+        body.keys.any((key) => key != 'movieId' && key != 'instructions') ||
+        movieId is! String ||
+        movieId.isEmpty ||
+        instructions is! String ||
+        instructions.length > 4000) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    if (!_state!.aiSettings.isConfigured) {
+      return _error(request, HttpStatus.conflict, 'ai_not_configured');
+    }
+    final task = _libraryDatabase.createAiTask(
+      movieId: movieId,
+      instructions: instructions.trim(),
+    );
+    if (task == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    _logger.event('ai.task.create', fields: {
+      'component': 'nas.ai',
+      'taskIdShort': nasShortId(task.id),
+      'movieIdShort': nasShortId(task.movieId),
+      'outcome': 'queued',
+    });
+    await _writeJson(request.response, HttpStatus.accepted, {
+      'data': _aiTaskPayload(task),
+    });
+    unawaited(_runAiTask(task.id));
+  }
+
+  Future<void> _aiTask(HttpRequest request) async {
+    final task = _libraryDatabase.findAiTask(request.uri.pathSegments.last);
+    if (task == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _aiTaskPayload(task),
+    });
+  }
+
+  Future<void> _applyAiTask(HttpRequest request) async {
+    final task = _libraryDatabase.findAiTask(request.uri.pathSegments[5]);
+    if (task == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (task.status != 'succeeded' || task.resultJson == null) {
+      return _error(request, HttpStatus.conflict, 'ai_task_not_ready');
+    }
+    final result = _aiTaskResult(task.resultJson!);
+    if (result == null) {
+      return _error(request, HttpStatus.conflict, 'ai_response_invalid');
+    }
+    final title = _nonEmptyText(result['title']);
+    final summary = result['summary'];
+    final hasOriginalTitle = result.containsKey('originalTitle');
+    final originalTitle = result['originalTitle'];
+    final hasCatalogNumber = result.containsKey('catalogNumber');
+    final catalogNumber = result['catalogNumber'];
+    if ((summary != null && summary is! String) ||
+        (hasOriginalTitle && originalTitle != null && originalTitle is! String) ||
+        (hasCatalogNumber && catalogNumber != null && catalogNumber is! String) ||
+        (title == null && summary == null && !hasOriginalTitle && !hasCatalogNumber)) {
+      return _error(request, HttpStatus.conflict, 'ai_response_invalid');
+    }
+    final movie = _libraryDatabase.updateMovieMetadata(
+      movieId: task.movieId,
+      title: title,
+      originalTitle: originalTitle as String?,
+      updateOriginalTitle: hasOriginalTitle,
+      catalogNumber: catalogNumber as String?,
+      updateCatalogNumber: hasCatalogNumber,
+      summary: summary as String?,
+    );
+    if (movie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': await _databaseDetails(movie),
+    });
+  }
+
+  Future<void> _runAiTask(String taskId) async {
+    final task = _libraryDatabase.markAiTaskRunning(taskId);
+    if (task == null) return;
+    try {
+      final movie = _libraryDatabase.findMovieForAdmin(task.movieId);
+      if (movie == null) {
+        _libraryDatabase.failAiTask(task.id, 'resource_not_found');
+        return;
+      }
+      final result = await _aiMetadataClient.generate(
+        settings: _state!.aiSettings,
+        movie: movie,
+        instructions: task.instructions,
+      );
+      final completed = _libraryDatabase.completeAiTask(task.id, result);
+      _logger.event('ai.task.complete', fields: {
+        'component': 'nas.ai',
+        'taskIdShort': nasShortId(task.id),
+        'outcome': completed == null ? 'discarded' : 'succeeded',
+      });
+    } on NasAiMetadataException catch (error) {
+      _libraryDatabase.failAiTask(task.id, error.code);
+      _logger.event('ai.task.complete', level: 'WARN', fields: {
+        'component': 'nas.ai',
+        'taskIdShort': nasShortId(task.id),
+        'outcome': 'failed',
+        'errorCode': error.code,
+      });
+    } catch (_) {
+      _libraryDatabase.failAiTask(task.id, 'ai_request_failed');
+      _logger.event('ai.task.complete', level: 'WARN', fields: {
+        'component': 'nas.ai',
+        'taskIdShort': nasShortId(task.id),
+        'outcome': 'failed',
+        'errorCode': 'ai_request_failed',
+      });
+    }
+  }
+
+  Map<String, Object?> _aiSettingsPayload(NasAiSettings settings) => {
+        'provider': settings.provider,
+        'endpoint': settings.endpoint,
+        'model': settings.model,
+        'apiKeyConfigured': settings.apiKey != null,
+        'isConfigured': settings.isConfigured,
+      };
+
+  Map<String, Object?> _aiTaskPayload(NasAiTask task) => {
+        'id': task.id,
+        'movieId': task.movieId,
+        'instructions': task.instructions,
+        'status': task.status,
+        'result': task.resultJson == null ? null : _aiTaskResult(task.resultJson!),
+        'errorCode': task.errorCode,
+        'createdAt': task.createdAt,
+        'finishedAt': task.finishedAt,
+      };
+
+  Map<String, Object?>? _aiTaskResult(String resultJson) {
+    try {
+      final decoded = jsonDecode(resultJson);
+      if (decoded is! Map) return null;
+      final result = <String, Object?>{};
+      decoded.forEach((key, value) {
+        if (key is String) result[key] = value;
+      });
+      return result;
+    } on FormatException {
+      return null;
+    }
+  }
+
+  String? _nonEmptyText(Object? value) {
+    if (value is! String || value.trim().isEmpty) return null;
+    return value.trim();
+  }
+
+  Future<void> _managedAsset(HttpRequest request) async {
+    final asset =
+        _libraryDatabase.findManagedAsset(request.uri.pathSegments.last);
+    if (asset == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final artwork = await _artworkService.managedAsset(asset.fileName);
+    if (artwork == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    request.response.statusCode = HttpStatus.ok;
+    request.response.headers.contentType = ContentType.parse(artwork.mimeType);
+    request.response.headers.contentLength = await artwork.file.length();
+    request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+    if (request.method == 'GET') {
+      await request.response.addStream(artwork.file.openRead());
+    }
+    await request.response.close();
+  }
+
+  Map<String, Object?> _actorPayload(NasActor actor) {
+    final photoAsset = actor.photoAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(actor.photoAssetId!);
+    return {
+      'id': actor.id,
+      'stageName': actor.stageName,
+      'originalName': actor.originalName,
+      'translatedName': actor.translatedName,
+      'aliases': actor.aliases,
+      'gender': actor.gender,
+      'birthMonth': actor.birthMonth,
+      'age': _actorAge(actor.birthMonth),
+      'heightCm': actor.heightCm,
+      'weightKg': actor.weightKg,
+      'measurements': actor.measurements,
+      'bodyType': actor.bodyType,
+      'country': actor.country,
+      'debutMonth': actor.debutMonth,
+      'debutDescription': actor.debutDescription,
+      'photoAsset':
+          photoAsset == null ? null : _managedAssetPayload(photoAsset),
+      'publisherNames': actor.publisherNames,
+      'movieCount': actor.movieCount,
+      'createdAt': actor.createdAt,
+      'updatedAt': actor.updatedAt,
+      'archivedAt': actor.archivedAt,
+    };
+  }
+
+  Map<String, Object?> _managedAssetPayload(NasManagedAsset asset) => {
+        'id': asset.id,
+        'purpose': asset.purpose,
+        'url': '/api/v1/assets/${asset.id}',
+        'mimeType': asset.mimeType,
+        'createdAt': asset.createdAt,
+      };
+
+  int _compareActors(NasActor left, NasActor right, String sort, String order) {
+    int compared;
+    switch (sort) {
+      case 'age':
+        compared = _compareNullableInt(
+            _actorAge(left.birthMonth), _actorAge(right.birthMonth));
+      case 'movieCount':
+        compared = left.movieCount.compareTo(right.movieCount);
+      case 'debutMonth':
+        compared = _compareNullableString(left.debutMonth, right.debutMonth);
+      default:
+        compared = left.createdAt.compareTo(right.createdAt);
+    }
+    if (compared == 0) compared = left.id.compareTo(right.id);
+    return order == 'asc' ? compared : -compared;
+  }
+
+  int _compareActorMovies(
+    NasLibraryMovie left,
+    NasLibraryMovie right,
+    String sort,
+    String order,
+  ) {
+    final compared = switch (sort) {
+      'title' => left.title.compareTo(right.title),
+      'durationMs' => _compareNullableInt(left.durationMs, right.durationMs),
+      'createdAt' => left.updatedAt.compareTo(right.updatedAt),
+      _ => left.playCount.compareTo(right.playCount),
+    };
+    final stable = compared == 0 ? left.id.compareTo(right.id) : compared;
+    return order == 'asc' ? stable : -stable;
+  }
+
+  int _compareMovies(
+    NasLibraryMovie left,
+    NasLibraryMovie right,
+    String sort,
+    String order,
+  ) {
+    final compared = switch (sort) {
+      'updatedAt' => left.updatedAt.compareTo(right.updatedAt),
+      'durationMs' => _compareNullableInt(left.durationMs, right.durationMs),
+      'recent' => left.playCount.compareTo(right.playCount),
+      _ => left.title.compareTo(right.title),
+    };
+    final stable = compared == 0 ? left.id.compareTo(right.id) : compared;
+    return order == 'asc' ? stable : -stable;
+  }
+
+  int? _actorAge(String? birthMonth) {
+    if (birthMonth == null ||
+        !RegExp(r'^\d{4}-(0[1-9]|1[0-2])$').hasMatch(birthMonth)) {
+      return null;
+    }
+    final parts = birthMonth.split('-');
+    final now = DateTime.now();
+    return now.year -
+        int.parse(parts[0]) -
+        (now.month < int.parse(parts[1]) ? 1 : 0);
+  }
+
+  int _compareNullableInt(int? left, int? right) {
+    if (left == null) return right == null ? 0 : 1;
+    if (right == null) return -1;
+    return left.compareTo(right);
+  }
+
+  int _compareNullableString(String? left, String? right) {
+    if (left == null) return right == null ? 0 : 1;
+    if (right == null) return -1;
+    return left.compareTo(right);
+  }
+
+  Map<String, Object?>? _actorInputValues(
+    Map<String, dynamic>? body, {
+    required bool creating,
+  }) {
+    if (body == null) return null;
+    const fields = {
+      'stageName': 'stage_name',
+      'originalName': 'original_name',
+      'translatedName': 'translated_name',
+      'aliases': 'aliases_json',
+      'gender': 'gender',
+      'birthMonth': 'birth_month',
+      'heightCm': 'height_cm',
+      'weightKg': 'weight_kg',
+      'measurements': 'measurements',
+      'bodyType': 'body_type',
+      'country': 'country',
+      'debutMonth': 'debut_month',
+      'debutDescription': 'debut_description',
+      'photoAssetId': 'photo_asset_id',
+      'publisherNames': 'publisher_names_json',
+    };
+    if (body.keys.any((key) => !fields.containsKey(key))) return null;
+    final values = <String, Object?>{};
+    for (final entry in body.entries) {
+      final databaseKey = fields[entry.key]!;
+      final value = entry.value;
+      switch (entry.key) {
+        case 'aliases':
+          if (value is! List || value.any((item) => item is! String))
+            return null;
+          values[databaseKey] =
+              jsonEncode(_cleanTextValues(value.cast<String>()));
+        case 'publisherNames':
+          if (value is! List || value.any((item) => item is! String))
+            return null;
+          final publishers = _cleanTextValues(value.cast<String>());
+          if (publishers
+              .any((name) => !RegExp(r'^[\u4e00-\u9fff]+$').hasMatch(name))) {
+            return null;
+          }
+          values[databaseKey] = jsonEncode(publishers);
+        case 'gender':
+          if (value != null &&
+              !const {'female', 'intersex', 'male'}.contains(value))
+            return null;
+          values[databaseKey] = value;
+        case 'birthMonth':
+        case 'debutMonth':
+          if (value != null &&
+              (value is! String ||
+                  !RegExp(r'^\d{4}-(0[1-9]|1[0-2])$').hasMatch(value))) {
+            return null;
+          }
+          values[databaseKey] = value;
+        case 'heightCm':
+          if (value != null && (value is! int || value < 1 || value > 300))
+            return null;
+          values[databaseKey] = value;
+        case 'weightKg':
+          if (value != null && (value is! int || value < 1 || value > 500))
+            return null;
+          values[databaseKey] = value;
+        default:
+          if (value != null && value is! String) return null;
+          values[databaseKey] =
+              value is String && value.trim().isEmpty ? null : value?.trim();
+      }
+    }
+    if (creating &&
+        ![
+          values['stage_name'],
+          values['original_name'],
+          values['translated_name'],
+          ..._stringListFromJson(values['aliases_json'] as String?),
+        ].any((value) => value is String && value.isNotEmpty)) {
+      return null;
+    }
+    return values;
   }
 
   Map<String, Object?> _databaseSummary(NasLibraryMovie movie) => {
@@ -651,7 +1458,8 @@ class NasHealthServer {
         color == _invalidTaxonomyColor ||
         _libraryDatabase.hasCategoryName(name) ||
         (config.managedCategoryLibrary && directoryKey == null) ||
-        (directoryKey != null && !await _canBindCategoryDirectory(directoryKey))) {
+        (directoryKey != null &&
+            !await _canBindCategoryDirectory(directoryKey))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final category = _libraryDatabase.createCategory(
@@ -704,7 +1512,8 @@ class NasHealthServer {
     if (category == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    final scanJob = directoryChanged ? _scheduleCategoryScan(category.id) : null;
+    final scanJob =
+        directoryChanged ? _scheduleCategoryScan(category.id) : null;
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {
         ..._categoryPayload(category),
@@ -774,7 +1583,8 @@ class NasHealthServer {
     final parentTagId = body?['parentTagId'];
     final color = _taxonomyColor(body);
     if (body == null ||
-        body.keys.any((key) => key != 'name' && key != 'parentTagId' && key != 'color') ||
+        body.keys.any(
+            (key) => key != 'name' && key != 'parentTagId' && key != 'color') ||
         name is! String ||
         name.trim().isEmpty ||
         (parentTagId != null && parentTagId is! String) ||
@@ -785,11 +1595,13 @@ class NasHealthServer {
     try {
       final tag = parentTagId == null
           ? _libraryDatabase.createRootTag(name.trim(), color: color).$1
-          : _libraryDatabase.createChildTag(
-              name: name.trim(),
-              parentTagId: parentTagId as String,
-              color: color,
-            ).$1;
+          : _libraryDatabase
+              .createChildTag(
+                name: name.trim(),
+                parentTagId: parentTagId as String,
+                color: color,
+              )
+              .$1;
       await _writeJson(request.response, HttpStatus.created, {
         'data': _tagPayload(tag),
       });
@@ -995,7 +1807,8 @@ class NasHealthServer {
     final parentKey = request.uri.queryParameters['parentKey'];
     if (parentKey != null &&
         (parentKey.isEmpty ||
-            (await _mediaService.directoryForRelativePath(parentKey)) == null)) {
+            (await _mediaService.directoryForRelativePath(parentKey)) ==
+                null)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final directories = await _mediaService.childDirectories(parentKey);
@@ -1098,7 +1911,7 @@ class NasHealthServer {
             key != 'originalTitle' &&
             key != 'catalogNumber' &&
             key != 'summary' &&
-            key != 'actors' &&
+            key != 'actorIds' &&
             key != 'categoryId' &&
             key != 'tagPlacementIds')) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
@@ -1109,8 +1922,8 @@ class NasHealthServer {
     final hasCatalogNumber = body.containsKey('catalogNumber');
     final rawCatalogNumber = body['catalogNumber'];
     final rawSummary = body['summary'];
-    final hasActors = body.containsKey('actors');
-    final rawActors = body['actors'];
+    final hasActorIds = body.containsKey('actorIds');
+    final rawActorIds = body['actorIds'];
     final hasCategoryId = body.containsKey('categoryId');
     final rawCategoryId = body['categoryId'];
     final hasTagPlacementIds = body.containsKey('tagPlacementIds');
@@ -1123,12 +1936,12 @@ class NasHealthServer {
             rawCatalogNumber != null &&
             rawCatalogNumber is! String) ||
         (rawSummary != null && rawSummary is! String) ||
-        (hasActors && rawActors is! List) ||
+        (hasActorIds && rawActorIds is! List) ||
         (rawTitle == null &&
             !hasOriginalTitle &&
             !hasCatalogNumber &&
             rawSummary == null &&
-            !hasActors &&
+            !hasActorIds &&
             !hasCategoryId &&
             !hasTagPlacementIds) ||
         (hasCategoryId && rawCategoryId != null && rawCategoryId is! String) ||
@@ -1141,31 +1954,21 @@ class NasHealthServer {
     }
     final originalTitle = (rawOriginalTitle as String?)?.trim();
     final catalogNumber = (rawCatalogNumber as String?)?.trim();
-    List<NasMovieActor>? actors;
-    if (hasActors) {
-      final rawList = rawActors as List;
-      if (rawList.length > 80) {
+    List<String>? actorIds;
+    if (hasActorIds) {
+      final rawList = rawActorIds as List;
+      if (rawList.length > 80 || rawList.any((value) => value is! String)) {
         return _error(request, HttpStatus.badRequest, 'invalid_request');
       }
-      final parsed = <NasMovieActor>[];
-      final actorNames = <String>{};
-      for (final value in rawList) {
-        if (value is! Map ||
-            value.keys.any((key) => key != 'name' && key != 'gender')) {
-          return _error(request, HttpStatus.badRequest, 'invalid_request');
-        }
-        final rawName = value['name'];
-        final gender = NasActorGender.tryParse(value['gender']);
-        if (rawName is! String ||
-            rawName.trim().isEmpty ||
-            rawName.trim().length > 120 ||
-            gender == null ||
-            !actorNames.add(rawName.trim().toLowerCase())) {
-          return _error(request, HttpStatus.badRequest, 'invalid_request');
-        }
-        parsed.add(NasMovieActor(name: rawName.trim(), gender: gender));
+      actorIds = rawList.cast<String>();
+      if (actorIds.any((id) => id.isEmpty) ||
+          actorIds.toSet().length != actorIds.length ||
+          actorIds.any((id) {
+            final actor = _libraryDatabase.findActor(id);
+            return actor == null || actor.archivedAt != null;
+          })) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
       }
-      actors = parsed;
     }
     final categoryId = rawCategoryId as String?;
     if (hasCategoryId &&
@@ -1196,10 +1999,16 @@ class NasHealthServer {
           catalogNumber == null || catalogNumber.isEmpty ? null : catalogNumber,
       updateCatalogNumber: hasCatalogNumber,
       summary: rawSummary as String?,
-      actors: actors,
     );
     if (movie == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (actorIds != null &&
+        !_libraryDatabase.setMovieActorIds(
+          movieId: movie.id,
+          actorIds: actorIds,
+        )) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     _libraryDatabase.setMovieTaxonomy(
       movieId: movie.id,
@@ -1264,7 +2073,8 @@ class NasHealthServer {
         fileSize: stat.size,
         mediaModifiedAt: stat.modified.microsecondsSinceEpoch,
       );
-      if (updated == null) throw StateError('episode disappeared during rename');
+      if (updated == null)
+        throw StateError('episode disappeared during rename');
       await _writeJson(request.response, HttpStatus.ok, {
         'data': _adminEpisodePayload(updated),
       });
@@ -1274,8 +2084,8 @@ class NasHealthServer {
         error.code == 'source_name_conflict'
             ? HttpStatus.conflict
             : error.code == 'resource_not_found'
-            ? HttpStatus.notFound
-            : HttpStatus.badRequest,
+                ? HttpStatus.notFound
+                : HttpStatus.badRequest,
         error.code,
       );
     } on Object {
@@ -1285,7 +2095,8 @@ class NasHealthServer {
           originalRelativePath: episode.relativePath,
         );
       }
-      return _error(request, HttpStatus.internalServerError, 'source_metadata_update_failed');
+      return _error(request, HttpStatus.internalServerError,
+          'source_metadata_update_failed');
     }
   }
 
@@ -1312,7 +2123,8 @@ class NasHealthServer {
     }
     final job = _ScanJob(
       id: newUuidV4(),
-      mediaRootId: categoryScan ? _configuredMediaRoot!.id : mediaRootId as String,
+      mediaRootId:
+          categoryScan ? _configuredMediaRoot!.id : mediaRootId as String,
       categoryId: categoryScan ? categoryId as String : null,
       createdAt: DateTime.now().toUtc(),
     );
@@ -1465,7 +2277,9 @@ class NasHealthServer {
     Map<String, dynamic>? body, {
     required Set<String> allowed,
   }) {
-    if (body == null || body['name'] is! String || body.keys.any((key) => !allowed.contains(key))) {
+    if (body == null ||
+        body['name'] is! String ||
+        body.keys.any((key) => !allowed.contains(key))) {
       return null;
     }
     final name = (body['name'] as String).trim();
@@ -1500,7 +2314,8 @@ class NasHealthServer {
     String directoryKey, {
     String? excludingCategoryId,
   }) async {
-    final directory = await _mediaService.directoryForRelativePath(directoryKey);
+    final directory =
+        await _mediaService.directoryForRelativePath(directoryKey);
     if (directory == null) return false;
     final normalized = directory.relativePath;
     for (final category in _libraryDatabase.listCategories()) {
@@ -1670,7 +2485,8 @@ class NasHealthServer {
     final movieId = request.uri.pathSegments[4];
     final movie = _libraryDatabase.findMovieForAdmin(movieId);
     final mimeType = request.headers.contentType?.mimeType;
-    if (movie == null) return _error(request, HttpStatus.notFound, 'resource_not_found');
+    if (movie == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
     final bytes = await _readArtworkBytes(request, mimeType);
     if (bytes == null || mimeType == null) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
@@ -1711,17 +2527,21 @@ class NasHealthServer {
       movieId: request.uri.pathSegments[4],
       imageId: request.uri.pathSegments[6],
     );
-    if (image == null) return _error(request, HttpStatus.notFound, 'resource_not_found');
+    if (image == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
     await _artworkService.deleteCarouselImage(image.fileName);
     request.response.statusCode = HttpStatus.noContent;
     await request.response.close();
   }
 
   Future<void> _carouselImage(HttpRequest request) async {
-    final image = _libraryDatabase.findCarouselImage(request.uri.pathSegments.last);
-    if (image == null) return _error(request, HttpStatus.notFound, 'resource_not_found');
+    final image =
+        _libraryDatabase.findCarouselImage(request.uri.pathSegments.last);
+    if (image == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
     final artwork = await _artworkService.carouselImage(image.fileName);
-    if (artwork == null) return _error(request, HttpStatus.notFound, 'resource_not_found');
+    if (artwork == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
     request.response.statusCode = HttpStatus.ok;
     request.response.headers.contentType = ContentType.parse(artwork.mimeType);
     request.response.headers.contentLength = await artwork.file.length();
@@ -1753,7 +2573,8 @@ class NasHealthServer {
       bytes.addAll(chunk);
     }
     if (oversized ||
-        !NasArtworkService.isValidPosterBytes(mimeType: mimeType, bytes: bytes)) {
+        !NasArtworkService.isValidPosterBytes(
+            mimeType: mimeType, bytes: bytes)) {
       return null;
     }
     return bytes;
@@ -2113,6 +2934,9 @@ class NasHealthServer {
       'insufficient_scope': 'This device does not have the required scope.',
       'invalid_request': 'The request is invalid.',
       'invalid_taxonomy': 'The taxonomy definition file is invalid.',
+      'ai_not_configured': 'AI settings have not been configured on this NAS.',
+      'ai_task_not_ready':
+          'The AI task does not have an applicable result yet.',
       'method_not_allowed':
           'The HTTP method is not supported for this resource.',
       'pairing_failed': 'Pairing could not be confirmed.',
@@ -2207,6 +3031,23 @@ class _ScanJob {
   DateTime? finishedAt;
   String? errorCode;
 }
+
+List<String> _stringListFromJson(String? value) {
+  if (value == null || value.isEmpty) return const [];
+  try {
+    final decoded = jsonDecode(value);
+    if (decoded is! List) return const [];
+    return _cleanTextValues(decoded.whereType<String>());
+  } on FormatException {
+    return const [];
+  }
+}
+
+List<String> _cleanTextValues(Iterable<String> values) => values
+    .map((value) => value.trim())
+    .where((value) => value.isNotEmpty)
+    .toSet()
+    .toList(growable: false);
 
 Future<bool> checkLocalHealth(NasConfig config) async {
   final client = HttpClient();

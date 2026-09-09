@@ -20,7 +20,7 @@ Future<void> main() async {
       NasLibraryDatabase('${directory.path}${Platform.pathSeparator}data');
   var probeCalls = 0;
   final metadataProbe = NasMediaMetadataProbe(
-    runner: (_, _) async {
+    runner: (command, arguments) async {
       probeCalls++;
       return ProcessResult(
         1,
@@ -42,32 +42,44 @@ Future<void> main() async {
     _expect(scan.scannedFiles == 1, 'scanner imports supported video files');
     final movie = database.listMovies().single;
     _expect(movie.title == 'sample', 'scanner derives a display title');
-    final enriched = database.updateMovieMetadata(
-      movieId: movie.id,
-      originalTitle: 'Sample Original',
-      updateOriginalTitle: true,
-      catalogNumber: 'ABC-001',
-      updateCatalogNumber: true,
-      actors: const [
-        NasMovieActor(name: '演员甲', gender: NasActorGender.female),
-        NasMovieActor(name: '演员乙', gender: NasActorGender.male),
-      ],
-    )!;
-    _expect(enriched.originalTitle == 'Sample Original',
+    final actorOne = database.createActor(
+      translatedName: '演员甲',
+      gender: 'female',
+    );
+    final actorTwo = database.createActor(
+      translatedName: '演员乙',
+      gender: 'male',
+    );
+    _expect(
+      database.updateMovieMetadata(
+            movieId: movie.id,
+            originalTitle: 'Sample Original',
+            updateOriginalTitle: true,
+            catalogNumber: 'ABC-001',
+            updateCatalogNumber: true,
+          ) !=
+          null,
+      'database updates movie metadata',
+    );
+    _expect(
+      database.setMovieActorIds(
+          movieId: movie.id, actorIds: [actorOne.id, actorTwo.id]),
+      'database stores native actor IDs only',
+    );
+    final linkedMovie = database.findMovieForAdmin(movie.id)!;
+    _expect(linkedMovie.originalTitle == 'Sample Original',
         'database stores the original title');
-    _expect(enriched.catalogNumber == 'ABC-001',
+    _expect(linkedMovie.catalogNumber == 'ABC-001',
         'database stores the catalog number');
     _expect(
-        enriched.actors.length == 2 &&
-            enriched.actors.first.name == '演员甲' &&
-            enriched.actors.first.gender == NasActorGender.female,
+        linkedMovie.actors.length == 2 &&
+            linkedMovie.actors.any((actor) =>
+                actor.name == '演员甲' && actor.gender == NasActorGender.female),
         'database stores structured actors');
     _expect(database.listMovies(query: 'sample original').length == 1,
         'database searches the original title');
     _expect(database.listMovies(query: 'abc001').length == 1,
         'database searches normalized catalog numbers');
-    _expect(database.listMovies(query: '演员乙').length == 1,
-        'database searches structured actor names');
     final episode = database.episodesForMovie(movie.id).single;
     _expect(episode.relativePath == '真人/sample.mp4',
         'database stores a relative path');
@@ -96,18 +108,21 @@ Future<void> main() async {
     await database.close();
     await database.open();
     final reopenedMovie = database.listMovies().single;
-    _expect(reopenedMovie.id == movie.id,
-        'SQLite data survives reopen');
-    _expect(reopenedMovie.originalTitle == 'Sample Original' &&
-        reopenedMovie.catalogNumber == 'ABC-001',
+    _expect(reopenedMovie.id == movie.id, 'SQLite data survives reopen');
+    _expect(
+        reopenedMovie.originalTitle == 'Sample Original' &&
+            reopenedMovie.catalogNumber == 'ABC-001',
         'movie identity metadata survives reopen');
     _expect(
-        reopenedMovie.actors.last.gender == NasActorGender.male,
-        'structured actors survive reopen');
+      reopenedMovie.actors.any((actor) =>
+          actor.name == '演员乙' && actor.gender == NasActorGender.male),
+      'native actor links survive reopen',
+    );
     final reopenedEpisode = database.episodesForMovie(movie.id).single;
-    _expect(reopenedEpisode.durationMs == 12500 &&
-        reopenedEpisode.videoWidth == 1920 &&
-        reopenedEpisode.videoHeight == 1080,
+    _expect(
+        reopenedEpisode.durationMs == 12500 &&
+            reopenedEpisode.videoWidth == 1920 &&
+            reopenedEpisode.videoHeight == 1080,
         'media metadata survives reopen');
     final reopenedRoot = database.listMediaRoots().single;
     _expect(

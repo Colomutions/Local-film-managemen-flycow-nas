@@ -2,7 +2,6 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../lib/mujing_nas.dart';
-import '../lib/src/persistent_state.dart';
 
 Future<void> main() async {
   final directory =
