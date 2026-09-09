@@ -314,6 +314,10 @@ class NasHealthServer {
           RegExp(r'^/api/v1/admin/actors/[^/]+$').hasMatch(path)) {
         return await _updateAdminActor(request);
       }
+      if (request.method == 'DELETE' &&
+          RegExp(r'^/api/v1/admin/actors/[^/]+$').hasMatch(path)) {
+        return await _deleteAdminActor(request);
+      }
       if (request.method == 'POST' &&
           RegExp(r'^/api/v1/admin/actors/[^/]+/archive$').hasMatch(path)) {
         return await _archiveAdminActor(request);
@@ -865,6 +869,31 @@ class NasHealthServer {
     });
   }
 
+  Future<void> _deleteAdminActor(HttpRequest request) async {
+    final actorId = request.uri.pathSegments.last;
+    final actor = _libraryDatabase.findActor(actorId);
+    if (actor == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (actor.movieCount > 0) {
+      return _error(request, HttpStatus.conflict, 'actor_in_use');
+    }
+    final photoAsset = actor.photoAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(actor.photoAssetId!);
+    if (!_libraryDatabase.deleteActor(actorId)) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (photoAsset != null) {
+      // 删除演员时同步移除其 NAS 受管理照片，避免遗留孤立资产记录或文件。
+      _libraryDatabase.removeManagedAsset(photoAsset.id);
+      await _artworkService.deleteManagedAsset(photoAsset.fileName);
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'deleted': true},
+    });
+  }
+
   Future<void> _uploadManagedImage(HttpRequest request) async {
     final purpose = request.uri.queryParameters['purpose'];
     final mimeType = request.headers.contentType?.mimeType;
@@ -1000,9 +1029,16 @@ class NasHealthServer {
     final hasCatalogNumber = result.containsKey('catalogNumber');
     final catalogNumber = result['catalogNumber'];
     if ((summary != null && summary is! String) ||
-        (hasOriginalTitle && originalTitle != null && originalTitle is! String) ||
-        (hasCatalogNumber && catalogNumber != null && catalogNumber is! String) ||
-        (title == null && summary == null && !hasOriginalTitle && !hasCatalogNumber)) {
+        (hasOriginalTitle &&
+            originalTitle != null &&
+            originalTitle is! String) ||
+        (hasCatalogNumber &&
+            catalogNumber != null &&
+            catalogNumber is! String) ||
+        (title == null &&
+            summary == null &&
+            !hasOriginalTitle &&
+            !hasCatalogNumber)) {
       return _error(request, HttpStatus.conflict, 'ai_response_invalid');
     }
     final movie = _libraryDatabase.updateMovieMetadata(
@@ -1074,7 +1110,8 @@ class NasHealthServer {
         'movieId': task.movieId,
         'instructions': task.instructions,
         'status': task.status,
-        'result': task.resultJson == null ? null : _aiTaskResult(task.resultJson!),
+        'result':
+            task.resultJson == null ? null : _aiTaskResult(task.resultJson!),
         'errorCode': task.errorCode,
         'createdAt': task.createdAt,
         'finishedAt': task.finishedAt,

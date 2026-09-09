@@ -102,6 +102,34 @@ Future<void> main() async {
           .isEmpty,
       'archived actor is excluded by default',
     );
+    final archivedDelete = await _request(
+      baseUrl,
+      'DELETE',
+      '/api/v1/admin/actors/$actorId',
+      token: token,
+    );
+    _expect(archivedDelete.statusCode == HttpStatus.ok,
+        'unlinked actor can be hard deleted after archive');
+    final afterDelete = await _request(
+      baseUrl,
+      'GET',
+      '/api/v1/actors?includeArchived=true',
+      token: token,
+    );
+    _expect(
+      ((afterDelete.json['data'] as Map<String, dynamic>)['items']
+              as List<dynamic>)
+          .isEmpty,
+      'deleted actor is no longer listed even with includeArchived',
+    );
+    final photoCheck = await _request(
+      baseUrl,
+      'GET',
+      '/api/v1/assets/$photoId',
+      token: token,
+    );
+    _expect(photoCheck.statusCode == HttpStatus.notFound,
+        'actor photo asset is removed together with actor');
   } finally {
     await server.stop();
     await dataDirectory.delete(recursive: true);

@@ -264,6 +264,38 @@ Future<void> main() async {
     );
     _expect(!jsonEncode(movieUpdate.json).contains(mediaRoot.path),
         'movie update hides container path');
+    final linkedDelete = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/actors/$actorOneId',
+      token: adminToken,
+    );
+    _expectError(linkedDelete, HttpStatus.conflict, 'actor_in_use');
+    final missingDelete = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/actors/missing',
+      token: adminToken,
+    );
+    _expectError(missingDelete, HttpStatus.notFound, 'resource_not_found');
+    final disposableActor = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: adminToken,
+      body: {'translatedName': '待删除演员', 'gender': 'female'},
+    );
+    final disposableActorId =
+        ((disposableActor.json['data'] as Map<String, dynamic>)['actor']
+            as Map<String, dynamic>)['id'] as String;
+    final unlinkedDelete = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/actors/$disposableActorId',
+      token: adminToken,
+    );
+    _expect(unlinkedDelete.statusCode == HttpStatus.ok,
+        'unlinked actor can be hard deleted by admin');
     final aiTask = await _request(
       base,
       'POST',
@@ -438,7 +470,8 @@ Future<Map<String, dynamic>> _waitForFinishedAiTask(
     );
     _expect(response.statusCode == HttpStatus.ok, 'admin can read AI task');
     final task = response.json['data'] as Map<String, dynamic>;
-    if (task['status'] == 'succeeded' || task['status'] == 'failed') return task;
+    if (task['status'] == 'succeeded' || task['status'] == 'failed')
+      return task;
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
   throw StateError('AI task did not finish in time.');

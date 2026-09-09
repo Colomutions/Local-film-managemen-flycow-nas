@@ -1094,6 +1094,13 @@ class NasLibraryDatabase {
         'archived_at': _now(),
       });
 
+  /// 删除无影片关联的演员；有关联时由调用方先校验或由外键限制拒绝。
+  bool deleteActor(String actorId) {
+    if (findActor(actorId) == null) return false;
+    _db.execute('DELETE FROM actors WHERE id = ?', [actorId]);
+    return true;
+  }
+
   bool setMovieActorIds({
     required String movieId,
     required List<String> actorIds,
@@ -1161,6 +1168,14 @@ class NasLibraryDatabase {
       mimeType: row['mime_type'] as String,
       createdAt: row['created_at'] as String,
     );
+  }
+
+  /// 删除受管理资产记录，供演员删除等场景同步清理 NAS 资产目录。
+  NasManagedAsset? removeManagedAsset(String assetId) {
+    final asset = findManagedAsset(assetId);
+    if (asset == null) return null;
+    _db.execute('DELETE FROM managed_assets WHERE id = ?', [assetId]);
+    return asset;
   }
 
   NasAiTask? createAiTask({
