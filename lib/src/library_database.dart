@@ -576,14 +576,9 @@ class NasLibraryDatabase {
       );
     }
     if (current < 13) {
-      final rows = _db.select('SELECT id, actors_json FROM movies');
-      for (final row in rows) {
-        final actors = decodeNasMovieActors(row['actors_json'] as String?);
-        _db.execute(
-          'UPDATE movies SET actors_json = ? WHERE id = ?',
-          [encodeNasMovieActors(actors), row['id']],
-        );
-      }
+      // Do not interpret or rewrite the former string-only actor payload.
+      // Actors are NAS-native entities now; legacy movie payloads have no
+      // value and are deliberately left untouched.
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [13, _now()],

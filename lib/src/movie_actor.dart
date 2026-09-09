@@ -20,7 +20,7 @@ enum NasActorGender {
 class NasMovieActor {
   const NasMovieActor({required this.name, required this.gender, this.id});
 
-  /// Native NAS actor identity. Legacy stored actor JSON has no ID.
+  /// Native NAS actor identity. IDs always refer to NAS-owned actors.
   final String? id;
   final String name;
   final NasActorGender gender;
@@ -32,12 +32,6 @@ class NasMovieActor {
   };
 
   static NasMovieActor? fromStoredJson(Object? value) {
-    if (value is String) {
-      final name = value.trim();
-      return name.isEmpty
-          ? null
-          : NasMovieActor(name: name, gender: NasActorGender.unknown);
-    }
     if (value is! Map) return null;
     final rawName = value['name'];
     if (rawName is! String || rawName.trim().isEmpty) return null;
