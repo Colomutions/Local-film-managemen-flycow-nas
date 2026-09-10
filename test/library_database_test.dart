@@ -50,6 +50,31 @@ Future<void> main() async {
       translatedName: '演员乙',
       gender: 'male',
     );
+    final publisher = database.createPublisher(
+      displayName: '测试发行商',
+      originalName: 'Test Publisher',
+    );
+    final draftSeries = database.createSeries(displayName: '未归属草稿系列');
+    _expect(
+      draftSeries.publisherId == null,
+      'series draft may omit a publisher before it has films',
+    );
+    _expect(
+      database.resolveMovieRelations(
+            movieId: movie.id,
+            publisherId: null,
+            updatePublisherId: true,
+            seriesId: draftSeries.id,
+            updateSeriesId: true,
+          ) ==
+          null,
+      'series draft cannot be linked to a movie before publisher is selected',
+    );
+    final series = database.createSeries(
+      displayName: '测试系列',
+      publisherId: publisher.id,
+      releaseDate: '2026-09-10',
+    );
     _expect(
       database.updateMovieMetadata(
             movieId: movie.id,
@@ -57,13 +82,20 @@ Future<void> main() async {
             updateOriginalTitle: true,
             catalogNumber: 'ABC-001',
             updateCatalogNumber: true,
-            publisherName: '测试发行商',
-            updatePublisherName: true,
-            seriesName: '测试系列',
-            updateSeriesName: true,
           ) !=
           null,
       'database updates movie metadata',
+    );
+    _expect(
+      database.updateMovieRelations(
+            movieId: movie.id,
+            publisherId: publisher.id,
+            updatePublisherId: true,
+            seriesId: series.id,
+            updateSeriesId: true,
+          ) !=
+          null,
+      'database stores movie publisher and series IDs',
     );
     _expect(
       database.setMovieActorIds(
@@ -75,10 +107,37 @@ Future<void> main() async {
         'database stores the original title');
     _expect(linkedMovie.catalogNumber == 'ABC-001',
         'database stores the catalog number');
-    _expect(linkedMovie.publisherName == '测试发行商',
-        'database stores the publisher name');
     _expect(
-        linkedMovie.seriesName == '测试系列', 'database stores the series name');
+      linkedMovie.publisherId == publisher.id &&
+          linkedMovie.publisherName == '测试发行商',
+      'database resolves the publisher through its stable ID',
+    );
+    _expect(
+      linkedMovie.seriesId == series.id && linkedMovie.seriesName == '测试系列',
+      'database resolves the series through its stable ID',
+    );
+    _expect(
+      database.updateMovieRelations(
+            movieId: movie.id,
+            publisherId: null,
+            updatePublisherId: true,
+            seriesId: series.id,
+            updateSeriesId: true,
+          ) ==
+          null,
+      'database rejects a series and publisher conflict',
+    );
+    _expect(
+      database.setActorPublisherIds(
+        actorId: actorOne.id,
+        publisherIds: [publisher.id],
+      ),
+      'actor publisher links use publisher entity IDs',
+    );
+    _expect(
+      database.publishersForActor(actorOne.id).single.id == publisher.id,
+      'actor publisher links resolve entity data',
+    );
     _expect(
         linkedMovie.actors.length == 2 &&
             linkedMovie.actors.any((actor) =>
@@ -123,8 +182,8 @@ Future<void> main() async {
     _expect(
         reopenedMovie.originalTitle == 'Sample Original' &&
             reopenedMovie.catalogNumber == 'ABC-001' &&
-            reopenedMovie.publisherName == '测试发行商' &&
-            reopenedMovie.seriesName == '测试系列',
+            reopenedMovie.publisherId == publisher.id &&
+            reopenedMovie.seriesId == series.id,
         'movie identity metadata survives reopen');
     _expect(
       reopenedMovie.actors.any((actor) =>

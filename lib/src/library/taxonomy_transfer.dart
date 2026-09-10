@@ -52,7 +52,9 @@ class NasCategoryTaxonomyTransfer {
     if (value is! Map) throw const FormatException('根节点必须是对象');
     final map = Map<String, dynamic>.from(value);
     if (!_hasOnly(map, const {'format', 'version', 'categories'}) ||
-        !map.keys.toSet().containsAll(const {'format', 'version', 'categories'}) ||
+        !map.keys
+            .toSet()
+            .containsAll(const {'format', 'version', 'categories'}) ||
         map['format'] != 'mujing-categories' ||
         map['version'] != 1 ||
         map['categories'] is! List) {
@@ -68,10 +70,17 @@ class NasCategoryTaxonomyTransfer {
 }
 
 class NasTagTaxonomyTransfer {
-  const NasTagTaxonomyTransfer({required this.roots, required this.children});
+  const NasTagTaxonomyTransfer({
+    required this.roots,
+    required this.children,
+    this.sourceSkipped = const [],
+    this.validationConflicts = const [],
+  });
 
   final List<NasTaxonomyTagDefinition> roots;
   final List<NasTaxonomyTagDefinition> children;
+  final List<String> sourceSkipped;
+  final List<String> validationConflicts;
 
   Map<String, Object> toJson() => {
         'format': 'mujing-tags',
@@ -101,13 +110,14 @@ class NasTagTaxonomyTransfer {
         tags['children'] is! List) {
       throw const FormatException('tags 只能包含 roots 和 children');
     }
-    final roots = _definitions(tags['roots'], '一级标签')
-        .map((item) => NasTaxonomyTagDefinition(
-              name: item.name,
-              color: item.color,
-            ))
-        .toList(growable: false);
+    final sourceSkipped = <String>[];
+    final validationConflicts = <String>[];
+    final roots = _tagRoots(tags['roots'], sourceSkipped);
+    final rootNames = {
+      for (final root in roots) normalizeTaxonomyName(root.name),
+    };
     final children = <NasTaxonomyTagDefinition>[];
+    final childNames = <String>{};
     for (final raw in tags['children'] as List) {
       if (raw is! Map) throw const FormatException('二级标签必须是对象');
       final item = Map<String, dynamic>.from(raw);
@@ -124,43 +134,54 @@ class NasTagTaxonomyTransfer {
       if (!isValidTaxonomyColor(color)) {
         throw const FormatException('颜色必须是 #RRGGBB');
       }
+      final normalizedName = normalizeTaxonomyName(name);
+      if (rootNames.contains(normalizedName)) {
+        validationConflicts.add('标签层级冲突：$name 同时定义为一级和二级标签');
+        continue;
+      }
+      if (!childNames.add(normalizedName)) {
+        sourceSkipped.add('二级标签（文件重复）：$name');
+        continue;
+      }
       final parents = <String>[];
       final seenParents = <String>{};
+      var hasUnknownParent = false;
       for (final rawParent in item['parents'] as List) {
         final parent = _requiredName(rawParent, '二级标签父级');
         if (!seenParents.add(normalizeTaxonomyName(parent))) {
-          throw const FormatException('二级标签父级不能重复');
+          sourceSkipped.add('标签归属（文件重复）：$parent → $name');
+          continue;
+        }
+        if (!rootNames.contains(normalizeTaxonomyName(parent))) {
+          validationConflicts.add('二级标签父级不存在：$parent → $name');
+          hasUnknownParent = true;
+          continue;
         }
         parents.add(parent);
       }
-      if (parents.isEmpty) throw const FormatException('二级标签至少需要一个一级归属');
+      if (parents.isEmpty) {
+        if (!hasUnknownParent) {
+          validationConflicts.add('二级标签缺少一级归属：$name');
+        }
+        continue;
+      }
+      if (hasUnknownParent) continue;
       children.add(NasTaxonomyTagDefinition(
         name: name,
         color: color,
         parents: parents,
       ));
     }
-    final rootNames = <String>{};
-    for (final root in roots) {
-      if (!rootNames.add(normalizeTaxonomyName(root.name))) {
-        throw const FormatException('一级标签名称不能重复（不区分大小写）');
-      }
-    }
-    final allNames = <String>{...rootNames};
-    for (final child in children) {
-      if (!allNames.add(normalizeTaxonomyName(child.name))) {
-        throw const FormatException('标签名称或角色冲突（不区分大小写）');
-      }
-      if (child.parents.any(
-        (parent) => !rootNames.contains(normalizeTaxonomyName(parent)),
-      )) {
-        throw const FormatException('二级标签引用了未知一级标签');
-      }
-    }
-    return NasTagTaxonomyTransfer(roots: roots, children: children);
+    return NasTagTaxonomyTransfer(
+      roots: roots,
+      children: children,
+      sourceSkipped: sourceSkipped,
+      validationConflicts: validationConflicts,
+    );
   }
 
-  static NasTagTaxonomyTransfer decodeText(String source) => decode(jsonDecode(source));
+  static NasTagTaxonomyTransfer decodeText(String source) =>
+      decode(jsonDecode(source));
 }
 
 class NasTaxonomyTransferResult {
@@ -206,6 +227,36 @@ List<NasTaxonomyCategoryDefinition> _definitions(Object? raw, String label) {
       throw FormatException('$label 名称不能重复（不区分大小写）');
     }
     result.add(NasTaxonomyCategoryDefinition(name: name, color: color));
+  }
+  return result;
+}
+
+List<NasTaxonomyTagDefinition> _tagRoots(
+  Object? raw,
+  List<String> sourceSkipped,
+) {
+  if (raw is! List) throw const FormatException('一级标签必须是数组');
+  final result = <NasTaxonomyTagDefinition>[];
+  final names = <String>{};
+  for (final value in raw) {
+    if (value is! Map) throw const FormatException('一级标签项必须是对象');
+    final item = Map<String, dynamic>.from(value);
+    if (!_hasOnly(item, const {'name', 'color'}) ||
+        !item.containsKey('name') ||
+        item['name'] is! String ||
+        (item['color'] != null && item['color'] is! String)) {
+      throw const FormatException('一级标签项结构无效');
+    }
+    final name = _requiredName(item['name'], '一级标签');
+    final color = item['color'] as String?;
+    if (!isValidTaxonomyColor(color)) {
+      throw const FormatException('颜色必须是 #RRGGBB');
+    }
+    if (!names.add(normalizeTaxonomyName(name))) {
+      sourceSkipped.add('一级标签（文件重复）：$name');
+      continue;
+    }
+    result.add(NasTaxonomyTagDefinition(name: name, color: color));
   }
   return result;
 }

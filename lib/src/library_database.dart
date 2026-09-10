@@ -23,7 +23,9 @@ class NasLibraryMovie {
     required this.title,
     this.originalTitle,
     this.catalogNumber,
+    this.publisherId,
     this.publisherName,
+    this.seriesId,
     this.seriesName,
     required this.summary,
     required this.actors,
@@ -41,7 +43,9 @@ class NasLibraryMovie {
   final String title;
   final String? originalTitle;
   final String? catalogNumber;
+  final String? publisherId;
   final String? publisherName;
+  final String? seriesId;
   final String? seriesName;
   final String summary;
   final List<NasMovieActor> actors;
@@ -213,7 +217,7 @@ class NasActor {
     this.debutMonth,
     this.debutDescription,
     this.photoAssetId,
-    required this.publisherNames,
+    required this.publisherIds,
     required this.movieCount,
     required this.createdAt,
     required this.updatedAt,
@@ -235,7 +239,7 @@ class NasActor {
   final String? debutMonth;
   final String? debutDescription;
   final String? photoAssetId;
-  final List<String> publisherNames;
+  final List<String> publisherIds;
   final int movieCount;
   final String createdAt;
   final String updatedAt;
@@ -262,6 +266,80 @@ class NasManagedAsset {
 /// 由共同影片关系推导出的合作演员，不能手工写入。
 class NasActorCoactor {
   const NasActorCoactor({required this.actor, required this.movieCount});
+
+  final NasActor actor;
+  final int movieCount;
+}
+
+/// NAS 原生发行商实体；统计值始终由关联影片和系列即时聚合。
+class NasPublisher {
+  const NasPublisher({
+    required this.id,
+    required this.displayName,
+    this.originalName,
+    this.countryRegion,
+    this.foundedDate,
+    this.logoAssetId,
+    required this.movieCount,
+    required this.seriesCount,
+    required this.durationMs,
+    required this.createdAt,
+    required this.updatedAt,
+    this.archivedAt,
+  });
+
+  final String id;
+  final String displayName;
+  final String? originalName;
+  final String? countryRegion;
+  final String? foundedDate;
+  final String? logoAssetId;
+  final int movieCount;
+  final int seriesCount;
+  final int? durationMs;
+  final String createdAt;
+  final String updatedAt;
+  final String? archivedAt;
+}
+
+/// NAS 原生系列实体；总集数和总时长不允许客户端手工覆盖。
+class NasSeries {
+  const NasSeries({
+    required this.id,
+    required this.displayName,
+    this.originalName,
+    this.translatedName,
+    this.publisherId,
+    this.releaseDate,
+    this.posterAssetId,
+    required this.movieCount,
+    required this.episodeCount,
+    required this.durationMs,
+    required this.createdAt,
+    required this.updatedAt,
+    this.archivedAt,
+  });
+
+  final String id;
+  final String displayName;
+  final String? originalName;
+  final String? translatedName;
+
+  /// 新建阶段允许暂不归属发行商，但关联影片前必须补齐。
+  final String? publisherId;
+  final String? releaseDate;
+  final String? posterAssetId;
+  final int movieCount;
+  final int episodeCount;
+  final int? durationMs;
+  final String createdAt;
+  final String updatedAt;
+  final String? archivedAt;
+}
+
+/// 发行商或系列下演员的参演影片数，仅作聚合展示。
+class NasRelatedActor {
+  const NasRelatedActor({required this.actor, required this.movieCount});
 
   final NasActor actor;
   final int movieCount;
@@ -320,7 +398,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 16;
+  static const currentSchemaVersion = 19;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -661,6 +739,159 @@ class NasLibraryDatabase {
         [16, _now()],
       );
     }
+    if (current < 17) {
+      // 旧版资产用途约束无法直接扩展，重建表但保留所有既有资产记录。
+      _db.execute('PRAGMA foreign_keys = OFF');
+      try {
+        _db.execute('''
+          CREATE TABLE managed_assets_v17 (
+            id TEXT PRIMARY KEY,
+            purpose TEXT NOT NULL CHECK(purpose IN (
+              'actor_photo', 'movie_poster', 'publisher_logo', 'series_poster'
+            )),
+            file_name TEXT NOT NULL UNIQUE,
+            mime_type TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO managed_assets_v17(id, purpose, file_name, mime_type, created_at)
+            SELECT id, purpose, file_name, mime_type, created_at FROM managed_assets;
+          DROP TABLE managed_assets;
+          ALTER TABLE managed_assets_v17 RENAME TO managed_assets;
+
+          CREATE TABLE publishers (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            original_name TEXT,
+            country_region TEXT,
+            founded_date TEXT,
+            logo_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
+          );
+          CREATE TABLE series (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            original_name TEXT,
+            translated_name TEXT,
+            publisher_id TEXT NOT NULL REFERENCES publishers(id) ON DELETE RESTRICT,
+            release_date TEXT,
+            poster_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
+          );
+          ALTER TABLE movies ADD COLUMN publisher_id TEXT REFERENCES publishers(id) ON DELETE SET NULL;
+          ALTER TABLE movies ADD COLUMN series_id TEXT REFERENCES series(id) ON DELETE SET NULL;
+          CREATE INDEX publishers_archived_created_idx
+            ON publishers(archived_at, created_at DESC);
+          CREATE INDEX series_publisher_archived_created_idx
+            ON series(publisher_id, archived_at, created_at DESC);
+          CREATE INDEX movies_publisher_id_idx ON movies(publisher_id);
+          CREATE INDEX movies_series_id_idx ON movies(series_id);
+
+          CREATE TRIGGER movies_series_publisher_insert
+          BEFORE INSERT ON movies
+          WHEN NEW.series_id IS NOT NULL AND (
+            NEW.publisher_id IS NULL OR
+            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'series_publisher_mismatch');
+          END;
+          CREATE TRIGGER movies_series_publisher_update
+          BEFORE UPDATE OF publisher_id, series_id ON movies
+          WHEN NEW.series_id IS NOT NULL AND (
+            NEW.publisher_id IS NULL OR
+            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'series_publisher_mismatch');
+          END;
+        ''');
+      } finally {
+        _db.execute('PRAGMA foreign_keys = ON');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [17, _now()],
+      );
+    }
+    if (current < 18) {
+      _db.execute('''
+        CREATE TABLE actor_publisher_links (
+          actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+          publisher_id TEXT NOT NULL REFERENCES publishers(id) ON DELETE RESTRICT,
+          PRIMARY KEY(actor_id, publisher_id)
+        );
+        CREATE INDEX actor_publisher_links_publisher_idx
+          ON actor_publisher_links(publisher_id, actor_id);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [18, _now()],
+      );
+    }
+    if (current < 19) {
+      // SQLite 不能直接移除 NOT NULL，重建系列表以支持未归属发行商的草稿系列。
+      _db.execute('PRAGMA foreign_keys = OFF');
+      try {
+        _db.execute('''
+          DROP TRIGGER IF EXISTS movies_series_publisher_insert;
+          DROP TRIGGER IF EXISTS movies_series_publisher_update;
+          CREATE TABLE series_v19 (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            original_name TEXT,
+            translated_name TEXT,
+            publisher_id TEXT REFERENCES publishers(id) ON DELETE RESTRICT,
+            release_date TEXT,
+            poster_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
+          );
+          INSERT INTO series_v19(
+            id, display_name, original_name, translated_name, publisher_id,
+            release_date, poster_asset_id, created_at, updated_at, archived_at
+          ) SELECT
+            id, display_name, original_name, translated_name, publisher_id,
+            release_date, poster_asset_id, created_at, updated_at, archived_at
+          FROM series;
+          DROP TABLE series;
+          ALTER TABLE series_v19 RENAME TO series;
+          CREATE INDEX series_publisher_archived_created_idx
+            ON series(publisher_id, archived_at, created_at DESC);
+
+          CREATE TRIGGER movies_series_publisher_insert
+          BEFORE INSERT ON movies
+          WHEN NEW.series_id IS NOT NULL AND (
+            (SELECT publisher_id FROM series WHERE id = NEW.series_id) IS NULL OR
+            NEW.publisher_id IS NULL OR
+            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'series_publisher_mismatch');
+          END;
+          CREATE TRIGGER movies_series_publisher_update
+          BEFORE UPDATE OF publisher_id, series_id ON movies
+          WHEN NEW.series_id IS NOT NULL AND (
+            (SELECT publisher_id FROM series WHERE id = NEW.series_id) IS NULL OR
+            NEW.publisher_id IS NULL OR
+            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
+          )
+          BEGIN
+            SELECT RAISE(ABORT, 'series_publisher_mismatch');
+          END;
+        ''');
+      } finally {
+        _db.execute('PRAGMA foreign_keys = ON');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [19, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -885,11 +1116,15 @@ class NasLibraryDatabase {
     final catalogQueryLike = '%$normalizedCatalogQuery%';
     final rows = _db.select('''
       SELECT m.id, m.title, m.original_title, m.catalog_number,
-             m.publisher_name, m.series_name,
+             m.publisher_id, p.display_name AS publisher_name,
+             m.series_id, s.display_name AS series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
              m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
-      FROM movies m JOIN episodes e ON e.movie_id = m.id
+      FROM movies m
+      LEFT JOIN publishers p ON p.id = m.publisher_id
+      LEFT JOIN series s ON s.id = m.series_id
+      JOIN episodes e ON e.movie_id = m.id
       WHERE e.is_available = 1 AND (
         ? = '%%'
         OR lower(m.title) LIKE lower(?)
@@ -911,7 +1146,9 @@ class NasLibraryDatabase {
               title: row['title'] as String,
               originalTitle: row['original_title'] as String?,
               catalogNumber: row['catalog_number'] as String?,
+              publisherId: row['publisher_id'] as String?,
               publisherName: row['publisher_name'] as String?,
+              seriesId: row['series_id'] as String?,
               seriesName: row['series_name'] as String?,
               summary: row['summary'] as String,
               actors: _movieActors(row['id'] as String),
@@ -924,6 +1161,357 @@ class NasLibraryDatabase {
               updatedAt: row['updated_at'] as String,
             )))
         .toList(growable: false);
+  }
+
+  List<NasPublisher> listPublishers({
+    String query = '',
+    bool includeArchived = false,
+  }) {
+    final queryLike = '%${query.trim()}%';
+    final rows = _db.select('''
+      SELECT p.id, p.display_name, p.original_name, p.country_region,
+             p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
+             p.archived_at,
+             (SELECT COUNT(*) FROM movies m WHERE m.publisher_id = p.id) AS movie_count,
+             (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
+             (SELECT SUM(COALESCE(e.duration_ms, 0))
+                FROM movies m JOIN episodes e ON e.movie_id = m.id
+               WHERE m.publisher_id = p.id AND e.is_available = 1) AS duration_ms
+      FROM publishers p
+      WHERE (? = 1 OR p.archived_at IS NULL)
+        AND (? = '%%' OR lower(p.display_name) LIKE lower(?)
+             OR lower(COALESCE(p.original_name, '')) LIKE lower(?))
+      ORDER BY p.created_at DESC, p.id DESC
+    ''', [includeArchived ? 1 : 0, queryLike, queryLike, queryLike]);
+    return rows.map(_mapPublisher).toList(growable: false);
+  }
+
+  NasPublisher? findPublisher(String publisherId) {
+    final rows = _db.select('''
+      SELECT p.id, p.display_name, p.original_name, p.country_region,
+             p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
+             p.archived_at,
+             (SELECT COUNT(*) FROM movies m WHERE m.publisher_id = p.id) AS movie_count,
+             (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
+             (SELECT SUM(COALESCE(e.duration_ms, 0))
+                FROM movies m JOIN episodes e ON e.movie_id = m.id
+               WHERE m.publisher_id = p.id AND e.is_available = 1) AS duration_ms
+      FROM publishers p WHERE p.id = ?
+    ''', [publisherId]);
+    return rows.isEmpty ? null : _mapPublisher(rows.single);
+  }
+
+  NasPublisher createPublisher({
+    required String displayName,
+    String? originalName,
+    String? countryRegion,
+    String? foundedDate,
+    String? logoAssetId,
+  }) {
+    final id = newUuidV4();
+    final timestamp = _now();
+    _db.execute('''
+      INSERT INTO publishers(
+        id, display_name, original_name, country_region, founded_date,
+        logo_asset_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      id,
+      displayName.trim(),
+      _nullableTrimmed(originalName),
+      _nullableTrimmed(countryRegion),
+      _nullableTrimmed(foundedDate),
+      logoAssetId,
+      timestamp,
+      timestamp,
+    ]);
+    return findPublisher(id)!;
+  }
+
+  NasPublisher? updatePublisher(
+      String publisherId, Map<String, Object?> values) {
+    if (findPublisher(publisherId) == null) return null;
+    if (values.isEmpty) return findPublisher(publisherId);
+    final assignments = <String>[];
+    final parameters = <Object?>[];
+    values.forEach((key, value) {
+      assignments.add('$key = ?');
+      parameters.add(value);
+    });
+    assignments.add('updated_at = ?');
+    parameters
+      ..add(_now())
+      ..add(publisherId);
+    _db.execute(
+      'UPDATE publishers SET ${assignments.join(', ')} WHERE id = ?',
+      parameters,
+    );
+    return findPublisher(publisherId);
+  }
+
+  NasPublisher? archivePublisher(String publisherId) => updatePublisher(
+        publisherId,
+        {'archived_at': _now()},
+      );
+
+  bool publisherHasReferences(String publisherId) => _db.select('''
+    SELECT 1
+    WHERE EXISTS(SELECT 1 FROM movies WHERE publisher_id = ?)
+       OR EXISTS(SELECT 1 FROM series WHERE publisher_id = ?)
+       OR EXISTS(SELECT 1 FROM actor_publisher_links WHERE publisher_id = ?)
+  ''', [publisherId, publisherId, publisherId]).isNotEmpty;
+
+  bool deletePublisher(String publisherId) {
+    if (findPublisher(publisherId) == null ||
+        publisherHasReferences(publisherId)) {
+      return false;
+    }
+    _db.execute('DELETE FROM publishers WHERE id = ?', [publisherId]);
+    return true;
+  }
+
+  List<NasSeries> listSeries({
+    String query = '',
+    String? publisherId,
+    bool includeArchived = false,
+  }) {
+    final queryLike = '%${query.trim()}%';
+    final rows = _db.select('''
+      SELECT s.id, s.display_name, s.original_name, s.translated_name,
+             s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
+             s.updated_at, s.archived_at,
+             (SELECT COUNT(*) FROM movies m WHERE m.series_id = s.id) AS movie_count,
+             (SELECT COUNT(e.id) FROM movies m JOIN episodes e ON e.movie_id = m.id
+               WHERE m.series_id = s.id AND e.is_available = 1) AS episode_count,
+             (SELECT SUM(COALESCE(e.duration_ms, 0))
+                FROM movies m JOIN episodes e ON e.movie_id = m.id
+               WHERE m.series_id = s.id AND e.is_available = 1) AS duration_ms
+      FROM series s
+      WHERE (? = 1 OR s.archived_at IS NULL)
+        AND (? IS NULL OR s.publisher_id = ?)
+        AND (? = '%%' OR lower(s.display_name) LIKE lower(?)
+             OR lower(COALESCE(s.original_name, '')) LIKE lower(?)
+             OR lower(COALESCE(s.translated_name, '')) LIKE lower(?))
+      ORDER BY s.created_at DESC, s.id DESC
+    ''', [
+      includeArchived ? 1 : 0,
+      publisherId,
+      publisherId,
+      queryLike,
+      queryLike,
+      queryLike,
+      queryLike,
+    ]);
+    return rows.map(_mapSeries).toList(growable: false);
+  }
+
+  NasSeries? findSeries(String seriesId) {
+    final rows = _db.select('''
+      SELECT s.id, s.display_name, s.original_name, s.translated_name,
+             s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
+             s.updated_at, s.archived_at,
+             (SELECT COUNT(*) FROM movies m WHERE m.series_id = s.id) AS movie_count,
+             (SELECT COUNT(e.id) FROM movies m JOIN episodes e ON e.movie_id = m.id
+               WHERE m.series_id = s.id AND e.is_available = 1) AS episode_count,
+             (SELECT SUM(COALESCE(e.duration_ms, 0))
+                FROM movies m JOIN episodes e ON e.movie_id = m.id
+               WHERE m.series_id = s.id AND e.is_available = 1) AS duration_ms
+      FROM series s WHERE s.id = ?
+    ''', [seriesId]);
+    return rows.isEmpty ? null : _mapSeries(rows.single);
+  }
+
+  NasSeries createSeries({
+    required String displayName,
+    String? publisherId,
+    String? originalName,
+    String? translatedName,
+    String? releaseDate,
+    String? posterAssetId,
+  }) {
+    final id = newUuidV4();
+    final timestamp = _now();
+    _db.execute('''
+      INSERT INTO series(
+        id, display_name, original_name, translated_name, publisher_id,
+        release_date, poster_asset_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      id,
+      displayName.trim(),
+      _nullableTrimmed(originalName),
+      _nullableTrimmed(translatedName),
+      _nullableTrimmed(publisherId),
+      _nullableTrimmed(releaseDate),
+      posterAssetId,
+      timestamp,
+      timestamp,
+    ]);
+    return findSeries(id)!;
+  }
+
+  NasSeries? updateSeries(String seriesId, Map<String, Object?> values) {
+    if (findSeries(seriesId) == null) return null;
+    if (values.isEmpty) return findSeries(seriesId);
+    final assignments = <String>[];
+    final parameters = <Object?>[];
+    values.forEach((key, value) {
+      assignments.add('$key = ?');
+      parameters.add(value);
+    });
+    assignments.add('updated_at = ?');
+    parameters
+      ..add(_now())
+      ..add(seriesId);
+    _db.execute(
+      'UPDATE series SET ${assignments.join(', ')} WHERE id = ?',
+      parameters,
+    );
+    return findSeries(seriesId);
+  }
+
+  NasSeries? archiveSeries(String seriesId) => updateSeries(
+        seriesId,
+        {'archived_at': _now()},
+      );
+
+  bool deleteSeries(String seriesId) {
+    final series = findSeries(seriesId);
+    if (series == null || series.movieCount > 0) return false;
+    _db.execute('DELETE FROM series WHERE id = ?', [seriesId]);
+    return true;
+  }
+
+  List<NasLibraryMovie> moviesForPublisher(String publisherId,
+          {String query = ''}) =>
+      listMovies(query: query)
+          .where((movie) => movie.publisherId == publisherId)
+          .toList(growable: false);
+
+  List<NasLibraryMovie> moviesForSeries(String seriesId, {String query = ''}) =>
+      listMovies(query: query)
+          .where((movie) => movie.seriesId == seriesId)
+          .toList(growable: false);
+
+  List<NasSeries> seriesForPublisher(String publisherId, {String query = ''}) =>
+      listSeries(query: query, publisherId: publisherId)
+          .toList(growable: false);
+
+  List<NasLibraryTag> tagsForPublisher(String publisherId) => _tagsForRelation(
+        'm.publisher_id = ?',
+        [publisherId],
+      );
+
+  List<NasLibraryTag> tagsForSeries(String seriesId) => _tagsForRelation(
+        'm.series_id = ?',
+        [seriesId],
+      );
+
+  List<NasRelatedActor> actorsForPublisher(String publisherId) =>
+      _relatedActorsForMovies('m.publisher_id = ?', [publisherId]);
+
+  List<NasRelatedActor> actorsForSeries(String seriesId) =>
+      _relatedActorsForMovies('m.series_id = ?', [seriesId]);
+
+  List<String> publisherIdsForActor(String actorId) => _db
+      .select('''
+        SELECT publisher_id FROM actor_publisher_links
+        WHERE actor_id = ? ORDER BY publisher_id
+      ''', [actorId])
+      .map((row) => row['publisher_id'] as String)
+      .toList(growable: false);
+
+  List<NasPublisher> publishersForActor(String actorId) =>
+      publisherIdsForActor(actorId)
+          .map(findPublisher)
+          .whereType<NasPublisher>()
+          .toList(growable: false);
+
+  bool setActorPublisherIds({
+    required String actorId,
+    required List<String> publisherIds,
+  }) {
+    if (findActor(actorId) == null ||
+        publisherIds.length != publisherIds.toSet().length ||
+        publisherIds.any((id) {
+          final publisher = findPublisher(id);
+          return publisher == null || publisher.archivedAt != null;
+        })) {
+      return false;
+    }
+    _db.execute('BEGIN');
+    try {
+      _db.execute(
+          'DELETE FROM actor_publisher_links WHERE actor_id = ?', [actorId]);
+      for (final publisherId in publisherIds) {
+        _db.execute(
+          'INSERT INTO actor_publisher_links(actor_id, publisher_id) VALUES (?, ?)',
+          [actorId, publisherId],
+        );
+      }
+      _db.execute('COMMIT');
+      return true;
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
+  /// 统一解析影片关系，系列存在时始终以系列所属发行商为准。
+  ({String? publisherId, String? seriesId})? resolveMovieRelations({
+    required String movieId,
+    String? publisherId,
+    required bool updatePublisherId,
+    String? seriesId,
+    required bool updateSeriesId,
+  }) {
+    final movie = findMovieForAdmin(movieId);
+    if (movie == null) return null;
+    final resolvedSeriesId =
+        updateSeriesId ? _nullableTrimmed(seriesId) : movie.seriesId;
+    var resolvedPublisherId =
+        updatePublisherId ? _nullableTrimmed(publisherId) : movie.publisherId;
+    if (resolvedSeriesId != null) {
+      final series = findSeries(resolvedSeriesId);
+      final seriesPublisherId = series?.publisherId;
+      if (series == null ||
+          series.archivedAt != null ||
+          seriesPublisherId == null) {
+        return null;
+      }
+      if (updatePublisherId && resolvedPublisherId != seriesPublisherId)
+        return null;
+      resolvedPublisherId = seriesPublisherId;
+    }
+    if (resolvedPublisherId != null) {
+      final publisher = findPublisher(resolvedPublisherId);
+      if (publisher == null || publisher.archivedAt != null) return null;
+    }
+    return (publisherId: resolvedPublisherId, seriesId: resolvedSeriesId);
+  }
+
+  NasLibraryMovie? updateMovieRelations({
+    required String movieId,
+    required String? publisherId,
+    required bool updatePublisherId,
+    required String? seriesId,
+    required bool updateSeriesId,
+  }) {
+    final relations = resolveMovieRelations(
+      movieId: movieId,
+      publisherId: publisherId,
+      updatePublisherId: updatePublisherId,
+      seriesId: seriesId,
+      updateSeriesId: updateSeriesId,
+    );
+    if (relations == null) return null;
+    if (!updatePublisherId && !updateSeriesId)
+      return findMovieForAdmin(movieId);
+    _db.execute(
+      'UPDATE movies SET publisher_id = ?, series_id = ?, updated_at = ? WHERE id = ?',
+      [relations.publisherId, relations.seriesId, _now(), movieId],
+    );
+    return findMovieForAdmin(movieId);
   }
 
   List<NasActor> listActors({
@@ -1295,11 +1883,15 @@ class NasLibraryDatabase {
   NasLibraryMovie? findMovieForAdmin(String movieId) {
     final rows = _db.select('''
       SELECT m.id, m.title, m.original_title, m.catalog_number,
-             m.publisher_name, m.series_name,
+             m.publisher_id, p.display_name AS publisher_name,
+             m.series_id, s.display_name AS series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
              m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
-      FROM movies m LEFT JOIN episodes e ON e.movie_id = m.id
+      FROM movies m
+      LEFT JOIN publishers p ON p.id = m.publisher_id
+      LEFT JOIN series s ON s.id = m.series_id
+      LEFT JOIN episodes e ON e.movie_id = m.id
       WHERE m.id = ?
       GROUP BY m.id
     ''', [movieId]);
@@ -1775,11 +2367,18 @@ class NasLibraryDatabase {
   }
 
   NasTaxonomyTransferResult importTagTaxonomy(NasTagTaxonomyTransfer transfer) {
+    if (transfer.validationConflicts.isNotEmpty) {
+      return NasTaxonomyTransferResult(
+        added: const [],
+        skipped: transfer.sourceSkipped,
+        conflicts: transfer.validationConflicts,
+      );
+    }
     final conflicts = taxonomyViolations();
     if (conflicts.isNotEmpty) {
       return NasTaxonomyTransferResult(
         added: const [],
-        skipped: const [],
+        skipped: transfer.sourceSkipped,
         conflicts: conflicts,
       );
     }
@@ -1812,12 +2411,12 @@ class NasLibraryDatabase {
     if (preflight.isNotEmpty) {
       return NasTaxonomyTransferResult(
         added: const [],
-        skipped: const [],
+        skipped: transfer.sourceSkipped,
         conflicts: preflight,
       );
     }
     final added = <String>[];
-    final skipped = <String>[];
+    final skipped = <String>[...transfer.sourceSkipped];
     _db.execute('BEGIN IMMEDIATE');
     try {
       for (final root in transfer.roots) {
@@ -2078,6 +2677,46 @@ class NasLibraryDatabase {
     return tags.values.toList(growable: false);
   }
 
+  List<NasLibraryTag> _tagsForRelation(
+    String condition,
+    List<Object?> parameters,
+  ) =>
+      _db.select('''
+        SELECT DISTINCT t.id, t.name, t.color, t.created_at, t.updated_at
+        FROM movies m
+        JOIN movie_tag_placements mtp ON mtp.movie_id = m.id
+        JOIN tag_placements tp ON tp.id = mtp.tag_placement_id
+        JOIN tags t ON t.id = tp.tag_id
+        WHERE $condition
+        ORDER BY t.name COLLATE NOCASE, t.id
+      ''', parameters).map(_mapTag).toList(growable: false);
+
+  List<NasRelatedActor> _relatedActorsForMovies(
+    String condition,
+    List<Object?> parameters,
+  ) {
+    final rows = _db.select('''
+      SELECT l.actor_id, COUNT(DISTINCT l.movie_id) AS movie_count
+      FROM movie_actor_links l
+      JOIN movies m ON m.id = l.movie_id
+      WHERE $condition
+      GROUP BY l.actor_id
+      ORDER BY movie_count DESC, l.actor_id ASC
+    ''', parameters);
+    return rows
+        .map((row) {
+          final actor = findActor(row['actor_id'] as String);
+          return actor == null
+              ? null
+              : NasRelatedActor(
+                  actor: actor,
+                  movieCount: row['movie_count'] as int,
+                );
+        })
+        .whereType<NasRelatedActor>()
+        .toList(growable: false);
+  }
+
   bool setMovieTaxonomy({
     required String movieId,
     required bool updateCategory,
@@ -2305,6 +2944,41 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _mapCarouselImage(rows.single);
   }
 
+  NasPublisher _mapPublisher(Row row) => NasPublisher(
+        id: row['id'] as String,
+        displayName: row['display_name'] as String,
+        originalName: row['original_name'] as String?,
+        countryRegion: row['country_region'] as String?,
+        foundedDate: row['founded_date'] as String?,
+        logoAssetId: row['logo_asset_id'] as String?,
+        movieCount: row['movie_count'] as int,
+        seriesCount: row['series_count'] as int,
+        durationMs: (row['duration_ms'] as int?) == 0
+            ? null
+            : row['duration_ms'] as int?,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+        archivedAt: row['archived_at'] as String?,
+      );
+
+  NasSeries _mapSeries(Row row) => NasSeries(
+        id: row['id'] as String,
+        displayName: row['display_name'] as String,
+        originalName: row['original_name'] as String?,
+        translatedName: row['translated_name'] as String?,
+        publisherId: row['publisher_id'] as String?,
+        releaseDate: row['release_date'] as String?,
+        posterAssetId: row['poster_asset_id'] as String?,
+        movieCount: row['movie_count'] as int,
+        episodeCount: row['episode_count'] as int,
+        durationMs: (row['duration_ms'] as int?) == 0
+            ? null
+            : row['duration_ms'] as int?,
+        createdAt: row['created_at'] as String,
+        updatedAt: row['updated_at'] as String,
+        archivedAt: row['archived_at'] as String?,
+      );
+
   NasActor _mapActor(Row row) => NasActor(
         id: row['id'] as String,
         stageName: row['stage_name'] as String?,
@@ -2321,7 +2995,7 @@ class NasLibraryDatabase {
         debutMonth: row['debut_month'] as String?,
         debutDescription: row['debut_description'] as String?,
         photoAssetId: row['photo_asset_id'] as String?,
-        publisherNames: _decodeTextList(row['publisher_names_json'] as String?),
+        publisherIds: publisherIdsForActor(row['id'] as String),
         movieCount: row['movie_count'] as int,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
@@ -2333,7 +3007,9 @@ class NasLibraryDatabase {
         title: row['title'] as String,
         originalTitle: row['original_title'] as String?,
         catalogNumber: row['catalog_number'] as String?,
+        publisherId: row['publisher_id'] as String?,
         publisherName: row['publisher_name'] as String?,
+        seriesId: row['series_id'] as String?,
         seriesName: row['series_name'] as String?,
         summary: row['summary'] as String,
         actors: _movieActors(row['id'] as String),
@@ -2362,7 +3038,9 @@ class NasLibraryDatabase {
       title: movie.title,
       originalTitle: movie.originalTitle,
       catalogNumber: movie.catalogNumber,
+      publisherId: movie.publisherId,
       publisherName: movie.publisherName,
+      seriesId: movie.seriesId,
       seriesName: movie.seriesName,
       summary: movie.summary,
       actors: movie.actors,

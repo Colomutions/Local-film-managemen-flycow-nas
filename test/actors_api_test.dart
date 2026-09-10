@@ -41,6 +41,16 @@ Future<void> main() async {
       'admin can upload actor photo',
     );
     final photoId = uploadedPhoto.json['data']['id'] as String;
+    final publisher = await _request(
+      baseUrl,
+      'POST',
+      '/api/v1/admin/publishers',
+      token: token,
+      body: {'displayName': '测试发行商'},
+    );
+    _expect(publisher.statusCode == HttpStatus.created,
+        'admin can create publisher entity');
+    final publisherId = publisher.json['data']['id'] as String;
 
     final created = await _request(
       baseUrl,
@@ -53,7 +63,7 @@ Future<void> main() async {
         'aliases': ['Test-Actor'],
         'gender': 'female',
         'bodyType': '柔弱',
-        'publisherNames': ['测试发行商'],
+        'publisherIds': [publisherId],
         'photoAssetId': photoId,
       },
     );
@@ -62,6 +72,10 @@ Future<void> main() async {
         as Map<String, dynamic>;
     final actorId = actor['id'] as String;
     _expect(actor['movieCount'] == 0, 'new actor has no movie relation');
+    _expect(
+      (actor['publishers'] as List<dynamic>).single['id'] == publisherId,
+      'actor stores publisher entity IDs instead of text',
+    );
 
     final searched = await _request(
       baseUrl,

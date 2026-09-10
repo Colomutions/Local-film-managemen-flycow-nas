@@ -18,6 +18,11 @@ import 'movie_actor.dart';
 import 'persistent_state.dart';
 import 'range.dart';
 
+String? _nullableTrimmed(String? value) {
+  final normalized = value?.trim();
+  return normalized == null || normalized.isEmpty ? null : normalized;
+}
+
 class NasHealthServer {
   NasHealthServer(
     this.config, {
@@ -322,6 +327,44 @@ class NasHealthServer {
           RegExp(r'^/api/v1/admin/actors/[^/]+/archive$').hasMatch(path)) {
         return await _archiveAdminActor(request);
       }
+      if (request.method == 'POST' && path == '/api/v1/admin/publishers') {
+        return await _createAdminPublisher(request);
+      }
+      if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/publishers/[^/]+$').hasMatch(path)) {
+        return await _updateAdminPublisher(request);
+      }
+      if (request.method == 'DELETE' &&
+          RegExp(r'^/api/v1/admin/publishers/[^/]+$').hasMatch(path)) {
+        return await _deleteAdminPublisher(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/publishers/[^/]+/archive$').hasMatch(path)) {
+        return await _archiveAdminPublisher(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/publishers/[^/]+/logo$').hasMatch(path)) {
+        return await _uploadAdminPublisherLogo(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/series') {
+        return await _createAdminSeries(request);
+      }
+      if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/series/[^/]+$').hasMatch(path)) {
+        return await _updateAdminSeries(request);
+      }
+      if (request.method == 'DELETE' &&
+          RegExp(r'^/api/v1/admin/series/[^/]+$').hasMatch(path)) {
+        return await _deleteAdminSeries(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/series/[^/]+/archive$').hasMatch(path)) {
+        return await _archiveAdminSeries(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/series/[^/]+/poster$').hasMatch(path)) {
+        return await _uploadAdminSeriesPoster(request);
+      }
       if (request.method == 'GET' && path == '/api/v1/movies') {
         return await _movies(request);
       }
@@ -330,6 +373,40 @@ class NasHealthServer {
       }
       if (request.method == 'GET' && path == '/api/v1/actors') {
         return await _actors(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/publishers') {
+        return await _publishers(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/series') {
+        return await _series(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/publishers/[^/]+/movies$').hasMatch(path)) {
+        return await _publisherMovies(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/publishers/[^/]+/series$').hasMatch(path)) {
+        return await _publisherSeries(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/publishers/[^/]+/actors$').hasMatch(path)) {
+        return await _publisherActors(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/publishers/[^/]+$').hasMatch(path)) {
+        return await _publisherDetails(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/series/[^/]+/movies$').hasMatch(path)) {
+        return await _seriesMovies(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/series/[^/]+/actors$').hasMatch(path)) {
+        return await _seriesActors(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/series/[^/]+$').hasMatch(path)) {
+        return await _seriesDetails(request);
       }
       if (request.method == 'GET' &&
           RegExp(r'^/api/v1/actors/[^/]+/coactors$').hasMatch(path)) {
@@ -797,6 +874,8 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final aliases = _stringListFromJson(values['aliases_json'] as String?);
+    final publisherIds =
+        (values.remove('publisher_ids') as List<String>?) ?? const <String>[];
     final similarActors = _libraryDatabase.findSimilarActors(
       stageName: values['stage_name'] as String?,
       originalName: values['original_name'] as String?,
@@ -818,9 +897,13 @@ class NasHealthServer {
       debutMonth: values['debut_month'] as String?,
       debutDescription: values['debut_description'] as String?,
       photoAssetId: photoAssetId,
-      publisherNames:
-          _stringListFromJson(values['publisher_names_json'] as String?),
     );
+    if (!_libraryDatabase.setActorPublisherIds(
+      actorId: actor.id,
+      publisherIds: publisherIds,
+    )) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
     await _writeJson(request.response, HttpStatus.created, {
       'data': {
         'actor': _actorPayload(actor),
@@ -843,12 +926,20 @@ class NasHealthServer {
             'actor_photo') {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final publisherIds = values.remove('publisher_ids') as List<String>?;
     final actor = _libraryDatabase.updateActor(
       request.uri.pathSegments.last,
       values,
     );
     if (actor == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (publisherIds != null &&
+        !_libraryDatabase.setActorPublisherIds(
+          actorId: actor.id,
+          publisherIds: publisherIds,
+        )) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     await _writeJson(request.response, HttpStatus.ok, {
       'data': _actorPayload(actor),
@@ -894,10 +985,543 @@ class NasHealthServer {
     });
   }
 
+  Future<void> _publishers(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '24') ?? 0;
+    final sort = parameters['sort'] ?? 'createdAt';
+    final order = parameters['order'] ?? 'desc';
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        !const {'createdAt', 'name', 'movieCount', 'seriesCount'}
+            .contains(sort) ||
+        !const {'asc', 'desc'}.contains(order)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final publishers = _libraryDatabase
+        .listPublishers(
+          query: parameters['q'] ?? '',
+          includeArchived: parameters['includeArchived'] == 'true',
+        )
+        .toList()
+      ..sort((left, right) => _comparePublishers(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final items = offset >= publishers.length
+        ? const <NasPublisher>[]
+        : publishers.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map(_publisherPayload).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': publishers.length,
+        'hasMore': offset + items.length < publishers.length,
+      },
+    });
+  }
+
+  Future<void> _publisherDetails(HttpRequest request) async {
+    final publisher =
+        _libraryDatabase.findPublisher(request.uri.pathSegments.last);
+    if (publisher == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _publisherPayload(publisher, includeTags: true),
+    });
+  }
+
+  Future<void> _publisherMovies(HttpRequest request) async {
+    final publisherId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findPublisher(publisherId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    return _relatedMovies(
+      request,
+      _libraryDatabase.moviesForPublisher(
+        publisherId,
+        query: request.uri.queryParameters['q'] ?? '',
+      ),
+    );
+  }
+
+  Future<void> _publisherSeries(HttpRequest request) async {
+    final publisherId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findPublisher(publisherId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '24') ?? 0;
+    final sort = parameters['sort'] ?? 'createdAt';
+    final order = parameters['order'] ?? 'desc';
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        !const {'createdAt', 'name', 'movieCount', 'releaseDate'}
+            .contains(sort) ||
+        !const {'asc', 'desc'}.contains(order)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final series = _libraryDatabase
+        .seriesForPublisher(publisherId, query: parameters['q'] ?? '')
+        .toList()
+      ..sort((left, right) => _compareSeries(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final items = offset >= series.length
+        ? const <NasSeries>[]
+        : series.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map(_seriesPayload).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': series.length,
+        'hasMore': offset + items.length < series.length,
+      },
+    });
+  }
+
+  Future<void> _publisherActors(HttpRequest request) async {
+    final publisherId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findPublisher(publisherId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    return _relatedActors(
+      request,
+      _libraryDatabase.actorsForPublisher(publisherId),
+    );
+  }
+
+  Future<void> _series(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '24') ?? 0;
+    final sort = parameters['sort'] ?? 'createdAt';
+    final order = parameters['order'] ?? 'desc';
+    final publisherId = parameters['publisherId'];
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        (publisherId != null &&
+            _libraryDatabase.findPublisher(publisherId) == null) ||
+        !const {'createdAt', 'name', 'movieCount', 'releaseDate'}
+            .contains(sort) ||
+        !const {'asc', 'desc'}.contains(order)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final series = _libraryDatabase
+        .listSeries(
+          query: parameters['q'] ?? '',
+          publisherId: publisherId,
+          includeArchived: parameters['includeArchived'] == 'true',
+        )
+        .toList()
+      ..sort((left, right) => _compareSeries(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final items = offset >= series.length
+        ? const <NasSeries>[]
+        : series.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map(_seriesPayload).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': series.length,
+        'hasMore': offset + items.length < series.length,
+      },
+    });
+  }
+
+  Future<void> _seriesDetails(HttpRequest request) async {
+    final series = _libraryDatabase.findSeries(request.uri.pathSegments.last);
+    if (series == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _seriesPayload(series, includeTags: true),
+    });
+  }
+
+  Future<void> _seriesMovies(HttpRequest request) async {
+    final seriesId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findSeries(seriesId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    return _relatedMovies(
+      request,
+      _libraryDatabase.moviesForSeries(
+        seriesId,
+        query: request.uri.queryParameters['q'] ?? '',
+      ),
+    );
+  }
+
+  Future<void> _seriesActors(HttpRequest request) async {
+    final seriesId = request.uri.pathSegments[3];
+    if (_libraryDatabase.findSeries(seriesId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    return _relatedActors(
+      request,
+      _libraryDatabase.actorsForSeries(seriesId),
+    );
+  }
+
+  Future<void> _relatedMovies(
+    HttpRequest request,
+    List<NasLibraryMovie> source,
+  ) async {
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '14') ?? 0;
+    final sort = parameters['sort'] ?? 'recent';
+    final order = parameters['order'] ?? 'desc';
+    final categoryId = parameters['categoryId'];
+    final resolutions = parameters['resolutions']
+        ?.split(',')
+        .where((value) => value.isNotEmpty)
+        .toSet();
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 14 ||
+        !const {'recent', 'createdAt', 'title', 'durationMs'}.contains(sort) ||
+        !const {'asc', 'desc'}.contains(order) ||
+        (categoryId != null &&
+            _libraryDatabase.findCategory(categoryId) == null)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movies = source
+        .where((movie) =>
+            (categoryId == null ||
+                _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
+            (resolutions == null ||
+                resolutions.isEmpty ||
+                (movie.resolutionLabel != null &&
+                    resolutions.contains(movie.resolutionLabel))))
+        .toList()
+      ..sort((left, right) => _compareActorMovies(left, right, sort, order));
+    final offset = (page - 1) * pageSize;
+    final items = offset >= movies.length
+        ? const <NasLibraryMovie>[]
+        : movies.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map(_databaseSummary).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': movies.length,
+        'hasMore': offset + items.length < movies.length,
+      },
+    });
+  }
+
+  Future<void> _relatedActors(
+    HttpRequest request,
+    List<NasRelatedActor> source,
+  ) async {
+    final page = int.tryParse(request.uri.queryParameters['page'] ?? '1') ?? 0;
+    final pageSize =
+        int.tryParse(request.uri.queryParameters['pageSize'] ?? '9') ?? 0;
+    if (page < 1 || pageSize < 1 || pageSize > 100) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final offset = (page - 1) * pageSize;
+    final items = offset >= source.length
+        ? const <NasRelatedActor>[]
+        : source.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': items
+            .map((item) => {
+                  'actor': _actorPayload(item.actor),
+                  'movieCount': item.movieCount,
+                })
+            .toList(growable: false),
+      },
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': source.length,
+        'hasMore': offset + items.length < source.length,
+      },
+    });
+  }
+
+  Future<void> _createAdminPublisher(HttpRequest request) async {
+    final values =
+        _publisherInputValues(await _readJsonBody(request), creating: true);
+    if (values == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final logoAssetId = values['logo_asset_id'] as String?;
+    if (logoAssetId != null &&
+        _libraryDatabase.findManagedAsset(logoAssetId)?.purpose !=
+            'publisher_logo') {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final publisher = _libraryDatabase.createPublisher(
+      displayName: values['display_name'] as String,
+      originalName: values['original_name'] as String?,
+      countryRegion: values['country_region'] as String?,
+      foundedDate: values['founded_date'] as String?,
+      logoAssetId: logoAssetId,
+    );
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': _publisherPayload(publisher),
+    });
+  }
+
+  Future<void> _updateAdminPublisher(HttpRequest request) async {
+    final values =
+        _publisherInputValues(await _readJsonBody(request), creating: false);
+    if (values == null || values.isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final logoAssetId = values['logo_asset_id'] as String?;
+    if (values.containsKey('logo_asset_id') &&
+        logoAssetId != null &&
+        _libraryDatabase.findManagedAsset(logoAssetId)?.purpose !=
+            'publisher_logo') {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final publisher = _libraryDatabase.updatePublisher(
+      request.uri.pathSegments.last,
+      values,
+    );
+    if (publisher == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _publisherPayload(publisher),
+    });
+  }
+
+  Future<void> _archiveAdminPublisher(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null || body.isNotEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final publisher =
+        _libraryDatabase.archivePublisher(request.uri.pathSegments[4]);
+    if (publisher == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _publisherPayload(publisher),
+    });
+  }
+
+  Future<void> _deleteAdminPublisher(HttpRequest request) async {
+    final id = request.uri.pathSegments.last;
+    final publisher = _libraryDatabase.findPublisher(id);
+    if (publisher == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (_libraryDatabase.publisherHasReferences(id)) {
+      return _error(request, HttpStatus.conflict, 'publisher_in_use');
+    }
+    final logo = publisher.logoAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(publisher.logoAssetId!);
+    if (!_libraryDatabase.deletePublisher(id)) {
+      return _error(request, HttpStatus.conflict, 'publisher_in_use');
+    }
+    await _deleteManagedAsset(logo);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'deleted': true},
+    });
+  }
+
+  Future<void> _createAdminSeries(HttpRequest request) async {
+    final values =
+        _seriesInputValues(await _readJsonBody(request), creating: true);
+    if (values == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final publisherId = values['publisher_id'] as String?;
+    final publisher = publisherId == null
+        ? null
+        : _libraryDatabase.findPublisher(publisherId);
+    final posterAssetId = values['poster_asset_id'] as String?;
+    if ((publisherId != null &&
+            (publisher == null || publisher.archivedAt != null)) ||
+        (posterAssetId != null &&
+            _libraryDatabase.findManagedAsset(posterAssetId)?.purpose !=
+                'series_poster')) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final series = _libraryDatabase.createSeries(
+      displayName: values['display_name'] as String,
+      publisherId: publisherId,
+      originalName: values['original_name'] as String?,
+      translatedName: values['translated_name'] as String?,
+      releaseDate: values['release_date'] as String?,
+      posterAssetId: posterAssetId,
+    );
+    await _writeJson(request.response, HttpStatus.created, {
+      'data': _seriesPayload(series),
+    });
+  }
+
+  Future<void> _updateAdminSeries(HttpRequest request) async {
+    final seriesId = request.uri.pathSegments.last;
+    final existing = _libraryDatabase.findSeries(seriesId);
+    if (existing == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final values =
+        _seriesInputValues(await _readJsonBody(request), creating: false);
+    if (values == null || values.isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final publisherId = values['publisher_id'] as String?;
+    final posterAssetId = values['poster_asset_id'] as String?;
+    if ((publisherId != null &&
+            (_libraryDatabase.findPublisher(publisherId)?.archivedAt != null ||
+                _libraryDatabase.findPublisher(publisherId) == null)) ||
+        (values.containsKey('publisher_id') &&
+            publisherId != existing.publisherId &&
+            existing.movieCount > 0) ||
+        (values.containsKey('poster_asset_id') &&
+            posterAssetId != null &&
+            _libraryDatabase.findManagedAsset(posterAssetId)?.purpose !=
+                'series_poster')) {
+      return _error(request, HttpStatus.conflict, 'series_in_use');
+    }
+    final series = _libraryDatabase.updateSeries(seriesId, values);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _seriesPayload(series!),
+    });
+  }
+
+  Future<void> _archiveAdminSeries(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null || body.isNotEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final series = _libraryDatabase.archiveSeries(request.uri.pathSegments[4]);
+    if (series == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _seriesPayload(series),
+    });
+  }
+
+  Future<void> _deleteAdminSeries(HttpRequest request) async {
+    final id = request.uri.pathSegments.last;
+    final series = _libraryDatabase.findSeries(id);
+    if (series == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (series.movieCount > 0) {
+      return _error(request, HttpStatus.conflict, 'series_in_use');
+    }
+    final poster = series.posterAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(series.posterAssetId!);
+    if (!_libraryDatabase.deleteSeries(id)) {
+      return _error(request, HttpStatus.conflict, 'series_in_use');
+    }
+    await _deleteManagedAsset(poster);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'deleted': true},
+    });
+  }
+
+  Future<void> _uploadAdminPublisherLogo(HttpRequest request) async {
+    final publisher =
+        _libraryDatabase.findPublisher(request.uri.pathSegments[4]);
+    if (publisher == null) {
+      await request.drain<void>();
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final asset = await _saveManagedImage(request, 'publisher_logo');
+    if (asset == null)
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    final previous = publisher.logoAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(publisher.logoAssetId!);
+    final updated = _libraryDatabase.updatePublisher(
+      publisher.id,
+      {'logo_asset_id': asset.id},
+    );
+    if (updated == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    await _deleteManagedAsset(previous);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _publisherPayload(updated),
+    });
+  }
+
+  Future<void> _uploadAdminSeriesPoster(HttpRequest request) async {
+    final series = _libraryDatabase.findSeries(request.uri.pathSegments[4]);
+    if (series == null) {
+      await request.drain<void>();
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final asset = await _saveManagedImage(request, 'series_poster');
+    if (asset == null)
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    final previous = series.posterAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(series.posterAssetId!);
+    final updated = _libraryDatabase.updateSeries(
+      series.id,
+      {'poster_asset_id': asset.id},
+    );
+    if (updated == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    await _deleteManagedAsset(previous);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _seriesPayload(updated),
+    });
+  }
+
+  Future<NasManagedAsset?> _saveManagedImage(
+    HttpRequest request,
+    String purpose,
+  ) async {
+    final mimeType = request.headers.contentType?.mimeType;
+    final bytes = await _readArtworkBytes(request, mimeType);
+    if (bytes == null || mimeType == null) return null;
+    final assetId = newUuidV4();
+    String? fileName;
+    try {
+      fileName = await _artworkService.saveManagedAsset(
+        assetId: assetId,
+        mimeType: mimeType,
+        bytes: bytes,
+      );
+      return _libraryDatabase.addManagedAsset(
+        id: assetId,
+        purpose: purpose,
+        fileName: fileName,
+        mimeType: mimeType,
+      );
+    } on ArgumentError {
+      if (fileName != null) await _artworkService.deleteManagedAsset(fileName);
+      return null;
+    }
+  }
+
+  Future<void> _deleteManagedAsset(NasManagedAsset? asset) async {
+    if (asset == null) return;
+    _libraryDatabase.removeManagedAsset(asset.id);
+    await _artworkService.deleteManagedAsset(asset.fileName);
+  }
+
   Future<void> _uploadManagedImage(HttpRequest request) async {
     final purpose = request.uri.queryParameters['purpose'];
     final mimeType = request.headers.contentType?.mimeType;
-    if (!const {'actor_photo', 'movie_poster'}.contains(purpose)) {
+    if (!const {
+      'actor_photo',
+      'movie_poster',
+      'publisher_logo',
+      'series_poster',
+    }.contains(purpose)) {
       await request.drain<void>();
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
@@ -1156,6 +1780,76 @@ class NasHealthServer {
     await request.response.close();
   }
 
+  Map<String, Object?> _publisherReferencePayload(NasPublisher publisher) => {
+        'id': publisher.id,
+        'displayName': publisher.displayName,
+      };
+
+  Map<String, Object?> _seriesReferencePayload(NasSeries series) => {
+        'id': series.id,
+        'displayName': series.displayName,
+        'publisherId': series.publisherId,
+      };
+
+  Map<String, Object?> _publisherPayload(
+    NasPublisher publisher, {
+    bool includeTags = false,
+  }) {
+    final logo = publisher.logoAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(publisher.logoAssetId!);
+    return {
+      ..._publisherReferencePayload(publisher),
+      'originalName': publisher.originalName,
+      'countryRegion': publisher.countryRegion,
+      'foundedDate': publisher.foundedDate,
+      'logoAsset': logo == null ? null : _managedAssetPayload(logo),
+      'movieCount': publisher.movieCount,
+      'seriesCount': publisher.seriesCount,
+      'durationMs': publisher.durationMs,
+      if (includeTags)
+        'tags': _libraryDatabase
+            .tagsForPublisher(publisher.id)
+            .map(_tagPayload)
+            .toList(growable: false),
+      'createdAt': publisher.createdAt,
+      'updatedAt': publisher.updatedAt,
+      'archivedAt': publisher.archivedAt,
+    };
+  }
+
+  Map<String, Object?> _seriesPayload(
+    NasSeries series, {
+    bool includeTags = false,
+  }) {
+    final publisher = series.publisherId == null
+        ? null
+        : _libraryDatabase.findPublisher(series.publisherId!);
+    final poster = series.posterAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(series.posterAssetId!);
+    return {
+      ..._seriesReferencePayload(series),
+      'originalName': series.originalName,
+      'translatedName': series.translatedName,
+      'publisher':
+          publisher == null ? null : _publisherReferencePayload(publisher),
+      'releaseDate': series.releaseDate,
+      'posterAsset': poster == null ? null : _managedAssetPayload(poster),
+      'movieCount': series.movieCount,
+      'episodeCount': series.episodeCount,
+      'durationMs': series.durationMs,
+      if (includeTags)
+        'tags': _libraryDatabase
+            .tagsForSeries(series.id)
+            .map(_tagPayload)
+            .toList(growable: false),
+      'createdAt': series.createdAt,
+      'updatedAt': series.updatedAt,
+      'archivedAt': series.archivedAt,
+    };
+  }
+
   Map<String, Object?> _actorPayload(NasActor actor) {
     final photoAsset = actor.photoAssetId == null
         ? null
@@ -1178,7 +1872,10 @@ class NasHealthServer {
       'debutDescription': actor.debutDescription,
       'photoAsset':
           photoAsset == null ? null : _managedAssetPayload(photoAsset),
-      'publisherNames': actor.publisherNames,
+      'publishers': _libraryDatabase
+          .publishersForActor(actor.id)
+          .map(_publisherReferencePayload)
+          .toList(growable: false),
       'movieCount': actor.movieCount,
       'createdAt': actor.createdAt,
       'updatedAt': actor.updatedAt,
@@ -1227,6 +1924,39 @@ class NasHealthServer {
     return order == 'asc' ? stable : -stable;
   }
 
+  int _comparePublishers(
+    NasPublisher left,
+    NasPublisher right,
+    String sort,
+    String order,
+  ) {
+    final compared = switch (sort) {
+      'name' => left.displayName.compareTo(right.displayName),
+      'movieCount' => left.movieCount.compareTo(right.movieCount),
+      'seriesCount' => left.seriesCount.compareTo(right.seriesCount),
+      _ => left.createdAt.compareTo(right.createdAt),
+    };
+    final stable = compared == 0 ? left.id.compareTo(right.id) : compared;
+    return order == 'asc' ? stable : -stable;
+  }
+
+  int _compareSeries(
+    NasSeries left,
+    NasSeries right,
+    String sort,
+    String order,
+  ) {
+    final compared = switch (sort) {
+      'name' => left.displayName.compareTo(right.displayName),
+      'movieCount' => left.movieCount.compareTo(right.movieCount),
+      'releaseDate' =>
+        _compareNullableString(left.releaseDate, right.releaseDate),
+      _ => left.createdAt.compareTo(right.createdAt),
+    };
+    final stable = compared == 0 ? left.id.compareTo(right.id) : compared;
+    return order == 'asc' ? stable : -stable;
+  }
+
   int _compareMovies(
     NasLibraryMovie left,
     NasLibraryMovie right,
@@ -1267,6 +1997,71 @@ class NasHealthServer {
     return left.compareTo(right);
   }
 
+  Map<String, Object?>? _publisherInputValues(
+    Map<String, dynamic>? body, {
+    required bool creating,
+  }) {
+    if (body == null) return null;
+    const fields = {
+      'displayName': 'display_name',
+      'originalName': 'original_name',
+      'countryRegion': 'country_region',
+      'foundedDate': 'founded_date',
+      'logoAssetId': 'logo_asset_id',
+    };
+    if (body.keys.any((key) => !fields.containsKey(key))) return null;
+    final values = <String, Object?>{};
+    for (final entry in body.entries) {
+      final value = entry.value;
+      if (value != null && value is! String) return null;
+      final normalized = value is String ? _nullableTrimmed(value) : null;
+      if (entry.key == 'displayName' && normalized == null) return null;
+      if (entry.key == 'foundedDate' &&
+          normalized != null &&
+          !RegExp(r'^\d{4}(-\d{2}(-\d{2})?)?$').hasMatch(normalized)) {
+        return null;
+      }
+      values[fields[entry.key]!] = normalized;
+    }
+    if (creating && (values['display_name'] as String?) == null) return null;
+    return values;
+  }
+
+  Map<String, Object?>? _seriesInputValues(
+    Map<String, dynamic>? body, {
+    required bool creating,
+  }) {
+    if (body == null) return null;
+    const fields = {
+      'displayName': 'display_name',
+      'originalName': 'original_name',
+      'translatedName': 'translated_name',
+      'publisherId': 'publisher_id',
+      'releaseDate': 'release_date',
+      'posterAssetId': 'poster_asset_id',
+    };
+    if (body.keys.any((key) => !fields.containsKey(key))) return null;
+    final values = <String, Object?>{};
+    for (final entry in body.entries) {
+      final value = entry.value;
+      if (value != null && value is! String) return null;
+      final normalized = value is String ? _nullableTrimmed(value) : null;
+      if (entry.key == 'displayName' && normalized == null) {
+        return null;
+      }
+      if (entry.key == 'releaseDate' &&
+          normalized != null &&
+          !RegExp(r'^\d{4}(-\d{2}(-\d{2})?)?$').hasMatch(normalized)) {
+        return null;
+      }
+      values[fields[entry.key]!] = normalized;
+    }
+    if (creating && (values['display_name'] as String?) == null) {
+      return null;
+    }
+    return values;
+  }
+
   Map<String, Object?>? _actorInputValues(
     Map<String, dynamic>? body, {
     required bool creating,
@@ -1287,7 +2082,7 @@ class NasHealthServer {
       'debutMonth': 'debut_month',
       'debutDescription': 'debut_description',
       'photoAssetId': 'photo_asset_id',
-      'publisherNames': 'publisher_names_json',
+      'publisherIds': 'publisher_ids',
     };
     if (body.keys.any((key) => !fields.containsKey(key))) return null;
     final values = <String, Object?>{};
@@ -1300,15 +2095,12 @@ class NasHealthServer {
             return null;
           values[databaseKey] =
               jsonEncode(_cleanTextValues(value.cast<String>()));
-        case 'publisherNames':
+        case 'publisherIds':
           if (value is! List || value.any((item) => item is! String))
             return null;
-          final publishers = _cleanTextValues(value.cast<String>());
-          if (publishers
-              .any((name) => !RegExp(r'^[\u4e00-\u9fff]+$').hasMatch(name))) {
-            return null;
-          }
-          values[databaseKey] = jsonEncode(publishers);
+          final publisherIds = _cleanTextValues(value.cast<String>());
+          if (publisherIds.length != value.length) return null;
+          values[databaseKey] = publisherIds;
         case 'gender':
           if (value != null &&
               !const {'female', 'intersex', 'male'}.contains(value))
@@ -1353,8 +2145,19 @@ class NasHealthServer {
         'title': movie.title,
         'originalTitle': movie.originalTitle,
         'catalogNumber': movie.catalogNumber,
-        'publisherName': movie.publisherName,
-        'seriesName': movie.seriesName,
+        'publisher': movie.publisherId == null
+            ? null
+            : {
+                'id': movie.publisherId,
+                'displayName': movie.publisherName,
+              },
+        'series': movie.seriesId == null
+            ? null
+            : {
+                'id': movie.seriesId,
+                'displayName': movie.seriesName,
+                'publisherId': movie.publisherId,
+              },
         'actors': nasMovieActorsToJson(movie.actors),
         'category': _categoryForMoviePayload(movie.id),
         'tags': _libraryDatabase
@@ -1969,8 +2772,8 @@ class NasHealthServer {
             key != 'title' &&
             key != 'originalTitle' &&
             key != 'catalogNumber' &&
-            key != 'publisherName' &&
-            key != 'seriesName' &&
+            key != 'publisherId' &&
+            key != 'seriesId' &&
             key != 'summary' &&
             key != 'actorIds' &&
             key != 'categoryId' &&
@@ -1982,10 +2785,10 @@ class NasHealthServer {
     final rawOriginalTitle = body['originalTitle'];
     final hasCatalogNumber = body.containsKey('catalogNumber');
     final rawCatalogNumber = body['catalogNumber'];
-    final hasPublisherName = body.containsKey('publisherName');
-    final rawPublisherName = body['publisherName'];
-    final hasSeriesName = body.containsKey('seriesName');
-    final rawSeriesName = body['seriesName'];
+    final hasPublisherId = body.containsKey('publisherId');
+    final rawPublisherId = body['publisherId'];
+    final hasSeriesId = body.containsKey('seriesId');
+    final rawSeriesId = body['seriesId'];
     final rawSummary = body['summary'];
     final hasActorIds = body.containsKey('actorIds');
     final rawActorIds = body['actorIds'];
@@ -2000,17 +2803,17 @@ class NasHealthServer {
         (hasCatalogNumber &&
             rawCatalogNumber != null &&
             rawCatalogNumber is! String) ||
-        (hasPublisherName &&
-            rawPublisherName != null &&
-            rawPublisherName is! String) ||
-        (hasSeriesName && rawSeriesName != null && rawSeriesName is! String) ||
+        (hasPublisherId &&
+            rawPublisherId != null &&
+            rawPublisherId is! String) ||
+        (hasSeriesId && rawSeriesId != null && rawSeriesId is! String) ||
         (rawSummary != null && rawSummary is! String) ||
         (hasActorIds && rawActorIds is! List) ||
         (rawTitle == null &&
             !hasOriginalTitle &&
             !hasCatalogNumber &&
-            !hasPublisherName &&
-            !hasSeriesName &&
+            !hasPublisherId &&
+            !hasSeriesId &&
             rawSummary == null &&
             !hasActorIds &&
             !hasCategoryId &&
@@ -2025,8 +2828,8 @@ class NasHealthServer {
     }
     final originalTitle = (rawOriginalTitle as String?)?.trim();
     final catalogNumber = (rawCatalogNumber as String?)?.trim();
-    final publisherName = (rawPublisherName as String?)?.trim();
-    final seriesName = (rawSeriesName as String?)?.trim();
+    final publisherId = (rawPublisherId as String?)?.trim();
+    final seriesId = (rawSeriesId as String?)?.trim();
     List<String>? actorIds;
     if (hasActorIds) {
       final rawList = rawActorIds as List;
@@ -2062,6 +2865,23 @@ class NasHealthServer {
         )) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final movieId = request.uri.pathSegments.last;
+    if (_libraryDatabase.findMovieForAdmin(movieId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    // 在写入任何影片字段前先验证系列与发行商的组合，避免 PATCH 局部成功。
+    final relationPreview = _libraryDatabase.resolveMovieRelations(
+      movieId: movieId,
+      publisherId:
+          publisherId == null || publisherId.isEmpty ? null : publisherId,
+      updatePublisherId: hasPublisherId,
+      seriesId: seriesId == null || seriesId.isEmpty ? null : seriesId,
+      updateSeriesId: hasSeriesId,
+    );
+    if (relationPreview == null) {
+      return _error(
+          request, HttpStatus.conflict, 'movie_series_publisher_conflict');
+    }
     final movie = _libraryDatabase.updateMovieMetadata(
       movieId: request.uri.pathSegments.last,
       title: title,
@@ -2071,15 +2891,22 @@ class NasHealthServer {
       catalogNumber:
           catalogNumber == null || catalogNumber.isEmpty ? null : catalogNumber,
       updateCatalogNumber: hasCatalogNumber,
-      publisherName:
-          publisherName == null || publisherName.isEmpty ? null : publisherName,
-      updatePublisherName: hasPublisherName,
-      seriesName: seriesName == null || seriesName.isEmpty ? null : seriesName,
-      updateSeriesName: hasSeriesName,
       summary: rawSummary as String?,
     );
     if (movie == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final updatedRelations = _libraryDatabase.updateMovieRelations(
+      movieId: movie.id,
+      publisherId:
+          publisherId == null || publisherId.isEmpty ? null : publisherId,
+      updatePublisherId: hasPublisherId,
+      seriesId: seriesId == null || seriesId.isEmpty ? null : seriesId,
+      updateSeriesId: hasSeriesId,
+    );
+    if (updatedRelations == null) {
+      return _error(
+          request, HttpStatus.conflict, 'movie_series_publisher_conflict');
     }
     if (actorIds != null &&
         !_libraryDatabase.setMovieActorIds(

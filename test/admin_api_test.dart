@@ -205,6 +205,65 @@ Future<void> main() async {
         as Map<String, dynamic>)['id'] as String;
     final actorTwoId = ((actorTwo.json['data'] as Map<String, dynamic>)['actor']
         as Map<String, dynamic>)['id'] as String;
+    final publisher = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/publishers',
+      token: adminToken,
+      body: {'displayName': '管理员发行商'},
+    );
+    _expect(publisher.statusCode == HttpStatus.created,
+        'admin creates publisher entity');
+    final publisherId =
+        (publisher.json['data'] as Map<String, dynamic>)['id'] as String;
+    final draftSeries = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/series',
+      token: adminToken,
+      body: {'displayName': '未归属草稿系列'},
+    );
+    _expect(
+      draftSeries.statusCode == HttpStatus.created &&
+          draftSeries.json['data']['publisherId'] == null,
+      'admin creates an unassigned series draft',
+    );
+    final draftSeriesId = draftSeries.json['data']['id'] as String;
+    final rejectedDraftLink = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}',
+      token: adminToken,
+      body: {'publisherId': null, 'seriesId': draftSeriesId},
+    );
+    _expectError(
+      rejectedDraftLink,
+      HttpStatus.conflict,
+      'movie_series_publisher_conflict',
+    );
+    final assignedDraft = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/series/$draftSeriesId',
+      token: adminToken,
+      body: {'publisherId': publisherId},
+    );
+    _expect(
+      assignedDraft.statusCode == HttpStatus.ok &&
+          assignedDraft.json['data']['publisherId'] == publisherId,
+      'draft series can receive a publisher before films are linked',
+    );
+    final series = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/series',
+      token: adminToken,
+      body: {'displayName': '管理员系列', 'publisherId': publisherId},
+    );
+    _expect(
+        series.statusCode == HttpStatus.created, 'admin creates series entity');
+    final seriesId =
+        (series.json['data'] as Map<String, dynamic>)['id'] as String;
     final movieUpdate = await _request(
       base,
       'PATCH',
@@ -214,8 +273,8 @@ Future<void> main() async {
         'title': '管理员标题',
         'originalTitle': 'Administrator Original',
         'catalogNumber': 'ABC-001',
-        'publisherName': '管理员发行商',
-        'seriesName': '管理员系列',
+        'publisherId': publisherId,
+        'seriesId': seriesId,
         'actorIds': [actorOneId, actorTwoId],
         'summary': '仅写入 NAS SQLite。',
       },
@@ -229,10 +288,28 @@ Future<void> main() async {
         'movie update returns original title');
     _expect(movieUpdate.json['data']['catalogNumber'] == 'ABC-001',
         'movie update returns catalog number');
-    _expect(movieUpdate.json['data']['publisherName'] == '管理员发行商',
-        'movie update returns publisher name');
-    _expect(movieUpdate.json['data']['seriesName'] == '管理员系列',
-        'movie update returns series name');
+    _expect(
+      movieUpdate.json['data']['publisher']['id'] == publisherId &&
+          movieUpdate.json['data']['publisher']['displayName'] == '管理员发行商',
+      'movie update returns publisher entity reference',
+    );
+    _expect(
+      movieUpdate.json['data']['series']['id'] == seriesId &&
+          movieUpdate.json['data']['series']['displayName'] == '管理员系列',
+      'movie update returns series entity reference',
+    );
+    final rejectedConflict = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}',
+      token: adminToken,
+      body: {'publisherId': null, 'seriesId': seriesId},
+    );
+    _expectError(
+      rejectedConflict,
+      HttpStatus.conflict,
+      'movie_series_publisher_conflict',
+    );
     final returnedActors = movieUpdate.json['data']['actors'] as List<dynamic>;
     _expect(
       returnedActors.length == 2 &&
@@ -244,6 +321,56 @@ Future<void> main() async {
     );
     _expect(movieUpdate.json['data']['summary'] == '仅写入 NAS SQLite。',
         'movie update returns summary');
+    final publisherDetails = await _request(
+      base,
+      'GET',
+      '/api/v1/publishers/$publisherId',
+      token: viewerToken,
+    );
+    _expect(
+      publisherDetails.statusCode == HttpStatus.ok &&
+          publisherDetails.json['data']['movieCount'] == 1 &&
+          publisherDetails.json['data']['seriesCount'] == 2,
+      'publisher detail aggregates movie and series counts',
+    );
+    final publisherMovies = await _request(
+      base,
+      'GET',
+      '/api/v1/publishers/$publisherId/movies?sort=title&page=1&pageSize=14',
+      token: viewerToken,
+    );
+    _expect(
+      (publisherMovies.json['data']['items'] as List<dynamic>).length == 1,
+      'publisher movies use relation pagination',
+    );
+    final seriesDetails = await _request(
+      base,
+      'GET',
+      '/api/v1/series/$seriesId',
+      token: viewerToken,
+    );
+    _expect(
+      seriesDetails.statusCode == HttpStatus.ok &&
+          seriesDetails.json['data']['episodeCount'] == 1,
+      'series detail aggregates episode count from linked movies',
+    );
+    final seriesActors = await _request(
+      base,
+      'GET',
+      '/api/v1/series/$seriesId/actors?page=1&pageSize=9',
+      token: viewerToken,
+    );
+    _expect(
+      (seriesActors.json['data']['items'] as List<dynamic>).length == 2,
+      'series actors aggregate linked movie actors',
+    );
+    final publisherDelete = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/publishers/$publisherId',
+      token: adminToken,
+    );
+    _expectError(publisherDelete, HttpStatus.conflict, 'publisher_in_use');
     final coactors = await _request(
       base,
       'GET',
