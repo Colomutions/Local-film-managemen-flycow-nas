@@ -1,0 +1,12 @@
+services:
+  mujing-nas:
+    volumes:
+      # 仅在 MUJING_ALLOW_SOURCE_RENAME=true 时使用；不要与只读双盘覆盖文件混用。
+      - type: bind
+        source: ${MEDIA_ROOT_DISK1:?Set MEDIA_ROOT_DISK1 in .env before enabling the dual writable-media overlay.}
+        target: /media/disk1
+        read_only: false
+      - type: bind
+        source: ${MEDIA_ROOT_DISK2:?Set MEDIA_ROOT_DISK2 in .env before enabling the dual writable-media overlay.}
+        target: /media/disk2
+        read_only: false

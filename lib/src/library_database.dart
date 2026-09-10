@@ -23,6 +23,8 @@ class NasLibraryMovie {
     required this.title,
     this.originalTitle,
     this.catalogNumber,
+    this.publisherName,
+    this.seriesName,
     required this.summary,
     required this.actors,
     required this.posterFileName,
@@ -39,6 +41,8 @@ class NasLibraryMovie {
   final String title;
   final String? originalTitle;
   final String? catalogNumber;
+  final String? publisherName;
+  final String? seriesName;
   final String summary;
   final List<NasMovieActor> actors;
   final String? posterFileName;
@@ -316,7 +320,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 15;
+  static const currentSchemaVersion = 16;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -647,6 +651,16 @@ class NasLibraryDatabase {
         [15, _now()],
       );
     }
+    if (current < 16) {
+      _db.execute('''
+        ALTER TABLE movies ADD COLUMN publisher_name TEXT;
+        ALTER TABLE movies ADD COLUMN series_name TEXT;
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [16, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -871,6 +885,7 @@ class NasLibraryDatabase {
     final catalogQueryLike = '%$normalizedCatalogQuery%';
     final rows = _db.select('''
       SELECT m.id, m.title, m.original_title, m.catalog_number,
+             m.publisher_name, m.series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
              m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
@@ -896,6 +911,8 @@ class NasLibraryDatabase {
               title: row['title'] as String,
               originalTitle: row['original_title'] as String?,
               catalogNumber: row['catalog_number'] as String?,
+              publisherName: row['publisher_name'] as String?,
+              seriesName: row['series_name'] as String?,
               summary: row['summary'] as String,
               actors: _movieActors(row['id'] as String),
               posterFileName: row['poster_file_name'] as String?,
@@ -1278,6 +1295,7 @@ class NasLibraryDatabase {
   NasLibraryMovie? findMovieForAdmin(String movieId) {
     final rows = _db.select('''
       SELECT m.id, m.title, m.original_title, m.catalog_number,
+             m.publisher_name, m.series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
              m.updated_at, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
@@ -1296,12 +1314,18 @@ class NasLibraryDatabase {
     bool updateOriginalTitle = false,
     String? catalogNumber,
     bool updateCatalogNumber = false,
+    String? publisherName,
+    bool updatePublisherName = false,
+    String? seriesName,
+    bool updateSeriesName = false,
     String? summary,
   }) {
     if (findMovieForAdmin(movieId) == null) return null;
     if (title == null &&
         !updateOriginalTitle &&
         !updateCatalogNumber &&
+        !updatePublisherName &&
+        !updateSeriesName &&
         summary == null) {
       return findMovieForAdmin(movieId);
     }
@@ -1318,6 +1342,14 @@ class NasLibraryDatabase {
     if (updateCatalogNumber) {
       assignments.add('catalog_number = ?');
       values.add(_nullableTrimmed(catalogNumber));
+    }
+    if (updatePublisherName) {
+      assignments.add('publisher_name = ?');
+      values.add(_nullableTrimmed(publisherName));
+    }
+    if (updateSeriesName) {
+      assignments.add('series_name = ?');
+      values.add(_nullableTrimmed(seriesName));
     }
     if (summary != null) {
       assignments.add('summary = ?');
@@ -2223,6 +2255,16 @@ class NasLibraryDatabase {
         FROM movie_carousel_images WHERE movie_id = ? ORDER BY created_at, id
       ''', [movieId]).map(_mapCarouselImage).toList(growable: false);
 
+  String? lastPlaybackStartedAtForMovie(String movieId) {
+    final rows = _db.select('''
+      SELECT started_at FROM playback_history
+      WHERE movie_id = ?
+      ORDER BY started_at DESC, id DESC
+      LIMIT 1
+    ''', [movieId]);
+    return rows.isEmpty ? null : rows.single['started_at'] as String?;
+  }
+
   NasCarouselImage? addCarouselImage({
     required String movieId,
     required String fileName,
@@ -2291,6 +2333,8 @@ class NasLibraryDatabase {
         title: row['title'] as String,
         originalTitle: row['original_title'] as String?,
         catalogNumber: row['catalog_number'] as String?,
+        publisherName: row['publisher_name'] as String?,
+        seriesName: row['series_name'] as String?,
         summary: row['summary'] as String,
         actors: _movieActors(row['id'] as String),
         posterFileName: row['poster_file_name'] as String?,
@@ -2318,6 +2362,8 @@ class NasLibraryDatabase {
       title: movie.title,
       originalTitle: movie.originalTitle,
       catalogNumber: movie.catalogNumber,
+      publisherName: movie.publisherName,
+      seriesName: movie.seriesName,
       summary: movie.summary,
       actors: movie.actors,
       posterFileName: movie.posterFileName,

@@ -57,6 +57,10 @@ Future<void> main() async {
             updateOriginalTitle: true,
             catalogNumber: 'ABC-001',
             updateCatalogNumber: true,
+            publisherName: '测试发行商',
+            updatePublisherName: true,
+            seriesName: '测试系列',
+            updateSeriesName: true,
           ) !=
           null,
       'database updates movie metadata',
@@ -71,6 +75,10 @@ Future<void> main() async {
         'database stores the original title');
     _expect(linkedMovie.catalogNumber == 'ABC-001',
         'database stores the catalog number');
+    _expect(linkedMovie.publisherName == '测试发行商',
+        'database stores the publisher name');
+    _expect(
+        linkedMovie.seriesName == '测试系列', 'database stores the series name');
     _expect(
         linkedMovie.actors.length == 2 &&
             linkedMovie.actors.any((actor) =>
@@ -90,6 +98,9 @@ Future<void> main() async {
         'scanner stores probed dimensions');
     _expect(episode.resolutionLabel == '1080P',
         'scanner stores normalized resolution label');
+    database.recordPlaybackStarted(movieId: movie.id, episodeId: episode.id);
+    _expect(database.lastPlaybackStartedAtForMovie(movie.id) != null,
+        'database returns the latest playback timestamp for a movie');
     final secondScan = await database.scanConfiguredRoot(
       rootName: '测试媒体根',
       containerPath: mediaRoot.path,
@@ -111,7 +122,9 @@ Future<void> main() async {
     _expect(reopenedMovie.id == movie.id, 'SQLite data survives reopen');
     _expect(
         reopenedMovie.originalTitle == 'Sample Original' &&
-            reopenedMovie.catalogNumber == 'ABC-001',
+            reopenedMovie.catalogNumber == 'ABC-001' &&
+            reopenedMovie.publisherName == '测试发行商' &&
+            reopenedMovie.seriesName == '测试系列',
         'movie identity metadata survives reopen');
     _expect(
       reopenedMovie.actors.any((actor) =>

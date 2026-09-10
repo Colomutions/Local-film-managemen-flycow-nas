@@ -214,6 +214,8 @@ Future<void> main() async {
         'title': '管理员标题',
         'originalTitle': 'Administrator Original',
         'catalogNumber': 'ABC-001',
+        'publisherName': '管理员发行商',
+        'seriesName': '管理员系列',
         'actorIds': [actorOneId, actorTwoId],
         'summary': '仅写入 NAS SQLite。',
       },
@@ -227,6 +229,10 @@ Future<void> main() async {
         'movie update returns original title');
     _expect(movieUpdate.json['data']['catalogNumber'] == 'ABC-001',
         'movie update returns catalog number');
+    _expect(movieUpdate.json['data']['publisherName'] == '管理员发行商',
+        'movie update returns publisher name');
+    _expect(movieUpdate.json['data']['seriesName'] == '管理员系列',
+        'movie update returns series name');
     final returnedActors = movieUpdate.json['data']['actors'] as List<dynamic>;
     _expect(
       returnedActors.length == 2 &&

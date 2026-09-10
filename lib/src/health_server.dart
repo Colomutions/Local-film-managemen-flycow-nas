@@ -1353,6 +1353,8 @@ class NasHealthServer {
         'title': movie.title,
         'originalTitle': movie.originalTitle,
         'catalogNumber': movie.catalogNumber,
+        'publisherName': movie.publisherName,
+        'seriesName': movie.seriesName,
         'actors': nasMovieActorsToJson(movie.actors),
         'category': _categoryForMoviePayload(movie.id),
         'tags': _libraryDatabase
@@ -1396,7 +1398,10 @@ class NasHealthServer {
     }
     return {
       ..._databaseSummary(movie),
+      'actors':
+          movie.actors.map(_movieActorDetailsPayload).toList(growable: false),
       'summary': movie.summary,
+      'lastPlayedAt': _libraryDatabase.lastPlaybackStartedAtForMovie(movie.id),
       'episodes': episodes,
       'carouselImages': _libraryDatabase
           .carouselImagesForMovie(movie.id)
@@ -1407,6 +1412,20 @@ class NasHealthServer {
             },
           )
           .toList(growable: false),
+    };
+  }
+
+  Map<String, Object?> _movieActorDetailsPayload(NasMovieActor relation) {
+    final actorId = relation.id;
+    final actor = actorId == null ? null : _libraryDatabase.findActor(actorId);
+    final photoAsset = actor?.photoAssetId == null
+        ? null
+        : _libraryDatabase.findManagedAsset(actor!.photoAssetId!);
+    return {
+      ...relation.toJson(),
+      'originalName': actor?.originalName,
+      'photoAsset':
+          photoAsset == null ? null : _managedAssetPayload(photoAsset),
     };
   }
 
@@ -1950,6 +1969,8 @@ class NasHealthServer {
             key != 'title' &&
             key != 'originalTitle' &&
             key != 'catalogNumber' &&
+            key != 'publisherName' &&
+            key != 'seriesName' &&
             key != 'summary' &&
             key != 'actorIds' &&
             key != 'categoryId' &&
@@ -1961,6 +1982,10 @@ class NasHealthServer {
     final rawOriginalTitle = body['originalTitle'];
     final hasCatalogNumber = body.containsKey('catalogNumber');
     final rawCatalogNumber = body['catalogNumber'];
+    final hasPublisherName = body.containsKey('publisherName');
+    final rawPublisherName = body['publisherName'];
+    final hasSeriesName = body.containsKey('seriesName');
+    final rawSeriesName = body['seriesName'];
     final rawSummary = body['summary'];
     final hasActorIds = body.containsKey('actorIds');
     final rawActorIds = body['actorIds'];
@@ -1975,11 +2000,17 @@ class NasHealthServer {
         (hasCatalogNumber &&
             rawCatalogNumber != null &&
             rawCatalogNumber is! String) ||
+        (hasPublisherName &&
+            rawPublisherName != null &&
+            rawPublisherName is! String) ||
+        (hasSeriesName && rawSeriesName != null && rawSeriesName is! String) ||
         (rawSummary != null && rawSummary is! String) ||
         (hasActorIds && rawActorIds is! List) ||
         (rawTitle == null &&
             !hasOriginalTitle &&
             !hasCatalogNumber &&
+            !hasPublisherName &&
+            !hasSeriesName &&
             rawSummary == null &&
             !hasActorIds &&
             !hasCategoryId &&
@@ -1994,6 +2025,8 @@ class NasHealthServer {
     }
     final originalTitle = (rawOriginalTitle as String?)?.trim();
     final catalogNumber = (rawCatalogNumber as String?)?.trim();
+    final publisherName = (rawPublisherName as String?)?.trim();
+    final seriesName = (rawSeriesName as String?)?.trim();
     List<String>? actorIds;
     if (hasActorIds) {
       final rawList = rawActorIds as List;
@@ -2038,6 +2071,11 @@ class NasHealthServer {
       catalogNumber:
           catalogNumber == null || catalogNumber.isEmpty ? null : catalogNumber,
       updateCatalogNumber: hasCatalogNumber,
+      publisherName:
+          publisherName == null || publisherName.isEmpty ? null : publisherName,
+      updatePublisherName: hasPublisherName,
+      seriesName: seriesName == null || seriesName.isEmpty ? null : seriesName,
+      updateSeriesName: hasSeriesName,
       summary: rawSummary as String?,
     );
     if (movie == null) {

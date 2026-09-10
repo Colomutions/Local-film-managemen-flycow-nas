@@ -1,0 +1,12 @@
+services:
+  mujing-nas:
+    volumes:
+      # 两块盘分别挂到稳定的容器内子目录，Windows 端可绑定 disk1/… 或 disk2/… 的类别目录。
+      - type: bind
+        source: ${MEDIA_ROOT_DISK1:?Set MEDIA_ROOT_DISK1 in .env before enabling the dual-media overlay.}
+        target: /media/disk1
+        read_only: true
+      - type: bind
+        source: ${MEDIA_ROOT_DISK2:?Set MEDIA_ROOT_DISK2 in .env before enabling the dual-media overlay.}
+        target: /media/disk2
+        read_only: true

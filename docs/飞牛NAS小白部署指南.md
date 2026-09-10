@@ -248,6 +248,34 @@ sudo docker inspect mujing-nas \
 
 重要：启用媒体后，以后每次创建或重建容器都必须同时带上 `docker-compose.media.yml`。如果只执行基础 `docker compose up`，新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
 
+### 两块媒体盘
+
+两块盘不能继续使用 `docker-compose.media.yml`，该文件只读取单数 `MEDIA_ROOT`。在 `.env` 中改为每行一个变量：
+
+```dotenv
+MEDIA_ROOT_DISK1=/vol2/1000/first movies
+MEDIA_ROOT_DISK2=/vol1/1000/second movies
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
+```
+
+使用项目提供的双盘只读覆盖文件：
+
+```bash
+sudo -H docker compose --env-file .env \
+  -f docker-compose.yml \
+  -f docker-compose.media.dual.yml \
+  config
+
+sudo -H docker compose --env-file .env \
+  -f docker-compose.yml \
+  -f docker-compose.media.dual.yml \
+  up -d --build --force-recreate
+```
+
+容器内两块盘固定为 `/media/disk1` 与 `/media/disk2`。Windows 端绑定类别时，填写 `disk1/子目录` 或 `disk2/子目录`；后续每次重建也必须继续带上同一个双盘覆盖文件。若启用源文件改名，改用 `docker-compose.media.dual-writable.yml`，同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`，且不能与只读双盘文件混用。
+
+如果此前以单盘 `/media` 根目录扫描过影片，已有数据库路径不会自动补上 `disk1/` 或 `disk2/`。不要删除 `data`；在 Windows 管理端将原分类重新绑定到对应 `disk1/子目录` 或 `disk2/子目录` 并重新扫描即可。
+
 普通部署应保持上述只读模式。如果确实需要在 Windows 管理端同步修改分集源文件名，仓库另有 `docker-compose.media-writable.yml`，且必须同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`。这是独立的高风险选择，不能与只读覆盖混用；启用前先备份，并完整阅读根目录 README 的“受控源文件改名”说明。
 
 ## 9. 首次建立影片类别并扫描

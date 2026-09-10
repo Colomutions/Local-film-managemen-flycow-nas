@@ -36,6 +36,25 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml
 
 该覆盖文件把媒体目录以**只读**方式挂到容器 `/media`。扫描只读取该目录；默认不会修改源媒体。
 
+### 双盘媒体库
+
+两块媒体盘不能只设置 `MEDIA_ROOT_DISK1` 和 `MEDIA_ROOT_DISK2` 后继续使用单盘覆盖文件；应在未跟踪的 `.env` 中设置两个 NAS 绝对路径，并使用双盘覆盖文件：
+
+```dotenv
+MEDIA_ROOT_DISK1=/vol2/1000/first movies
+MEDIA_ROOT_DISK2=/vol1/1000/second movies
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
+```
+
+```text
+sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml build --pull=false
+sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml up -d --force-recreate
+```
+
+两个目录分别只读挂载为 `/media/disk1` 和 `/media/disk2`。Windows 管理端创建或绑定影片类别时，选择相对于 `/media` 的 `disk1/子目录` 或 `disk2/子目录`；两个盘的文件都不会暴露 NAS 宿主机绝对路径。若明确开启 `MUJING_ALLOW_SOURCE_RENAME=true`，才可改用 `docker-compose.media.dual-writable.yml`；不可与只读双盘覆盖文件混用。
+
+从单盘挂载迁移到双盘挂载时，已有 SQLite 条目的相对路径不含 `disk1/` 或 `disk2/` 前缀，首次启动后会显示为不可用。保留 `./data`，在 Windows 管理端将每个既有类别重新绑定到 `disk1/子目录` 或 `disk2/子目录` 后重新扫描；不要删除数据目录来“修复”路径。
+
 ### 受控源文件改名（默认关闭）
 
 只有需要从 Windows 管理员页面执行“同目录改名”时，用户才可在 `.env` 显式设置 `MUJING_ALLOW_SOURCE_RENAME=true`，并改用 `docker-compose.media-writable.yml`，而不是只读覆盖文件：
@@ -191,4 +210,6 @@ test/                 不依赖第三方包的本地测试
 docker-compose.yml    最小服务与持久数据卷
 docker-compose.media.yml  默认只读媒体卷
 docker-compose.media-writable.yml  显式启用的可写媒体卷
+docker-compose.media.dual.yml  两块盘的默认只读媒体卷
+docker-compose.media.dual-writable.yml  两块盘的显式可写媒体卷
 ```
