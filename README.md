@@ -22,36 +22,37 @@ DeepSeek 影片资料识别仅在 Windows 本机影片编辑流程中运行。NA
 2. 复制 `.env.example` 为 `.env`，并设置 `PUID`、`PGID` 和端口。`PUID:PGID` 必须对 `./data` 有写权限；它表示容器内进程访问 NAS 文件时采用的 Linux 用户/组编号。
 3. 主编排文件只挂载 `./data:/data`。服务身份与设备令牌哈希保存在 `/data/state/server.json`；原始令牌和配对码不会写入该文件。
 
-真实媒体目录尚未确定，因此默认不挂载。以后要启用媒体卷，先在 `.env` 设置一个已经存在的 NAS 目录：
+真实媒体目录尚未确定，因此最小服务默认不挂载。启用真实媒体时，**双媒体盘是默认部署方式**：在 `.env` 设置两个已经存在的 NAS 目录：
 
 ```dotenv
-MEDIA_ROOT=/你的/NAS/媒体目录
+MEDIA_ROOT_DISK1=/你的/NAS/媒体目录一
+MEDIA_ROOT_DISK2=/你的/NAS/媒体目录二
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/相对测试文件.mp4
 ```
 
-然后使用媒体覆盖文件启动：
+然后使用双盘只读媒体覆盖文件启动：
 
 ```text
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml up -d --build
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml up -d --build
 ```
 
-该覆盖文件把媒体目录以**只读**方式挂到容器 `/media`。扫描只读取该目录；默认不会修改源媒体。
+该覆盖文件把两个媒体目录以**只读**方式挂到容器 `/media/disk1`、`/media/disk2`。扫描只读取该目录；默认不会修改源媒体。
 
-### 双盘媒体库
+### 单媒体盘（仅在明确选择时）
 
-两块媒体盘不能只设置 `MEDIA_ROOT_DISK1` 和 `MEDIA_ROOT_DISK2` 后继续使用单盘覆盖文件；应在未跟踪的 `.env` 中设置两个 NAS 绝对路径，并使用双盘覆盖文件：
+单媒体盘只能在明确不使用默认双盘方案时启用。在未跟踪的 `.env` 中设置一个 NAS 绝对路径，并使用单盘覆盖文件：
 
 ```dotenv
-MEDIA_ROOT_DISK1=/vol2/1000/first movies
-MEDIA_ROOT_DISK2=/vol1/1000/second movies
-MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
+MEDIA_ROOT=/vol2/1000/movies
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=动漫/样片.mp4
 ```
 
 ```text
-sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml build --pull=false
-sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml up -d --force-recreate
+sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml build --pull=false
+sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml up -d --force-recreate
 ```
 
-两个目录分别只读挂载为 `/media/disk1` 和 `/media/disk2`。Windows 管理端创建或绑定影片类别时，选择相对于 `/media` 的 `disk1/子目录` 或 `disk2/子目录`；两个盘的文件都不会暴露 NAS 宿主机绝对路径。若明确开启 `MUJING_ALLOW_SOURCE_RENAME=true`，才可改用 `docker-compose.media.dual-writable.yml`；不可与只读双盘覆盖文件混用。
+单盘目录只读挂载为 `/media`。Windows 管理端创建或绑定影片类别时，选择相对于 `/media` 的子目录。双盘与单盘覆盖文件、环境变量不得混用；若明确开启 `MUJING_ALLOW_SOURCE_RENAME=true`，才可改用相应的可写覆盖文件。
 
 从单盘挂载迁移到双盘挂载时，已有 SQLite 条目的相对路径不含 `disk1/` 或 `disk2/` 前缀，首次启动后会显示为不可用。保留 `./data`，在 Windows 管理端将每个既有类别重新绑定到 `disk1/子目录` 或 `disk2/子目录` 后重新扫描；不要删除数据目录来“修复”路径。
 
@@ -89,7 +90,7 @@ curl http://<NAS 局域网地址>:48291/health
 以下 `dart` 命令只适用于安装了 Dart SDK 的开发机；飞牛 NAS 宿主机默认不安装 Dart，出现 `dart: command not found` 属于预期。NAS 上应使用 Docker 构建验证，Dockerfile 会在构建阶段执行 `dart pub get` 与 `dart compile exe`：
 
 ```text
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml build --pull=false
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml build --pull=false
 ```
 
 在开发机上可不依赖 Docker 运行最小测试：
@@ -139,8 +140,9 @@ dart run test/startup_integrity_test.dart
 隔离的协议测试还可以把 fixture 显式绑定到一个真实媒体文件。该能力不用于生产影片库；必须同时启用媒体覆盖文件，并在未跟踪 `.env` 中设置：
 
 ```dotenv
-MEDIA_ROOT=/NAS/上的实际媒体目录
-MUJING_FIXTURE_MEDIA_RELATIVE_PATH=相对于媒体目录的/test.mp4
+MEDIA_ROOT_DISK1=/NAS/上的实际媒体目录一
+MEDIA_ROOT_DISK2=/NAS/上的实际媒体目录二
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/相对于媒体目录的/test.mp4
 ```
 
 服务端只接受相对路径，拒绝绝对路径、`..` 路径逃逸，并在每次流请求时解析符号链接，确保最终文件仍位于容器 `/media` 根内。该配置可在部署时手动提供；本任务没有配置页面，也不会把宿主机路径返回给客户端。
@@ -208,8 +210,8 @@ bin/                  进程入口
 lib/src/              配置和健康服务
 test/                 不依赖第三方包的本地测试
 docker-compose.yml    最小服务与持久数据卷
-docker-compose.media.yml  默认只读媒体卷
-docker-compose.media-writable.yml  显式启用的可写媒体卷
-docker-compose.media.dual.yml  两块盘的默认只读媒体卷
+docker-compose.media.dual.yml  默认双盘只读媒体卷
 docker-compose.media.dual-writable.yml  两块盘的显式可写媒体卷
+docker-compose.media.yml  明确选择单盘时的只读媒体卷
+docker-compose.media-writable.yml  明确选择单盘时的可写媒体卷
 ```

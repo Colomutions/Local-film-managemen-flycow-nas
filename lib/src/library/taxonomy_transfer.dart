@@ -17,21 +17,28 @@ class NasTaxonomyCategoryDefinition {
       };
 }
 
+/// 标签导入定义以实体层级和父实体名称表达，不再使用路径位置。
 class NasTaxonomyTagDefinition {
   const NasTaxonomyTagDefinition({
     required this.name,
+    required this.level,
+    this.description = '',
     this.color,
     this.parents = const [],
   });
 
   final String name;
+  final int level;
+  final String description;
   final String? color;
   final List<String> parents;
 
-  Map<String, Object> toJson({required bool child}) => {
+  Map<String, Object> toJson() => {
         'name': name,
+        'level': level,
+        if (description.isNotEmpty) 'description': description,
         if (color != null) 'color': color!,
-        if (child) 'parents': parents,
+        if (level > 1) 'parents': parents,
       };
 }
 
@@ -71,24 +78,19 @@ class NasCategoryTaxonomyTransfer {
 
 class NasTagTaxonomyTransfer {
   const NasTagTaxonomyTransfer({
-    required this.roots,
-    required this.children,
+    required this.tags,
     this.sourceSkipped = const [],
     this.validationConflicts = const [],
   });
 
-  final List<NasTaxonomyTagDefinition> roots;
-  final List<NasTaxonomyTagDefinition> children;
+  final List<NasTaxonomyTagDefinition> tags;
   final List<String> sourceSkipped;
   final List<String> validationConflicts;
 
   Map<String, Object> toJson() => {
         'format': 'mujing-tags',
-        'version': 1,
-        'tags': {
-          'roots': roots.map((item) => item.toJson(child: false)).toList(),
-          'children': children.map((item) => item.toJson(child: true)).toList(),
-        },
+        'version': 2,
+        'tags': tags.map((item) => item.toJson()).toList(),
       };
 
   String encode() => const JsonEncoder.withIndent('  ').convert(toJson());
@@ -99,84 +101,92 @@ class NasTagTaxonomyTransfer {
     if (!_hasOnly(map, const {'format', 'version', 'tags'}) ||
         !map.keys.toSet().containsAll(const {'format', 'version', 'tags'}) ||
         map['format'] != 'mujing-tags' ||
-        map['version'] != 1 ||
-        map['tags'] is! Map) {
-      throw const FormatException('不是幕境标签定义文件');
+        map['version'] != 2 ||
+        map['tags'] is! List) {
+      throw const FormatException('不是三级幕境标签定义文件');
     }
-    final tags = Map<String, dynamic>.from(map['tags'] as Map);
-    if (!_hasOnly(tags, const {'roots', 'children'}) ||
-        !tags.keys.toSet().containsAll(const {'roots', 'children'}) ||
-        tags['roots'] is! List ||
-        tags['children'] is! List) {
-      throw const FormatException('tags 只能包含 roots 和 children');
-    }
-    final sourceSkipped = <String>[];
-    final validationConflicts = <String>[];
-    final roots = _tagRoots(tags['roots'], sourceSkipped);
-    final rootNames = {
-      for (final root in roots) normalizeTaxonomyName(root.name),
-    };
-    final children = <NasTaxonomyTagDefinition>[];
-    final childNames = <String>{};
-    for (final raw in tags['children'] as List) {
-      if (raw is! Map) throw const FormatException('二级标签必须是对象');
+
+    final skipped = <String>[];
+    final conflicts = <String>[];
+    final definitions = <NasTaxonomyTagDefinition>[];
+    final levelsByName = <String, int>{};
+
+    for (final raw in map['tags'] as List) {
+      if (raw is! Map) throw const FormatException('标签项必须是对象');
       final item = Map<String, dynamic>.from(raw);
-      if (!_hasOnly(item, const {'name', 'color', 'parents'}) ||
+      if (!_hasOnly(item, const {'name', 'description', 'color', 'level', 'parents'}) ||
           !item.containsKey('name') ||
-          !item.containsKey('parents') ||
+          !item.containsKey('level') ||
           item['name'] is! String ||
+          item['level'] is! int ||
+          (item['description'] != null && item['description'] is! String) ||
           (item['color'] != null && item['color'] is! String) ||
-          item['parents'] is! List) {
-        throw const FormatException('二级标签结构无效');
+          (item['parents'] != null && item['parents'] is! List)) {
+        throw const FormatException('标签项结构无效');
       }
-      final name = _requiredName(item['name'], '二级标签');
+      final name = _requiredName(item['name'], '标签');
+      final level = item['level'] as int;
+      final description = (item['description'] as String? ?? '').trim();
       final color = item['color'] as String?;
-      if (!isValidTaxonomyColor(color)) {
-        throw const FormatException('颜色必须是 #RRGGBB');
+      if (level < 1 || level > 3 || !isValidTaxonomyColor(color)) {
+        throw const FormatException('标签层级或颜色无效');
       }
-      final normalizedName = normalizeTaxonomyName(name);
-      if (rootNames.contains(normalizedName)) {
-        validationConflicts.add('标签层级冲突：$name 同时定义为一级和二级标签');
-        continue;
-      }
-      if (!childNames.add(normalizedName)) {
-        sourceSkipped.add('二级标签（文件重复）：$name');
-        continue;
-      }
+
       final parents = <String>[];
       final seenParents = <String>{};
-      var hasUnknownParent = false;
-      for (final rawParent in item['parents'] as List) {
-        final parent = _requiredName(rawParent, '二级标签父级');
-        if (!seenParents.add(normalizeTaxonomyName(parent))) {
-          sourceSkipped.add('标签归属（文件重复）：$parent → $name');
-          continue;
-        }
-        if (!rootNames.contains(normalizeTaxonomyName(parent))) {
-          validationConflicts.add('二级标签父级不存在：$parent → $name');
-          hasUnknownParent = true;
+      for (final rawParent in item['parents'] as List? ?? const []) {
+        final parent = _requiredName(rawParent, '标签父级');
+        final parentKey = normalizeTaxonomyName(parent);
+        if (!seenParents.add(parentKey)) {
+          skipped.add('标签归属（文件重复）：$parent → $name');
           continue;
         }
         parents.add(parent);
       }
-      if (parents.isEmpty) {
-        if (!hasUnknownParent) {
-          validationConflicts.add('二级标签缺少一级归属：$name');
+      if (level == 1 && parents.isNotEmpty) {
+        conflicts.add('一级标签不能指定父级：$name');
+        continue;
+      }
+      if (level > 1 && parents.isEmpty) {
+        conflicts.add('${_levelName(level)}标签缺少有效父级：$name');
+        continue;
+      }
+
+      final key = normalizeTaxonomyName(name);
+      final existingLevel = levelsByName[key];
+      if (existingLevel != null) {
+        if (existingLevel != level) {
+          conflicts.add('标签层级冲突：$name 同时定义为${_levelName(existingLevel)}和${_levelName(level)}标签');
+        } else {
+          skipped.add('${_levelName(level)}标签（文件重复）：$name');
         }
         continue;
       }
-      if (hasUnknownParent) continue;
-      children.add(NasTaxonomyTagDefinition(
+      levelsByName[key] = level;
+      definitions.add(NasTaxonomyTagDefinition(
         name: name,
+        level: level,
+        description: description,
         color: color,
         parents: parents,
       ));
     }
+
+    for (final definition in definitions) {
+      if (definition.level == 1) continue;
+      for (final parent in definition.parents) {
+        final parentLevel = levelsByName[normalizeTaxonomyName(parent)];
+        if (parentLevel != null && parentLevel != definition.level - 1) {
+          conflicts.add(
+            '${_levelName(definition.level)}标签父级层级错误：$parent → ${definition.name}',
+          );
+        }
+      }
+    }
     return NasTagTaxonomyTransfer(
-      roots: roots,
-      children: children,
-      sourceSkipped: sourceSkipped,
-      validationConflicts: validationConflicts,
+      tags: definitions,
+      sourceSkipped: skipped,
+      validationConflicts: conflicts,
     );
   }
 
@@ -231,39 +241,16 @@ List<NasTaxonomyCategoryDefinition> _definitions(Object? raw, String label) {
   return result;
 }
 
-List<NasTaxonomyTagDefinition> _tagRoots(
-  Object? raw,
-  List<String> sourceSkipped,
-) {
-  if (raw is! List) throw const FormatException('一级标签必须是数组');
-  final result = <NasTaxonomyTagDefinition>[];
-  final names = <String>{};
-  for (final value in raw) {
-    if (value is! Map) throw const FormatException('一级标签项必须是对象');
-    final item = Map<String, dynamic>.from(value);
-    if (!_hasOnly(item, const {'name', 'color'}) ||
-        !item.containsKey('name') ||
-        item['name'] is! String ||
-        (item['color'] != null && item['color'] is! String)) {
-      throw const FormatException('一级标签项结构无效');
-    }
-    final name = _requiredName(item['name'], '一级标签');
-    final color = item['color'] as String?;
-    if (!isValidTaxonomyColor(color)) {
-      throw const FormatException('颜色必须是 #RRGGBB');
-    }
-    if (!names.add(normalizeTaxonomyName(name))) {
-      sourceSkipped.add('一级标签（文件重复）：$name');
-      continue;
-    }
-    result.add(NasTaxonomyTagDefinition(name: name, color: color));
-  }
-  return result;
-}
-
 String _requiredName(Object? value, String label) {
   if (value is! String || value.trim().isEmpty || value != value.trim()) {
     throw FormatException('$label 名称不能为空或含首尾空白');
   }
   return value;
 }
+
+String _levelName(int level) => switch (level) {
+      1 => '一级',
+      2 => '二级',
+      3 => '三级',
+      _ => '未知',
+    };

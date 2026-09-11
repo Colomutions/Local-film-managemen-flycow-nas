@@ -102,8 +102,9 @@ MUJING_MEDIA_ROOT_NAME=媒体库
 MUJING_SCAN_ON_START=false
 MUJING_TIMEZONE=Asia/Shanghai
 
-MEDIA_ROOT=/NAS内部真实媒体目录
-# MUJING_FIXTURE_MEDIA_RELATIVE_PATH=动漫/样片.mp4
+MEDIA_ROOT_DISK1=/NAS内部真实媒体目录一
+MEDIA_ROOT_DISK2=/NAS内部真实媒体目录二
+# MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
 ```
 
 注意：
@@ -111,14 +112,15 @@ MEDIA_ROOT=/NAS内部真实媒体目录
 - `PUID`、`PGID` 应以 NAS 上 `id` 的结果为准。
 - `MUJING_ADVERTISE_URL` 必须是纯 URL，不要填写 `[地址](地址)`。
 - 配对码只能保存在 `.env`，不要写进文档、截图、聊天或 Git。
-- `MEDIA_ROOT` 是 NAS 内部绝对路径，不能写 Windows 的 `\\NAS\共享目录`。
-- fixture 必须相对于 `MEDIA_ROOT`，不能再次填写完整绝对路径。
+- 默认双盘的 `MEDIA_ROOT_DISK1`、`MEDIA_ROOT_DISK2` 是 NAS 内部绝对路径，不能写 Windows 的 `\\NAS\共享目录`。
+- fixture 必须相对于容器 `/media`，双盘时以 `disk1/` 或 `disk2/` 开头，不能再次填写完整绝对路径。
 
 例如：
 
 ```dotenv
-MEDIA_ROOT=/vol2/1000/视频备份
-MUJING_FIXTURE_MEDIA_RELATIVE_PATH=动漫/样片.mp4
+MEDIA_ROOT_DISK1=/vol2/1000/视频备份
+MEDIA_ROOT_DISK2=/vol1/1000/影视收藏
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
 ```
 
 ## 5. 可选：私人镜像加速器
@@ -205,28 +207,37 @@ sudo docker compose --env-file .env up -d --force-recreate
 
 稳定身份保存在 `./data`，不要删除这个目录。
 
-## 8. 启用真实媒体只读挂载
+## 8. 启用双媒体盘只读挂载（默认）
 
-先确认媒体根和测试文件存在：
+先确认两个媒体根和测试文件存在：
 
 ```bash
-ls -ld "/NAS内部真实媒体目录"
-ls -l "/NAS内部真实媒体目录/相对测试文件"
+ls -ld "/NAS内部真实媒体目录一"
+ls -ld "/NAS内部真实媒体目录二"
+ls -l "/NAS内部真实媒体目录一/相对测试文件"
 ```
 
-设置 `.env` 后，使用两个 Compose 文件：
+在 `.env` 中每行设置一个媒体根：
+
+```dotenv
+MEDIA_ROOT_DISK1=/vol2/1000/first movies
+MEDIA_ROOT_DISK2=/vol1/1000/second movies
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
+```
+
+设置后，默认使用双盘 Compose 覆盖文件：
 
 ```bash
 cd /vol2/1000/docker/mujing-nas
 
 sudo docker compose --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.yml \
+  -f docker-compose.media.dual.yml \
   config
 
 sudo docker compose --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.yml \
+  -f docker-compose.media.dual.yml \
   up -d --force-recreate
 ```
 
@@ -240,41 +251,41 @@ sudo docker inspect mujing-nas \
 正确结果：
 
 ```text
-工程目录/data -> /data  RW=true
-媒体目录       -> /media RW=false
+工程目录/data  -> /data         RW=true
+媒体目录一     -> /media/disk1  RW=false
+媒体目录二     -> /media/disk2  RW=false
 ```
 
 `RW=false` 表示媒体只读。
 
-重要：启用媒体后，以后每次创建或重建容器都必须同时带上 `docker-compose.media.yml`。如果只执行基础 `docker compose up`，新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
+重要：启用媒体后，以后每次构建、创建、重建或重启容器都必须同时带上 `docker-compose.media.dual.yml`。如果只执行基础 `docker compose up`，新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
 
-### 两块媒体盘
+### 单媒体盘（仅在明确选择时）
 
-两块盘不能继续使用 `docker-compose.media.yml`，该文件只读取单数 `MEDIA_ROOT`。在 `.env` 中改为每行一个变量：
+只有明确不使用默认双盘方案时，才设置单数 `MEDIA_ROOT` 并使用 `docker-compose.media.yml`：
 
 ```dotenv
-MEDIA_ROOT_DISK1=/vol2/1000/first movies
-MEDIA_ROOT_DISK2=/vol1/1000/second movies
-MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
+MEDIA_ROOT=/vol2/1000/movies
+MUJING_FIXTURE_MEDIA_RELATIVE_PATH=动漫/样片.mp4
 ```
 
-使用项目提供的双盘只读覆盖文件：
+使用单盘只读覆盖文件：
 
 ```bash
 sudo -H docker compose --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
+  -f docker-compose.media.yml \
   config
 
 sudo -H docker compose --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
+  -f docker-compose.media.yml \
   up -d --build --force-recreate
 ```
 
-容器内两块盘固定为 `/media/disk1` 与 `/media/disk2`。Windows 端绑定类别时，填写 `disk1/子目录` 或 `disk2/子目录`；后续每次重建也必须继续带上同一个双盘覆盖文件。若启用源文件改名，改用 `docker-compose.media.dual-writable.yml`，同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`，且不能与只读双盘文件混用。
+单盘在容器内固定为 `/media`。Windows 端绑定类别时，填写相对于 `/media` 的子目录；后续每次重建也必须继续带上同一个单盘覆盖文件。若启用源文件改名，改用 `docker-compose.media-writable.yml`，同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`，且不能与只读单盘文件混用。
 
-如果此前以单盘 `/media` 根目录扫描过影片，已有数据库路径不会自动补上 `disk1/` 或 `disk2/`。不要删除 `data`；在 Windows 管理端将原分类重新绑定到对应 `disk1/子目录` 或 `disk2/子目录` 并重新扫描即可。
+从单盘切换到默认双盘后，已有数据库路径不会自动补上 `disk1/` 或 `disk2/`。不要删除 `data`；在 Windows 管理端将原分类重新绑定到对应 `disk1/子目录` 或 `disk2/子目录` 并重新扫描即可。
 
 普通部署应保持上述只读模式。如果确实需要在 Windows 管理端同步修改分集源文件名，仓库另有 `docker-compose.media-writable.yml`，且必须同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`。这是独立的高风险选择，不能与只读覆盖混用；启用前先备份，并完整阅读根目录 README 的“受控源文件改名”说明。
 
@@ -321,7 +332,7 @@ permission denied while trying to connect to /var/run/docker.sock
 ```bash
 sudo -H docker compose --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.yml \
+  -f docker-compose.media.dual.yml \
   build --pull=false
 ```
 
@@ -339,7 +350,7 @@ mkdir -p /tmp/mujing-docker-config
 HOME=/tmp DOCKER_CONFIG=/tmp/mujing-docker-config \
 docker compose --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.yml \
+  -f docker-compose.media.dual.yml \
   build --pull=false
 ```
 
@@ -374,8 +385,8 @@ Failed to load dynamic library 'libsqlite3.so'
 依次检查：
 
 1. fixture 是否为相对路径；
-2. 是否使用了 `docker-compose.media.yml`；
-3. `/media` 是否存在且为 `RW=false`；
+2. 是否使用了 `docker-compose.media.dual.yml`；
+3. `/media/disk1`、`/media/disk2` 是否存在且为 `RW=false`；
 4. 容器用户是否能读取测试文件；
 5. 修改 `.env` 后是否重新创建容器。
 
@@ -399,7 +410,7 @@ sudo docker logs --tail=100 mujing-nas
 sudo docker compose \
   --env-file .env \
   -f docker-compose.yml \
-  -f docker-compose.media.yml \
+  -f docker-compose.media.dual.yml \
   restart
 ```
 

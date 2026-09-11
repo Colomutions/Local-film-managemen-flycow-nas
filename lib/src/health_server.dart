@@ -227,33 +227,59 @@ class NasHealthServer {
         if (request.method == 'DELETE')
           return await _deleteAdminCategory(request);
       }
-      if (request.method == 'GET' && path == '/api/v1/admin/tags') {
-        return await _adminTags(request);
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/tag-management/overview') {
+        return await _tagManagementOverview(request);
       }
-      if (request.method == 'GET' && path == '/api/v1/admin/taxonomy/tags') {
-        return await _exportAdminTagTaxonomy(request);
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/tag-management/directory') {
+        return await _tagManagementDirectory(request);
       }
-      if (request.method == 'POST' && path == '/api/v1/admin/taxonomy/tags') {
-        return await _importAdminTagTaxonomy(request);
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/tag-management/parent-candidates') {
+        return await _tagManagementParentCandidates(request);
       }
-      if (request.method == 'POST' && path == '/api/v1/admin/tags') {
-        return await _createAdminTag(request);
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/tag-management/selectable') {
+        return await _tagManagementSelectableTags(request);
       }
-      if (RegExp(r'^/api/v1/admin/tags/[^/]+$').hasMatch(path)) {
-        if (request.method == 'PATCH') return await _updateAdminTag(request);
-        if (request.method == 'DELETE') return await _deleteAdminTag(request);
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/tag-management/template') {
+        return await _tagManagementTemplate(request);
       }
-      if (request.method == 'GET' && path == '/api/v1/admin/tag-placements') {
-        return await _adminTagPlacements(request);
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/tag-management/export') {
+        return await _tagManagementExport(request);
       }
-      if (request.method == 'POST' && path == '/api/v1/admin/tag-placements') {
-        return await _createAdminTagPlacement(request);
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/tag-management/import') {
+        return await _importTagManagement(request);
       }
-      if (RegExp(r'^/api/v1/admin/tag-placements/[^/]+$').hasMatch(path)) {
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/tag-management/tags') {
+        return await _createTagManagementTag(request);
+      }
+      if (RegExp(r'^/api/v1/admin/tag-management/tags/[^/]+/archive$')
+          .hasMatch(path)) {
+        if (request.method == 'POST')
+          return await _archiveTagManagementTag(request);
+      }
+      if (RegExp(r'^/api/v1/admin/tag-management/tags/[^/]+/children$')
+          .hasMatch(path)) {
+        if (request.method == 'GET')
+          return await _tagManagementChildren(request);
+      }
+      if (RegExp(r'^/api/v1/admin/tag-management/tags/[^/]+/movies$')
+          .hasMatch(path)) {
+        if (request.method == 'GET') return await _tagManagementMovies(request);
+      }
+      if (RegExp(r'^/api/v1/admin/tag-management/tags/[^/]+$').hasMatch(path)) {
+        if (request.method == 'GET')
+          return await _tagManagementDetails(request);
         if (request.method == 'PATCH')
-          return await _updateAdminTagPlacement(request);
+          return await _updateTagManagementTag(request);
         if (request.method == 'DELETE')
-          return await _deleteAdminTagPlacement(request);
+          return await _deleteTagManagementTag(request);
       }
       if (request.method == 'PATCH' &&
           RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
@@ -2392,261 +2418,326 @@ class NasHealthServer {
     await request.response.close();
   }
 
-  Future<void> _adminTags(HttpRequest request) => _writeJson(
-        request.response,
-        HttpStatus.ok,
-        {
-          'data': {
-            'items': _libraryDatabase
-                .listTags()
-                .map(_tagPayload)
-                .toList(growable: false),
-          },
-        },
-      );
-
-  Future<void> _exportAdminTagTaxonomy(HttpRequest request) async {
-    final conflicts = _libraryDatabase.taxonomyViolations();
-    if (conflicts.isNotEmpty) {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: conflicts,
-        ),
-      );
-    }
+  Future<void> _tagManagementOverview(HttpRequest request) async {
+    final overview = _libraryDatabase.tagOverview();
     await _writeJson(request.response, HttpStatus.ok, {
-      'data': _libraryDatabase.exportTagTaxonomy().toJson(),
+      'data': {
+        'total': overview.total,
+        'levelOne': overview.levelOne,
+        'levelTwo': overview.levelTwo,
+        'levelThree': overview.levelThree,
+        'movieLinks': overview.movieLinks,
+      },
     });
   }
 
-  Future<void> _importAdminTagTaxonomy(HttpRequest request) async {
-    final body = await _readJsonBody(request);
-    if (body == null) {
+  Future<void> _tagManagementDirectory(HttpRequest request) async {
+    final roots = _libraryDatabase.tagDirectory(
+      query: request.uri.queryParameters['q'] ?? '',
+    );
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': roots
+            .map((root) => {
+                  'tag': _tagPayload(root.tag),
+                  'movieCount': root.movieCount,
+                  'children': root.children
+                      .map((child) => {
+                            'tag': _tagPayload(child.tag),
+                            'movieCount': child.movieCount,
+                          })
+                      .toList(growable: false),
+                })
+            .toList(growable: false),
+      },
+    });
+  }
+
+  Future<void> _tagManagementParentCandidates(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final level = int.tryParse(parameters['level'] ?? '') ?? 0;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '20') ?? 0;
+    if (level < 2 || level > 3 || page < 1 || pageSize < 1 || pageSize > 50) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final query = parameters['q']?.trim().toLowerCase() ?? '';
+    final candidates = _libraryDatabase
+        .listTags(level: level - 1)
+        .where(
+          (tag) => query.isEmpty || tag.name.toLowerCase().contains(query),
+        )
+        .toList(growable: false);
+    final offset = (page - 1) * pageSize;
+    final items = offset >= candidates.length
+        ? const <NasLibraryTag>[]
+        : candidates.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map(_tagPayload).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': candidates.length,
+        'hasMore': offset + items.length < candidates.length,
+      },
+    });
+  }
+
+  Future<void> _tagManagementSelectableTags(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final level = int.tryParse(parameters['level'] ?? '') ?? 0;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '20') ?? 0;
+    if (level < 1 || level > 3 || page < 1 || pageSize < 1 || pageSize > 50) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final query = parameters['q']?.trim().toLowerCase() ?? '';
+    final tags = _libraryDatabase
+        .listTags(level: level)
+        .where(
+          (tag) => query.isEmpty || tag.name.toLowerCase().contains(query),
+        )
+        .toList(growable: false);
+    final offset = (page - 1) * pageSize;
+    final items = offset >= tags.length
+        ? const <NasLibraryTag>[]
+        : tags.skip(offset).take(pageSize).toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map(_tagPayload).toList(growable: false)},
+      'page': {
+        'number': page,
+        'size': pageSize,
+        'total': tags.length,
+        'hasMore': offset + items.length < tags.length,
+      },
+    });
+  }
+
+  Future<void> _tagManagementDetails(HttpRequest request) async {
+    final details = _libraryDatabase.tagDetails(
+      tagId: request.uri.pathSegments.last,
+      contextParentId: request.uri.queryParameters['contextParentId'],
+      contextRootId: request.uri.queryParameters['contextRootId'],
+    );
+    if (details == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'tag': _tagPayload(details.tag),
+        'parents': details.parents.map(_tagPayload).toList(growable: false),
+        'directChildCount': details.directChildCount,
+        'movieCount': details.movieCount,
+        'path': details.path.map(_tagPayload).toList(growable: false),
+      },
+    });
+  }
+
+  Future<void> _tagManagementChildren(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final scope = parameters['scope'] ?? 'all';
+    final associated = switch (scope) {
+      'all' => null,
+      'linked' => true,
+      'unlinked' => false,
+      _ => null,
+    };
+    if (!const {'all', 'linked', 'unlinked'}.contains(scope)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     try {
-      return await _writeTaxonomyResult(
+      final page = _libraryDatabase.tagChildren(
+        parentTagId:
+            request.uri.pathSegments[request.uri.pathSegments.length - 2],
+        query: parameters['q'] ?? '',
+        associated: associated,
+        sort: parameters['sort'] ?? 'movieCount',
+        order: parameters['order'] ?? 'desc',
+        page: int.tryParse(parameters['page'] ?? '1') ?? 0,
+        pageSize: int.tryParse(parameters['pageSize'] ?? '10') ?? 0,
+      );
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'items': page.items
+              .map((item) => {
+                    'tag': _tagPayload(item.tag),
+                    'movieCount': item.movieCount,
+                  })
+              .toList(growable: false)
+        },
+        'page': {
+          'number': page.number,
+          'size': page.size,
+          'total': page.total,
+          'hasMore': page.hasMore,
+        },
+      });
+    } on ArgumentError {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  Future<void> _tagManagementMovies(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    try {
+      final page = _libraryDatabase.tagMovies(
+        tagId: request.uri.pathSegments[request.uri.pathSegments.length - 2],
+        query: parameters['q'] ?? '',
+        categoryId: parameters['categoryId'],
+        resolution: parameters['resolution'],
+        sort: parameters['sort'] ?? 'lastPlayedAt',
+        order: parameters['order'] ?? 'desc',
+        page: int.tryParse(parameters['page'] ?? '1') ?? 0,
+        pageSize: int.tryParse(parameters['pageSize'] ?? '15') ?? 0,
+      );
+      final movies = page.movieIds
+          .map(_libraryDatabase.findMovieForAdmin)
+          .whereType<NasLibraryMovie>()
+          .map(_databaseSummary)
+          .toList(growable: false);
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {'items': movies},
+        'page': {
+          'number': page.number,
+          'size': page.size,
+          'total': page.total,
+          'hasMore': page.hasMore,
+        },
+      });
+    } on ArgumentError {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  Future<void> _tagManagementTemplate(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {
+          'data': const NasTagTaxonomyTransfer(
+            tags: [
+              NasTaxonomyTagDefinition(
+                name: '一级标签示例',
+                level: 1,
+                description: '下载模板示例：可替换为自己的一级标签名称。',
+                color: '#58D5FF',
+              ),
+              NasTaxonomyTagDefinition(
+                name: '二级标签示例 A',
+                level: 2,
+                description: '下载模板示例：二级标签必须关联一级父级。',
+                color: '#FFC266',
+                parents: ['一级标签示例'],
+              ),
+              NasTaxonomyTagDefinition(
+                name: '二级标签示例 B',
+                level: 2,
+                description: '下载模板示例：可建立多个二级标签。',
+                color: '#FFC266',
+                parents: ['一级标签示例'],
+              ),
+              NasTaxonomyTagDefinition(
+                name: '三级标签示例（多父）',
+                level: 3,
+                description: '下载模板示例：三级标签可关联多个二级父级。',
+                color: '#73D8A4',
+                parents: ['二级标签示例 A', '二级标签示例 B'],
+              ),
+            ],
+          ).toJson(),
+        },
+      );
+
+  Future<void> _tagManagementExport(HttpRequest request) => _writeJson(
+        request.response,
+        HttpStatus.ok,
+        {'data': _libraryDatabase.exportTagTaxonomy().toJson()},
+      );
+
+  Future<void> _importTagManagement(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null)
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    try {
+      await _writeTaxonomyResult(
         request,
-        _libraryDatabase.importTagTaxonomy(
-          NasTagTaxonomyTransfer.decode(body),
-        ),
+        _libraryDatabase.importTagTaxonomy(NasTagTaxonomyTransfer.decode(body)),
       );
     } on FormatException {
-      return _error(request, HttpStatus.badRequest, 'invalid_taxonomy');
+      await _error(request, HttpStatus.badRequest, 'invalid_taxonomy');
     }
   }
 
-  Future<void> _createAdminTag(HttpRequest request) async {
-    final body = await _readJsonBody(request);
-    final name = body?['name'];
-    final parentTagId = body?['parentTagId'];
-    final color = _taxonomyColor(body);
-    if (body == null ||
-        body.keys.any(
-            (key) => key != 'name' && key != 'parentTagId' && key != 'color') ||
-        name is! String ||
-        name.trim().isEmpty ||
-        (parentTagId != null && parentTagId is! String) ||
-        _libraryDatabase.hasTagName(name.trim()) ||
-        color == _invalidTaxonomyColor) {
+  Future<void> _createTagManagementTag(HttpRequest request) async {
+    final input =
+        _tagManagementInput(await _readJsonBody(request), creating: true);
+    if (input == null)
       return _error(request, HttpStatus.badRequest, 'invalid_request');
-    }
     try {
-      final tag = parentTagId == null
-          ? _libraryDatabase.createRootTag(name.trim(), color: color).$1
-          : _libraryDatabase
-              .createChildTag(
-                name: name.trim(),
-                parentTagId: parentTagId as String,
-                color: color,
-              )
-              .$1;
-      await _writeJson(request.response, HttpStatus.created, {
-        'data': _tagPayload(tag),
-      });
-    } on ArgumentError catch (_) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    } on StateError catch (_) {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: _libraryDatabase.taxonomyViolations(),
-        ),
+      final tag = _libraryDatabase.createTag(
+        name: input.name,
+        level: input.level!,
+        description: input.description,
+        color: input.color,
+        parentIds: input.parentIds,
       );
-    }
-  }
-
-  Future<void> _updateAdminTag(HttpRequest request) async {
-    final body = await _readJsonBody(request);
-    final name = _taxonomyName(body, allowed: const {'name', 'color'});
-    final color = _taxonomyColor(body);
-    final tagId = request.uri.pathSegments.last;
-    if (name == null ||
-        color == _invalidTaxonomyColor ||
-        _libraryDatabase.hasTagName(name, excludingId: tagId)) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    }
-    NasLibraryTag? tag;
-    try {
-      tag = _libraryDatabase.updateTagName(
-        tagId,
-        name,
-        color: color,
-        updateColor: body?.containsKey('color') ?? false,
-      );
+      await _writeJson(
+          request.response, HttpStatus.created, {'data': _tagPayload(tag)});
     } on ArgumentError {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
     } on StateError {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: _libraryDatabase.taxonomyViolations(),
-        ),
-      );
+      await _error(request, HttpStatus.conflict, 'tag_taxonomy_conflict');
     }
-    if (tag == null) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
-    }
-    await _writeJson(request.response, HttpStatus.ok, {
-      'data': _tagPayload(tag),
-    });
   }
 
-  Future<void> _deleteAdminTag(HttpRequest request) async {
+  Future<void> _updateTagManagementTag(HttpRequest request) async {
+    final tagId = request.uri.pathSegments.last;
+    final current = _libraryDatabase.findTag(tagId);
+    if (current == null)
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    final input =
+        _tagManagementInput(await _readJsonBody(request), creating: false);
+    if (input == null)
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    try {
+      final tag = _libraryDatabase.updateTag(
+        tagId: tagId,
+        name: input.name,
+        description: input.description,
+        color: input.color,
+        parentIds: input.parentIds,
+      );
+      if (tag == null) {
+        await _error(request, HttpStatus.notFound, 'resource_not_found');
+        return;
+      }
+      await _writeJson(
+          request.response, HttpStatus.ok, {'data': _tagPayload(tag)});
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    } on StateError {
+      await _error(request, HttpStatus.conflict, 'tag_taxonomy_conflict');
+    }
+  }
+
+  Future<void> _archiveTagManagementTag(HttpRequest request) async {
+    final tagId = request.uri.pathSegments[request.uri.pathSegments.length - 2];
+    if (!_libraryDatabase.archiveTag(tagId)) {
+      await _error(request, HttpStatus.notFound, 'resource_not_found');
+      return;
+    }
+    final tag = _libraryDatabase.findTag(tagId)!;
+    await _writeJson(
+        request.response, HttpStatus.ok, {'data': _tagPayload(tag)});
+  }
+
+  Future<void> _deleteTagManagementTag(HttpRequest request) async {
     try {
       if (!_libraryDatabase.deleteTag(request.uri.pathSegments.last)) {
-        return await _error(request, HttpStatus.badRequest, 'invalid_request');
+        await _error(request, HttpStatus.notFound, 'resource_not_found');
+        return;
       }
     } on StateError {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: _libraryDatabase.taxonomyViolations(),
-        ),
-      );
-    }
-    request.response.statusCode = HttpStatus.noContent;
-    await request.response.close();
-  }
-
-  Future<void> _adminTagPlacements(HttpRequest request) => _writeJson(
-        request.response,
-        HttpStatus.ok,
-        {
-          'data': {
-            'items': _libraryDatabase
-                .listTagPlacements()
-                .map(_tagPlacementPayload)
-                .toList(growable: false),
-          },
-        },
-      );
-
-  Future<void> _createAdminTagPlacement(HttpRequest request) async {
-    final body = await _readJsonBody(request);
-    final tagId = body?['tagId'];
-    final parentPlacementId = body?['parentPlacementId'];
-    if (body == null ||
-        body.keys.any((key) => key != 'tagId' && key != 'parentPlacementId') ||
-        tagId is! String ||
-        tagId.isEmpty ||
-        (parentPlacementId != null && parentPlacementId is! String) ||
-        _libraryDatabase.findTag(tagId) == null ||
-        (parentPlacementId is String &&
-            _libraryDatabase.findTagPlacement(parentPlacementId) == null)) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    }
-    NasTagPlacement placement;
-    try {
-      placement = _libraryDatabase.createTagPlacement(
-        tagId: tagId,
-        parentPlacementId: parentPlacementId as String?,
-      );
-    } on ArgumentError {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    } on StateError {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: _libraryDatabase.taxonomyViolations(),
-        ),
-      );
-    }
-    await _writeJson(request.response, HttpStatus.created, {
-      'data': _tagPlacementPayload(placement),
-    });
-  }
-
-  Future<void> _updateAdminTagPlacement(HttpRequest request) async {
-    final body = await _readJsonBody(request);
-    final placementId = request.uri.pathSegments.last;
-    if (body == null ||
-        body.length != 1 ||
-        !body.containsKey('parentPlacementId') ||
-        (body['parentPlacementId'] != null &&
-            body['parentPlacementId'] is! String)) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    }
-    final parentPlacementId = body['parentPlacementId'] as String?;
-    if (_libraryDatabase.findTagPlacement(placementId) == null) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
-    }
-    if (parentPlacementId != null &&
-        (_libraryDatabase.findTagPlacement(parentPlacementId) == null ||
-            _libraryDatabase.isTagPlacementDescendant(
-              candidateParentId: parentPlacementId,
-              placementId: placementId,
-            ))) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    }
-    NasTagPlacement? placement;
-    try {
-      placement = _libraryDatabase.updateTagPlacementParent(
-        placementId: placementId,
-        parentPlacementId: parentPlacementId,
-      );
-    } on ArgumentError {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
-    } on StateError {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: _libraryDatabase.taxonomyViolations(),
-        ),
-      );
-    }
-    await _writeJson(request.response, HttpStatus.ok, {
-      'data': _tagPlacementPayload(placement!),
-    });
-  }
-
-  Future<void> _deleteAdminTagPlacement(HttpRequest request) async {
-    try {
-      if (!_libraryDatabase.deleteTagPlacement(request.uri.pathSegments.last)) {
-        return await _error(request, HttpStatus.badRequest, 'invalid_request');
-      }
-    } on StateError {
-      return _writeTaxonomyResult(
-        request,
-        NasTaxonomyTransferResult(
-          added: const [],
-          skipped: const [],
-          conflicts: _libraryDatabase.taxonomyViolations(),
-        ),
-      );
+      await _error(request, HttpStatus.conflict, 'tag_has_references');
+      return;
     }
     request.response.statusCode = HttpStatus.noContent;
     await request.response.close();
@@ -2777,7 +2868,7 @@ class NasHealthServer {
             key != 'summary' &&
             key != 'actorIds' &&
             key != 'categoryId' &&
-            key != 'tagPlacementIds')) {
+            key != 'tagIds')) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final rawTitle = body['title'];
@@ -2794,8 +2885,13 @@ class NasHealthServer {
     final rawActorIds = body['actorIds'];
     final hasCategoryId = body.containsKey('categoryId');
     final rawCategoryId = body['categoryId'];
-    final hasTagPlacementIds = body.containsKey('tagPlacementIds');
-    final rawTagPlacementIds = body['tagPlacementIds'];
+    final hasTagIds = body.containsKey('tagIds');
+    final rawTagIds = body['tagIds'];
+    final movieId = request.uri.pathSegments.last;
+    final existingMovie = _libraryDatabase.findMovieForAdmin(movieId);
+    if (existingMovie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
     if ((rawTitle != null && rawTitle is! String) ||
         (hasOriginalTitle &&
             rawOriginalTitle != null &&
@@ -2817,9 +2913,9 @@ class NasHealthServer {
             rawSummary == null &&
             !hasActorIds &&
             !hasCategoryId &&
-            !hasTagPlacementIds) ||
+            !hasTagIds) ||
         (hasCategoryId && rawCategoryId != null && rawCategoryId is! String) ||
-        (hasTagPlacementIds && rawTagPlacementIds is! List)) {
+        (hasTagIds && rawTagIds is! List)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final title = (rawTitle as String?)?.trim();
@@ -2853,21 +2949,22 @@ class NasHealthServer {
                 _libraryDatabase.findCategory(categoryId) == null))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final tagPlacementIds = hasTagPlacementIds
-        ? (rawTagPlacementIds as List)
+    final tagIds = hasTagIds
+        ? (rawTagIds as List)
             .map((value) => value is String ? value : null)
             .toList(growable: false)
         : const <String?>[];
-    if (tagPlacementIds.any((id) => id == null || id.isEmpty) ||
-        tagPlacementIds.toSet().length != tagPlacementIds.length ||
-        tagPlacementIds.any(
-          (id) => _libraryDatabase.findTagPlacement(id!) == null,
-        )) {
+    final existingTagIds = hasTagIds
+        ? _libraryDatabase.tagsForMovie(movieId).map((tag) => tag.id).toSet()
+        : const <String>{};
+    if (tagIds.any((id) => id == null || id.isEmpty) ||
+        tagIds.toSet().length != tagIds.length ||
+        tagIds.any((id) {
+          final tag = id == null ? null : _libraryDatabase.findTag(id);
+          return tag == null ||
+              (tag.archivedAt != null && !existingTagIds.contains(tag.id));
+        })) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
-    }
-    final movieId = request.uri.pathSegments.last;
-    if (_libraryDatabase.findMovieForAdmin(movieId) == null) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     // 在写入任何影片字段前先验证系列与发行商的组合，避免 PATCH 局部成功。
     final relationPreview = _libraryDatabase.resolveMovieRelations(
@@ -2883,7 +2980,7 @@ class NasHealthServer {
           request, HttpStatus.conflict, 'movie_series_publisher_conflict');
     }
     final movie = _libraryDatabase.updateMovieMetadata(
-      movieId: request.uri.pathSegments.last,
+      movieId: movieId,
       title: title,
       originalTitle:
           originalTitle == null || originalTitle.isEmpty ? null : originalTitle,
@@ -2919,8 +3016,8 @@ class NasHealthServer {
       movieId: movie.id,
       updateCategory: hasCategoryId,
       categoryId: categoryId,
-      updateTagPlacements: hasTagPlacementIds,
-      tagPlacementIds: tagPlacementIds.cast<String>(),
+      updateTagIds: hasTagIds,
+      tagIds: tagIds.cast<String>(),
     );
     final updatedMovie = _libraryDatabase.findMovieForAdmin(movie.id)!;
     await _writeJson(request.response, HttpStatus.ok, {
@@ -3157,23 +3254,52 @@ class NasHealthServer {
   Map<String, Object?> _tagPayload(NasLibraryTag tag) => {
         'id': tag.id,
         'name': tag.name,
+        'level': tag.level,
+        'description': tag.description,
         'color': tag.color,
         'createdAt': tag.createdAt,
         'updatedAt': tag.updatedAt,
+        'archivedAt': tag.archivedAt,
       };
 
-  Map<String, Object?> _tagPlacementPayload(NasTagPlacement placement) {
-    final path = _libraryDatabase.allTagPaths().where(
-          (candidate) => candidate.placementId == placement.id,
-        );
-    return {
-      'id': placement.id,
-      'tagId': placement.tagId,
-      'parentPlacementId': placement.parentPlacementId,
-      'path': path.isEmpty ? const <String>[] : path.single.names,
-      'createdAt': placement.createdAt,
-      'updatedAt': placement.updatedAt,
-    };
+  _TagManagementInput? _tagManagementInput(
+    Map<String, dynamic>? body, {
+    required bool creating,
+  }) {
+    if (body == null ||
+        body.keys.any((key) => !{
+              'name',
+              'description',
+              'color',
+              if (creating) 'level',
+              'parentIds',
+            }.contains(key)) ||
+        body['name'] is! String ||
+        body['description'] is! String ||
+        (body['color'] != null && body['color'] is! String) ||
+        body['parentIds'] is! List ||
+        (creating && body['level'] is! int)) {
+      return null;
+    }
+    final name = (body['name'] as String).trim();
+    final description = (body['description'] as String).trim();
+    final color = body['color'] as String?;
+    final parentIds = (body['parentIds'] as List)
+        .map((value) => value is String ? value.trim() : '')
+        .toList(growable: false);
+    if (name.isEmpty ||
+        !isValidTaxonomyColor(color) ||
+        parentIds.any((id) => id.isEmpty) ||
+        parentIds.toSet().length != parentIds.length) {
+      return null;
+    }
+    return _TagManagementInput(
+      name: name,
+      description: description,
+      color: color,
+      level: creating ? body['level'] as int : null,
+      parentIds: parentIds,
+    );
   }
 
   static const _invalidTaxonomyColor = '\u0000';
@@ -3915,6 +4041,22 @@ class _FixturePlaybackState {
 
   final int positionMs;
   final int durationMs;
+}
+
+class _TagManagementInput {
+  const _TagManagementInput({
+    required this.name,
+    required this.description,
+    required this.color,
+    required this.level,
+    required this.parentIds,
+  });
+
+  final String name;
+  final String description;
+  final String? color;
+  final int? level;
+  final List<String> parentIds;
 }
 
 class _ScanJob {

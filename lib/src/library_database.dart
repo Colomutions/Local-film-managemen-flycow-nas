@@ -17,6 +17,13 @@ String? _nullableTrimmed(String? value) {
   return normalized == null || normalized.isEmpty ? null : normalized;
 }
 
+String _tagLevelName(int level) => switch (level) {
+      1 => '一级',
+      2 => '二级',
+      3 => '三级',
+      _ => '未知',
+    };
+
 class NasLibraryMovie {
   const NasLibraryMovie({
     required this.id,
@@ -135,32 +142,22 @@ class NasLibraryTag {
   const NasLibraryTag({
     required this.id,
     required this.name,
+    required this.level,
+    this.description = '',
     this.color,
     required this.createdAt,
     required this.updatedAt,
+    this.archivedAt,
   });
 
   final String id;
   final String name;
+  final int level;
+  final String description;
   final String? color;
   final String createdAt;
   final String updatedAt;
-}
-
-class NasTagPlacement {
-  const NasTagPlacement({
-    required this.id,
-    required this.tagId,
-    required this.parentPlacementId,
-    required this.createdAt,
-    required this.updatedAt,
-  });
-
-  final String id;
-  final String tagId;
-  final String? parentPlacementId;
-  final String createdAt;
-  final String updatedAt;
+  final String? archivedAt;
 }
 
 class NasTagPath {
@@ -175,6 +172,96 @@ class NasTagPath {
   final String tagId;
   final String tagName;
   final List<String> names;
+}
+
+class NasTagOverview {
+  const NasTagOverview({
+    required this.total,
+    required this.levelOne,
+    required this.levelTwo,
+    required this.levelThree,
+    required this.movieLinks,
+  });
+
+  final int total;
+  final int levelOne;
+  final int levelTwo;
+  final int levelThree;
+  final int movieLinks;
+}
+
+class NasTagDirectoryRoot {
+  const NasTagDirectoryRoot({
+    required this.tag,
+    required this.movieCount,
+    required this.children,
+  });
+
+  final NasLibraryTag tag;
+  final int movieCount;
+  final List<NasTagDirectoryChild> children;
+}
+
+class NasTagDirectoryChild {
+  const NasTagDirectoryChild({required this.tag, required this.movieCount});
+
+  final NasLibraryTag tag;
+  final int movieCount;
+}
+
+class NasTagDetails {
+  const NasTagDetails({
+    required this.tag,
+    required this.parents,
+    required this.directChildCount,
+    required this.movieCount,
+    required this.path,
+  });
+
+  final NasLibraryTag tag;
+  final List<NasLibraryTag> parents;
+  final int directChildCount;
+  final int movieCount;
+  final List<NasLibraryTag> path;
+}
+
+class NasTagChildSummary {
+  const NasTagChildSummary({required this.tag, required this.movieCount});
+
+  final NasLibraryTag tag;
+  final int movieCount;
+}
+
+class NasTagChildPage {
+  const NasTagChildPage({
+    required this.items,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<NasTagChildSummary> items;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
+}
+
+class NasTagMoviePage {
+  const NasTagMoviePage({
+    required this.movieIds,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<String> movieIds;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
 }
 
 class NasScanResult {
@@ -398,7 +485,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 19;
+  static const currentSchemaVersion = 20;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -890,6 +977,53 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [19, _now()],
+      );
+    }
+    if (current < 20) {
+      // 已获授权：仅清理旧标签定义、路径归属和影片路径关联，绝不触及影片或媒体数据。
+      _db.execute('PRAGMA foreign_keys = OFF');
+      try {
+        _db.execute('''
+          DROP TABLE IF EXISTS movie_tag_placements;
+          DROP TABLE IF EXISTS tag_placements;
+          DROP TABLE IF EXISTS tags;
+
+          CREATE TABLE tags (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL UNIQUE,
+            level INTEGER NOT NULL CHECK(level IN (1, 2, 3)),
+            description TEXT NOT NULL DEFAULT '',
+            color TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived_at TEXT
+          );
+          CREATE TABLE tag_parent_links (
+            child_tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
+            parent_tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(child_tag_id, parent_tag_id),
+            CHECK(child_tag_id != parent_tag_id)
+          );
+          CREATE TABLE movie_tag_links (
+            movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+            tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
+            PRIMARY KEY(movie_id, tag_id)
+          );
+          CREATE INDEX tags_level_active_name_idx
+            ON tags(level, archived_at, name COLLATE NOCASE);
+          CREATE INDEX tag_parent_links_parent_idx
+            ON tag_parent_links(parent_tag_id, child_tag_id);
+          CREATE INDEX movie_tag_links_tag_idx
+            ON movie_tag_links(tag_id, movie_id);
+        ''');
+      } finally {
+        _db.execute('PRAGMA foreign_keys = ON');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [20, _now()],
       );
     }
   }
@@ -2156,321 +2290,441 @@ class NasLibraryDatabase {
     );
   }
 
-  List<NasLibraryTag> listTags() => _db
-      .select(
-          'SELECT id, name, color, created_at, updated_at FROM tags ORDER BY name COLLATE NOCASE')
-      .map(_mapTag)
-      .toList(growable: false);
+  List<NasLibraryTag> listTags({int? level, bool includeArchived = false}) {
+    final conditions = <String>[if (!includeArchived) 'archived_at IS NULL'];
+    final parameters = <Object?>[];
+    if (level != null) {
+      conditions.add('level = ?');
+      parameters.add(level);
+    }
+    return _db.select('''
+      SELECT id, name, level, description, color, created_at, updated_at, archived_at
+      FROM tags
+      ${conditions.isEmpty ? '' : 'WHERE ${conditions.join(' AND ')}'}
+      ORDER BY level, name COLLATE NOCASE, id
+    ''', parameters).map(_mapTag).toList(growable: false);
+  }
 
   NasLibraryTag? findTag(String tagId) {
-    final rows = _db.select(
-      'SELECT id, name, color, created_at, updated_at FROM tags WHERE id = ?',
-      [tagId],
-    );
+    final rows = _db.select('''
+      SELECT id, name, level, description, color, created_at, updated_at, archived_at
+      FROM tags WHERE id = ?
+    ''', [tagId]);
     return rows.isEmpty ? null : _mapTag(rows.single);
   }
 
   bool hasTagName(String name, {String? excludingId}) {
-    final normalized = normalizeTaxonomyName(name);
-    return listTags().any(
-      (tag) =>
-          tag.id != excludingId &&
-          normalizeTaxonomyName(tag.name) == normalized,
+    final rows = _db.select(
+      'SELECT id FROM tags WHERE normalized_name = ?',
+      [normalizeTaxonomyName(name)],
     );
+    return rows.any((row) => row['id'] != excludingId);
   }
 
-  NasLibraryTag createTag(String name, {String? color}) {
-    return createRootTag(name, color: color).$1;
-  }
-
-  (NasLibraryTag, NasTagPlacement) createRootTag(String name, {String? color}) {
-    _requireWritableTaxonomy();
-    _requireTaxonomyName(name, '标签');
-    if (hasTagName(name)) {
-      throw ArgumentError.value(name, 'name', 'already exists');
-    }
-    final timestamp = _now();
-    final tag = NasLibraryTag(
-      id: newUuidV4(),
-      name: name,
-      color: color,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    );
-    _db.execute(
-      'INSERT INTO tags(id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
-      [tag.id, tag.name, tag.color, tag.createdAt, tag.updatedAt],
-    );
-    final placement = _insertTagPlacement(tag.id, null, timestamp);
-    return (tag, placement);
-  }
-
-  (NasLibraryTag, NasTagPlacement) createChildTag({
+  NasLibraryTag createTag({
     required String name,
-    required String parentTagId,
+    required int level,
+    String description = '',
     String? color,
+    List<String> parentIds = const [],
   }) {
     _requireWritableTaxonomy();
-    _requireTaxonomyName(name, '标签');
+    _requireTagInput(
+      name: name,
+      level: level,
+      color: color,
+      parentIds: parentIds,
+    );
     if (hasTagName(name)) {
-      throw ArgumentError.value(name, 'name', 'already exists');
-    }
-    final parentPlacement = _rootPlacementForTag(parentTagId);
-    if (parentPlacement == null) {
-      throw ArgumentError.value(
-          parentTagId, 'parentTagId', 'must be a root tag');
+      throw ArgumentError.value(name, 'name', '标签名称已存在');
     }
     final timestamp = _now();
     final tag = NasLibraryTag(
       id: newUuidV4(),
       name: name,
+      level: level,
+      description: description.trim(),
       color: color,
       createdAt: timestamp,
       updatedAt: timestamp,
     );
-    _db.execute(
-      'INSERT INTO tags(id, name, color, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
-      [tag.id, tag.name, tag.color, tag.createdAt, tag.updatedAt],
-    );
-    return (tag, _insertTagPlacement(tag.id, parentPlacement.id, timestamp));
+    _insertTag(tag);
+    _replaceTagParents(tag.id, parentIds, timestamp);
+    return tag;
   }
 
-  NasLibraryTag? updateTagName(String tagId, String name,
-      {String? color, bool updateColor = false}) {
-    if (findTag(tagId) == null) return null;
+  NasLibraryTag? updateTag({
+    required String tagId,
+    required String name,
+    required String description,
+    String? color,
+    required List<String> parentIds,
+  }) {
+    final current = findTag(tagId);
+    if (current == null) return null;
     _requireWritableTaxonomy();
-    _requireTaxonomyName(name, '标签');
-    if (hasTagName(name, excludingId: tagId)) {
-      throw ArgumentError.value(name, 'name', 'already exists');
-    }
-    _db.execute(
-      'UPDATE tags SET name = ?, color = ?, updated_at = ? WHERE id = ?',
-      [name, updateColor ? color : findTag(tagId)!.color, _now(), tagId],
+    _requireTagInput(
+      name: name,
+      level: current.level,
+      color: color,
+      parentIds: parentIds,
     );
+    if (hasTagName(name, excludingId: tagId)) {
+      throw ArgumentError.value(name, 'name', '标签名称已存在');
+    }
+    final timestamp = _now();
+    _db.execute('''
+      UPDATE tags
+      SET name = ?, normalized_name = ?, description = ?, color = ?, updated_at = ?
+      WHERE id = ?
+    ''', [
+      name,
+      normalizeTaxonomyName(name),
+      description.trim(),
+      color,
+      timestamp,
+      tagId,
+    ]);
+    _replaceTagParents(tagId, parentIds, timestamp);
     return findTag(tagId);
   }
 
-  bool deleteTag(String tagId) {
-    return deleteTagWithTaxonomyRules(tagId);
-  }
-
-  List<NasTagPlacement> listTagPlacements() => _db.select('''
-        SELECT id, tag_id, parent_placement_id, created_at, updated_at
-        FROM tag_placements ORDER BY created_at
-      ''').map(_mapTagPlacement).toList(growable: false);
-
-  NasTagPlacement? findTagPlacement(String placementId) {
-    final rows = _db.select('''
-      SELECT id, tag_id, parent_placement_id, created_at, updated_at
-      FROM tag_placements WHERE id = ?
-    ''', [placementId]);
-    return rows.isEmpty ? null : _mapTagPlacement(rows.single);
-  }
-
-  NasTagPlacement createTagPlacement({
-    required String tagId,
-    required String? parentPlacementId,
-  }) {
+  bool archiveTag(String tagId) {
+    if (findTag(tagId) == null) return false;
     _requireWritableTaxonomy();
-    if (parentPlacementId == null) {
-      throw ArgumentError('一级标签只能通过新建一级标签创建');
-    }
-    final parent = findTagPlacement(parentPlacementId);
-    if (parent == null || parent.parentPlacementId != null) {
-      throw ArgumentError('二级标签只能归属一级标签');
-    }
-    if (_rootPlacementForTag(tagId) != null) {
-      throw ArgumentError('一级标签不能作为二级标签归属');
-    }
-    if (findTag(tagId) == null) {
-      throw ArgumentError.value(tagId, 'tagId', 'does not exist');
-    }
-    if (listTagPlacements().any(
-      (placement) =>
-          placement.tagId == tagId &&
-          placement.parentPlacementId == parentPlacementId,
-    )) {
-      throw ArgumentError('该一级归属已存在');
-    }
-    return _insertTagPlacement(tagId, parentPlacementId, _now());
-  }
-
-  NasTagPlacement? updateTagPlacementParent({
-    required String placementId,
-    required String? parentPlacementId,
-  }) {
-    _requireWritableTaxonomy();
-    final placement = findTagPlacement(placementId);
-    if (placement == null) return null;
-    if (placement.parentPlacementId == null || parentPlacementId == null) {
-      throw ArgumentError('一级标签不能移动，二级标签必须保留一级归属');
-    }
-    final parent = findTagPlacement(parentPlacementId);
-    if (parent == null || parent.parentPlacementId != null) {
-      throw ArgumentError('二级标签只能归属一级标签');
-    }
-    if (parent.tagId == placement.tagId ||
-        listTagPlacements().any(
-          (item) =>
-              item.id != placementId &&
-              item.tagId == placement.tagId &&
-              item.parentPlacementId == parentPlacementId,
-        )) {
-      throw ArgumentError('该一级归属已存在');
-    }
     _db.execute(
-      'UPDATE tag_placements SET parent_placement_id = ?, updated_at = ? WHERE id = ?',
-      [parentPlacementId, _now(), placementId],
+      'UPDATE tags SET archived_at = ?, updated_at = ? WHERE id = ?',
+      [_now(), _now(), tagId],
     );
-    return findTagPlacement(placementId);
-  }
-
-  bool deleteTagPlacement(String placementId) {
-    _requireWritableTaxonomy();
-    final placement = findTagPlacement(placementId);
-    if (placement == null || placement.parentPlacementId == null) return false;
-    final siblingPlacements = listTagPlacements()
-        .where((item) => item.tagId == placement.tagId)
-        .toList(growable: false);
-    _db.execute('DELETE FROM tag_placements WHERE id = ?', [placementId]);
-    if (siblingPlacements.length == 1) {
-      _db.execute('DELETE FROM tags WHERE id = ?', [placement.tagId]);
-    }
     return true;
   }
 
-  NasTagTaxonomyTransfer exportTagTaxonomy() {
-    final conflicts = taxonomyViolations();
-    if (conflicts.isNotEmpty) throw StateError(conflicts.join('\n'));
-    final tagsById = {for (final tag in listTags()) tag.id: tag};
-    final placements = listTagPlacements();
-    final roots = <NasTaxonomyTagDefinition>[];
-    final children = <NasTaxonomyTagDefinition>[];
-    for (final placement
-        in placements.where((item) => item.parentPlacementId == null)) {
-      final tag = tagsById[placement.tagId]!;
-      roots.add(NasTaxonomyTagDefinition(name: tag.name, color: tag.color));
+  bool deleteTag(String tagId) {
+    final tag = findTag(tagId);
+    if (tag == null) return false;
+    _requireWritableTaxonomy();
+    final movieLinks = _db.select(
+      'SELECT COUNT(*) AS count FROM movie_tag_links WHERE tag_id = ?',
+      [tagId],
+    ).single['count'] as int;
+    final childLinks = _db.select(
+      'SELECT COUNT(*) AS count FROM tag_parent_links WHERE parent_tag_id = ?',
+      [tagId],
+    ).single['count'] as int;
+    if (movieLinks > 0 || childLinks > 0) {
+      throw StateError('标签仍有关联影片或子级，只能归档');
     }
-    for (final tag in tagsById.values) {
-      final parents = placements
-          .where(
-              (item) => item.tagId == tag.id && item.parentPlacementId != null)
-          .map((item) =>
-              tagsById[findTagPlacement(item.parentPlacementId!)!.tagId]!.name)
+    _db.execute('DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
+    _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
+    return true;
+  }
+
+  NasTagOverview tagOverview() {
+    final row = _db.select('''
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN level = 1 THEN 1 ELSE 0 END) AS level_one,
+             SUM(CASE WHEN level = 2 THEN 1 ELSE 0 END) AS level_two,
+             SUM(CASE WHEN level = 3 THEN 1 ELSE 0 END) AS level_three
+      FROM tags
+    ''').single;
+    final links = _db.select('SELECT COUNT(*) AS count FROM movie_tag_links')
+        .single['count'] as int;
+    return NasTagOverview(
+      total: row['total'] as int,
+      levelOne: (row['level_one'] as int?) ?? 0,
+      levelTwo: (row['level_two'] as int?) ?? 0,
+      levelThree: (row['level_three'] as int?) ?? 0,
+      movieLinks: links,
+    );
+  }
+
+  List<NasTagDirectoryRoot> tagDirectory({String query = ''}) {
+    final tags = listTags();
+    final byId = {for (final tag in tags) tag.id: tag};
+    final childrenByParent = _tagChildrenByParent();
+    final counts = _tagMovieCounts();
+    final normalized = query.trim().toLowerCase();
+    final roots = tags.where((tag) => tag.level == 1).toList(growable: false);
+    return roots.map((root) {
+      final children = (childrenByParent[root.id] ?? const <String>[])
+          .map((id) => byId[id])
+          .whereType<NasLibraryTag>()
+          .where((tag) => tag.level == 2)
+          .map((tag) => NasTagDirectoryChild(
+                tag: tag,
+                movieCount: counts[tag.id] ?? 0,
+              ))
           .toList(growable: false);
-      if (parents.isNotEmpty) {
-        children.add(NasTaxonomyTagDefinition(
-            name: tag.name, color: tag.color, parents: parents));
+      if (normalized.isNotEmpty &&
+          !root.name.toLowerCase().contains(normalized) &&
+          !children.any((item) => item.tag.name.toLowerCase().contains(normalized))) {
+        return null;
       }
+      final visibleChildren = normalized.isNotEmpty &&
+              !root.name.toLowerCase().contains(normalized)
+          ? children
+              .where((item) => item.tag.name.toLowerCase().contains(normalized))
+              .toList(growable: false)
+          : children;
+      return NasTagDirectoryRoot(
+        tag: root,
+        movieCount: counts[root.id] ?? 0,
+        children: visibleChildren,
+      );
+    }).whereType<NasTagDirectoryRoot>().toList(growable: false);
+  }
+
+  NasTagDetails? tagDetails({
+    required String tagId,
+    String? contextParentId,
+    String? contextRootId,
+  }) {
+    final tag = findTag(tagId);
+    if (tag == null) return null;
+    final allTags = listTags(includeArchived: true);
+    final byId = {for (final item in allTags) item.id: item};
+    final parentsByChild = _tagParentsByChild();
+    final parentIds = parentsByChild[tagId] ?? const <String>[];
+    final parents = parentIds.map((id) => byId[id]).whereType<NasLibraryTag>().toList(growable: false);
+    final directChildCount = _db.select(
+      'SELECT COUNT(*) AS count FROM tag_parent_links WHERE parent_tag_id = ?',
+      [tagId],
+    ).single['count'] as int;
+    final path = _tagPathForContext(
+      tag: tag,
+      byId: byId,
+      parentsByChild: parentsByChild,
+      contextParentId: contextParentId,
+      contextRootId: contextRootId,
+    );
+    return NasTagDetails(
+      tag: tag,
+      parents: parents,
+      directChildCount: directChildCount,
+      movieCount: _tagMovieCounts()[tagId] ?? 0,
+      path: path,
+    );
+  }
+
+  NasTagChildPage tagChildren({
+    required String parentTagId,
+    String query = '',
+    bool? associated,
+    String sort = 'movieCount',
+    String order = 'desc',
+    int page = 1,
+    int pageSize = 10,
+  }) {
+    if (page < 1 || pageSize != 10 ||
+        !const {'movieCount', 'name', 'createdAt'}.contains(sort) ||
+        !const {'asc', 'desc'}.contains(order)) {
+      throw ArgumentError('子标签分页参数无效');
     }
-    return NasTagTaxonomyTransfer(roots: roots, children: children);
+    final tags = listTags();
+    final byId = {for (final tag in tags) tag.id: tag};
+    final counts = _tagMovieCounts();
+    final normalized = query.trim().toLowerCase();
+    final items = ( _tagChildrenByParent()[parentTagId] ?? const <String>[])
+        .map((id) => byId[id])
+        .whereType<NasLibraryTag>()
+        .where((tag) => normalized.isEmpty || tag.name.toLowerCase().contains(normalized))
+        .where((tag) =>
+            associated == null || ((counts[tag.id] ?? 0) > 0) == associated)
+        .map((tag) => NasTagChildSummary(tag: tag, movieCount: counts[tag.id] ?? 0))
+        .toList(growable: false);
+    items.sort((left, right) {
+      final comparison = switch (sort) {
+        'movieCount' => left.movieCount.compareTo(right.movieCount),
+        'name' => left.tag.name.compareTo(right.tag.name),
+        _ => left.tag.createdAt.compareTo(right.tag.createdAt),
+      };
+      return order == 'asc' ? comparison : -comparison;
+    });
+    final offset = (page - 1) * pageSize;
+    final paged = offset >= items.length
+        ? const <NasTagChildSummary>[]
+        : items.skip(offset).take(pageSize).toList(growable: false);
+    return NasTagChildPage(
+      items: paged,
+      number: page,
+      size: pageSize,
+      total: items.length,
+      hasMore: offset + paged.length < items.length,
+    );
+  }
+
+  NasTagMoviePage tagMovies({
+    required String tagId,
+    String query = '',
+    String? categoryId,
+    String? resolution,
+    String sort = 'lastPlayedAt',
+    String order = 'desc',
+    int page = 1,
+    int pageSize = 15,
+  }) {
+    if (page < 1 || pageSize != 15 ||
+        !const {'lastPlayedAt', 'createdAt', 'title', 'durationMs'}.contains(sort) ||
+        !const {'asc', 'desc'}.contains(order)) {
+      throw ArgumentError('关联影片分页参数无效');
+    }
+    final clauses = <String>[
+      'm.id IN (SELECT movie_id FROM movie_tag_links WHERE tag_id IN (SELECT tag_id FROM tag_scope))',
+    ];
+    final parameters = <Object?>[tagId];
+    final trimmed = query.trim();
+    if (trimmed.isNotEmpty) {
+      final like = '%$trimmed%';
+      final catalog = '%${_normalizeCatalogNumber(trimmed)}%';
+      clauses.add('''(
+        lower(m.title) LIKE lower(?) OR
+        lower(COALESCE(m.original_title, '')) LIKE lower(?) OR
+        lower(REPLACE(REPLACE(REPLACE(COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(?)
+      )''');
+      parameters.addAll([like, like, catalog]);
+    }
+    if (categoryId != null) {
+      clauses.add('m.category_id = ?');
+      parameters.add(categoryId);
+    }
+    if (resolution != null) {
+      clauses.add('EXISTS (SELECT 1 FROM episodes re WHERE re.movie_id = m.id AND re.resolution_label = ?)');
+      parameters.add(resolution);
+    }
+    final where = clauses.join(' AND ');
+    final cte = '''WITH RECURSIVE tag_scope(tag_id) AS (
+      SELECT ?
+      UNION
+      SELECT l.child_tag_id FROM tag_parent_links l
+      JOIN tag_scope scope ON scope.tag_id = l.parent_tag_id
+    )''';
+    final count = _db.select('$cte SELECT COUNT(*) AS count FROM movies m WHERE $where', parameters)
+        .single['count'] as int;
+    final expression = switch (sort) {
+      'title' => 'm.title COLLATE NOCASE',
+      'createdAt' => 'm.created_at',
+      'durationMs' => 'SUM(COALESCE(e.duration_ms, 0))',
+      _ => 'MAX(h.started_at)',
+    };
+    final offset = (page - 1) * pageSize;
+    final rows = _db.select('''$cte
+      SELECT m.id
+      FROM movies m
+      LEFT JOIN episodes e ON e.movie_id = m.id
+      LEFT JOIN playback_history h ON h.movie_id = m.id
+      WHERE $where
+      GROUP BY m.id
+      ORDER BY $expression ${order.toUpperCase()}, m.id ASC
+      LIMIT ? OFFSET ?
+    ''', [...parameters, pageSize, offset]);
+    return NasTagMoviePage(
+      movieIds: rows.map((row) => row['id'] as String).toList(growable: false),
+      number: page,
+      size: pageSize,
+      total: count,
+      hasMore: offset + rows.length < count,
+    );
+  }
+
+  NasTagTaxonomyTransfer exportTagTaxonomy() {
+    final tags = listTags();
+    final byId = {for (final tag in tags) tag.id: tag};
+    final parents = _tagParentsByChild();
+    return NasTagTaxonomyTransfer(
+      tags: tags.map((tag) => NasTaxonomyTagDefinition(
+        name: tag.name,
+        level: tag.level,
+        description: tag.description,
+        color: tag.color,
+        parents: (parents[tag.id] ?? const <String>[])
+            .map((id) => byId[id]?.name)
+            .whereType<String>()
+            .toList(growable: false),
+      )).toList(growable: false),
+    );
   }
 
   NasTaxonomyTransferResult importTagTaxonomy(NasTagTaxonomyTransfer transfer) {
     if (transfer.validationConflicts.isNotEmpty) {
       return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: transfer.sourceSkipped,
-        conflicts: transfer.validationConflicts,
+        added: const [], skipped: transfer.sourceSkipped, conflicts: transfer.validationConflicts,
       );
     }
-    final conflicts = taxonomyViolations();
+    final violations = taxonomyViolations();
+    if (violations.isNotEmpty) {
+      return NasTaxonomyTransferResult(
+        added: const [], skipped: transfer.sourceSkipped, conflicts: violations,
+      );
+    }
+    final tagsByName = {
+      for (final tag in listTags(includeArchived: true)) normalizeTaxonomyName(tag.name): tag,
+    };
+    final definitions = {
+      for (final definition in transfer.tags) normalizeTaxonomyName(definition.name): definition,
+    };
+    final conflicts = <String>[];
+    for (final definition in transfer.tags) {
+      final existing = tagsByName[normalizeTaxonomyName(definition.name)];
+      if (existing != null && existing.level != definition.level) {
+        conflicts.add('标签层级冲突：${definition.name} 已是${_tagLevelName(existing.level)}标签');
+      }
+      for (final parentName in definition.parents) {
+        final key = normalizeTaxonomyName(parentName);
+        final parent = tagsByName[key];
+        final pending = definitions[key];
+        final parentLevel = parent?.level ?? pending?.level;
+        if (parentLevel == null) {
+          conflicts.add('标签父级不存在：$parentName → ${definition.name}');
+        } else if (parentLevel != definition.level - 1) {
+          conflicts.add('标签父级层级错误：$parentName → ${definition.name}');
+        } else if (parent?.archivedAt != null) {
+          conflicts.add('标签父级已归档：$parentName → ${definition.name}');
+        }
+      }
+    }
     if (conflicts.isNotEmpty) {
       return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: transfer.sourceSkipped,
-        conflicts: conflicts,
+        added: const [], skipped: transfer.sourceSkipped, conflicts: conflicts,
       );
     }
-    final tags = {
-      for (final tag in listTags()) normalizeTaxonomyName(tag.name): tag
-    };
-    final rootIds = {
-      for (final placement in listTagPlacements()
-          .where((item) => item.parentPlacementId == null))
-        placement.tagId,
-    };
-    final childIds = {
-      for (final placement in listTagPlacements()
-          .where((item) => item.parentPlacementId != null))
-        placement.tagId,
-    };
-    final preflight = <String>[];
-    for (final root in transfer.roots) {
-      final existing = tags[normalizeTaxonomyName(root.name)];
-      if (existing != null && !rootIds.contains(existing.id)) {
-        preflight.add('标签角色冲突：${existing.name} 已是二级标签');
-      }
-    }
-    for (final child in transfer.children) {
-      final existing = tags[normalizeTaxonomyName(child.name)];
-      if (existing != null && !childIds.contains(existing.id)) {
-        preflight.add('标签角色冲突：${existing.name} 已是一级标签');
-      }
-    }
-    if (preflight.isNotEmpty) {
-      return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: transfer.sourceSkipped,
-        conflicts: preflight,
-      );
-    }
+    final links = _db.select('SELECT child_tag_id, parent_tag_id FROM tag_parent_links')
+        .map((row) => '${row['child_tag_id']}:${row['parent_tag_id']}').toSet();
     final added = <String>[];
     final skipped = <String>[...transfer.sourceSkipped];
     _db.execute('BEGIN IMMEDIATE');
     try {
-      for (final root in transfer.roots) {
-        final key = normalizeTaxonomyName(root.name);
-        if (tags.containsKey(key)) {
-          skipped.add('一级标签：${tags[key]!.name}');
-        } else {
-          final created = createRootTag(root.name, color: root.color).$1;
-          tags[key] = created;
-          rootIds.add(created.id);
-          added.add('一级标签：${created.name}');
-        }
-      }
-      for (final child in transfer.children) {
-        final key = normalizeTaxonomyName(child.name);
-        final existing = tags[key];
-        final createdChild = existing == null;
-        final tag = existing ??
-            createChildTag(
-              name: child.name,
-              parentTagId: tags[normalizeTaxonomyName(child.parents.first)]!.id,
-              color: child.color,
-            ).$1;
-        if (existing == null) {
-          tags[key] = tag;
-          childIds.add(tag.id);
-          added.add('二级标签：${tag.name}');
-        } else {
-          skipped.add('二级标签：${tag.name}');
-        }
-        final currentParents = listTagPlacements()
-            .where((item) =>
-                item.tagId == tag.id && item.parentPlacementId != null)
-            .map((item) => findTagPlacement(item.parentPlacementId!)!.tagId)
-            .toSet();
-        for (final parentName in child.parents) {
-          final parent = tags[normalizeTaxonomyName(parentName)]!;
-          if (currentParents.contains(parent.id)) {
-            // createChildTag 会原子创建第一个一级归属；它属于本次导入的新增数据。
-            if (createdChild &&
-                normalizeTaxonomyName(parentName) ==
-                    normalizeTaxonomyName(child.parents.first)) {
-              added.add('标签归属：${parent.name} → ${tag.name}');
-            } else {
-              skipped.add('标签归属：${parent.name} → ${tag.name}');
-            }
-          } else {
-            createTagPlacement(
-              tagId: tag.id,
-              parentPlacementId: _rootPlacementForTag(parent.id)!.id,
-            );
-            currentParents.add(parent.id);
-            added.add('标签归属：${parent.name} → ${tag.name}');
+      for (var level = 1; level <= 3; level++) {
+        for (final definition in transfer.tags.where((item) => item.level == level)) {
+          final key = normalizeTaxonomyName(definition.name);
+          if (tagsByName.containsKey(key)) {
+            skipped.add('${_tagLevelName(level)}标签：${tagsByName[key]!.name}');
+            continue;
           }
+          final timestamp = _now();
+          final tag = NasLibraryTag(
+            id: newUuidV4(), name: definition.name, level: level,
+            description: definition.description, color: definition.color,
+            createdAt: timestamp, updatedAt: timestamp,
+          );
+          _insertTag(tag);
+          tagsByName[key] = tag;
+          added.add('${_tagLevelName(level)}标签：${tag.name}');
+        }
+      }
+      for (final definition in transfer.tags.where((item) => item.level > 1)) {
+        final child = tagsByName[normalizeTaxonomyName(definition.name)]!;
+        for (final parentName in definition.parents) {
+          final parent = tagsByName[normalizeTaxonomyName(parentName)]!;
+          final key = '${child.id}:${parent.id}';
+          if (!links.add(key)) {
+            skipped.add('标签归属：${parent.name} → ${child.name}');
+            continue;
+          }
+          _db.execute('''
+            INSERT INTO tag_parent_links(child_tag_id, parent_tag_id, created_at)
+            VALUES (?, ?, ?)
+          ''', [child.id, parent.id, _now()]);
+          added.add('标签归属：${parent.name} → ${child.name}');
         }
       }
       _db.execute('COMMIT');
@@ -2478,141 +2732,30 @@ class NasLibraryDatabase {
       _db.execute('ROLLBACK');
       rethrow;
     }
-    return NasTaxonomyTransferResult(
-      added: added,
-      skipped: skipped,
-      conflicts: const [],
-    );
-  }
-
-  bool deleteTagWithTaxonomyRules(String tagId) {
-    _requireWritableTaxonomy();
-    final root = _rootPlacementForTag(tagId);
-    if (root == null) return false;
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      final children = listTagPlacements()
-          .where((item) => item.parentPlacementId == root.id)
-          .toList(growable: false);
-      _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
-      for (final childPlacement in children) {
-        final remaining = listTagPlacements()
-            .where((item) => item.tagId == childPlacement.tagId)
-            .toList(growable: false);
-        if (remaining.isEmpty) {
-          _db.execute('DELETE FROM tags WHERE id = ?', [childPlacement.tagId]);
-        }
-      }
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return true;
+    return NasTaxonomyTransferResult(added: added, skipped: skipped, conflicts: const []);
   }
 
   List<String> taxonomyViolations() {
+    final tags = listTags(includeArchived: true);
+    final byId = {for (final tag in tags) tag.id: tag};
+    final parents = _tagParentsByChild();
     final violations = <String>[];
-    final tags = listTags();
-    final placements = listTagPlacements();
-    final tagsById = {for (final tag in tags) tag.id: tag};
-    final names = <String, String>{};
     for (final tag in tags) {
-      final key = normalizeTaxonomyName(tag.name);
-      final existing = names[key];
-      if (existing != null) {
-        violations.add('标签名称重复（不区分大小写）：$existing / ${tag.name}');
-      } else {
-        names[key] = tag.name;
+      final parentIds = parents[tag.id] ?? const <String>[];
+      if (tag.level == 1 && parentIds.isNotEmpty) {
+        violations.add('一级标签不能拥有父级：${tag.name}');
       }
-    }
-    final rootCount = <String, int>{};
-    final childCount = <String, int>{};
-    final childParents = <String>{};
-    for (final placement in placements) {
-      final tag = tagsById[placement.tagId];
-      if (tag == null) {
-        violations.add('标签位置引用了不存在的标签：${placement.id}');
-        continue;
+      if (tag.level > 1 && parentIds.isEmpty) {
+        violations.add('${_tagLevelName(tag.level)}标签缺少父级：${tag.name}');
       }
-      if (placement.parentPlacementId == null) {
-        rootCount.update(tag.id, (count) => count + 1, ifAbsent: () => 1);
-        continue;
-      }
-      final parents = placements
-          .where((item) => item.id == placement.parentPlacementId)
-          .toList(growable: false);
-      final parent = parents.isEmpty ? null : parents.single;
-      if (parent == null || parent.parentPlacementId != null) {
-        violations.add('标签层级超过两级：${tag.name}');
-        continue;
-      }
-      final key = '${tag.id}:${parent.id}';
-      if (!childParents.add(key)) {
-        violations.add('标签归属重复：${tag.name}');
-      }
-      childCount.update(tag.id, (count) => count + 1, ifAbsent: () => 1);
-    }
-    for (final tag in tags) {
-      final roots = rootCount[tag.id] ?? 0;
-      final children = childCount[tag.id] ?? 0;
-      if (roots == 0 && children == 0) {
-        violations.add('标签未归属：${tag.name}');
-      } else if (roots > 1) {
-        violations.add('一级标签位置重复：${tag.name}');
-      } else if (roots > 0 && children > 0) {
-        violations.add('标签角色混用：${tag.name} 同时是一级和二级');
+      for (final parentId in parentIds) {
+        final parent = byId[parentId];
+        if (parent == null || parent.level != tag.level - 1) {
+          violations.add('标签父级层级错误：${tag.name}');
+        }
       }
     }
     return violations;
-  }
-
-  bool isTagPlacementDescendant({
-    required String candidateParentId,
-    required String placementId,
-  }) {
-    var current = findTagPlacement(candidateParentId);
-    final visited = <String>{};
-    while (current != null && visited.add(current.id)) {
-      if (current.id == placementId) return true;
-      current = current.parentPlacementId == null
-          ? null
-          : findTagPlacement(current.parentPlacementId!);
-    }
-    return false;
-  }
-
-  NasTagPlacement _insertTagPlacement(
-    String tagId,
-    String? parentPlacementId,
-    String timestamp,
-  ) {
-    final placement = NasTagPlacement(
-      id: newUuidV4(),
-      tagId: tagId,
-      parentPlacementId: parentPlacementId,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    );
-    _db.execute('''
-      INSERT INTO tag_placements(id, tag_id, parent_placement_id, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-    ''', [
-      placement.id,
-      placement.tagId,
-      placement.parentPlacementId,
-      placement.createdAt,
-      placement.updatedAt,
-    ]);
-    return placement;
-  }
-
-  NasTagPlacement? _rootPlacementForTag(String tagId) {
-    final roots = listTagPlacements()
-        .where((placement) =>
-            placement.tagId == tagId && placement.parentPlacementId == null)
-        .toList(growable: false);
-    return roots.length == 1 ? roots.single : null;
   }
 
   List<String> _categoryViolations() {
@@ -2643,6 +2786,174 @@ class NasLibraryDatabase {
     }
   }
 
+  void _requireTagInput({
+    required String name,
+    required int level,
+    required String? color,
+    required List<String> parentIds,
+  }) {
+    _requireTaxonomyName(name, '标签');
+    if (level < 1 || level > 3 || !isValidTaxonomyColor(color)) {
+      throw ArgumentError('标签层级或颜色无效');
+    }
+    if ((level == 1 && parentIds.isNotEmpty) ||
+        (level > 1 && parentIds.isEmpty) ||
+        parentIds.toSet().length != parentIds.length) {
+      throw ArgumentError('标签父级不符合固定三级规则');
+    }
+    for (final parentId in parentIds) {
+      final parent = findTag(parentId);
+      if (parent == null || parent.archivedAt != null || parent.level != level - 1) {
+        throw ArgumentError('标签父级不存在、已归档或层级不匹配');
+      }
+    }
+  }
+
+  void _insertTag(NasLibraryTag tag) {
+    _db.execute('''
+      INSERT INTO tags(
+        id, name, normalized_name, level, description, color,
+        created_at, updated_at, archived_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      tag.id,
+      tag.name,
+      normalizeTaxonomyName(tag.name),
+      tag.level,
+      tag.description,
+      tag.color,
+      tag.createdAt,
+      tag.updatedAt,
+      tag.archivedAt,
+    ]);
+  }
+
+  void _replaceTagParents(
+    String tagId,
+    List<String> parentIds,
+    String timestamp,
+  ) {
+    _db.execute('DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
+    for (final parentId in parentIds) {
+      _db.execute('''
+        INSERT INTO tag_parent_links(child_tag_id, parent_tag_id, created_at)
+        VALUES (?, ?, ?)
+      ''', [tagId, parentId, timestamp]);
+    }
+  }
+
+  Map<String, List<String>> _tagParentsByChild() {
+    final values = <String, List<String>>{};
+    for (final row in _db.select('''
+      SELECT child_tag_id, parent_tag_id
+      FROM tag_parent_links
+      ORDER BY parent_tag_id, child_tag_id
+    ''')) {
+      values.putIfAbsent(row['child_tag_id'] as String, () => [])
+          .add(row['parent_tag_id'] as String);
+    }
+    return values;
+  }
+
+  Map<String, List<String>> _tagChildrenByParent() {
+    final values = <String, List<String>>{};
+    for (final entry in _tagParentsByChild().entries) {
+      for (final parentId in entry.value) {
+        values.putIfAbsent(parentId, () => []).add(entry.key);
+      }
+    }
+    return values;
+  }
+
+  Map<String, int> _tagMovieCounts() {
+    final rows = _db.select('''
+      WITH RECURSIVE descendants(ancestor_id, descendant_id) AS (
+        SELECT id, id FROM tags
+        UNION
+        SELECT descendants.ancestor_id, links.child_tag_id
+        FROM descendants
+        JOIN tag_parent_links links ON links.parent_tag_id = descendants.descendant_id
+      )
+      SELECT descendants.ancestor_id AS tag_id,
+             COUNT(DISTINCT movie_tag_links.movie_id) AS movie_count
+      FROM descendants
+      LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
+      GROUP BY descendants.ancestor_id
+    ''');
+    return {
+      for (final row in rows) row['tag_id'] as String: row['movie_count'] as int,
+    };
+  }
+
+  List<NasLibraryTag> _tagPathForContext({
+    required NasLibraryTag tag,
+    required Map<String, NasLibraryTag> byId,
+    required Map<String, List<String>> parentsByChild,
+    required String? contextParentId,
+    required String? contextRootId,
+  }) {
+    if (tag.level == 1) return [tag];
+    final parentIds = parentsByChild[tag.id] ?? const <String>[];
+    final selectedParentId = contextParentId != null && parentIds.contains(contextParentId)
+        ? contextParentId
+        : parentIds.isEmpty
+            ? null
+            : parentIds.first;
+    final parent = selectedParentId == null ? null : byId[selectedParentId];
+    if (parent == null) return [tag];
+    if (tag.level == 2) return [parent, tag];
+    final grandparentIds = parentsByChild[parent.id] ?? const <String>[];
+    final grandparentId = contextRootId != null && grandparentIds.contains(contextRootId)
+        ? contextRootId
+        : grandparentIds.isEmpty
+            ? null
+            : grandparentIds.first;
+    final grandparent = grandparentId == null ? null : byId[grandparentId];
+    return [if (grandparent != null) grandparent, parent, tag];
+  }
+
+  List<NasTagPath> _tagPathsForIds(Iterable<String> tagIds) {
+    final tags = listTags(includeArchived: true);
+    final byId = {for (final tag in tags) tag.id: tag};
+    final parentsByChild = _tagParentsByChild();
+    List<List<NasLibraryTag>> pathsFor(String tagId, Set<String> visiting) {
+      final tag = byId[tagId];
+      if (tag == null || !visiting.add(tagId)) return const [];
+      try {
+        if (tag.level == 1) return [[tag]];
+        final parentIds = parentsByChild[tagId] ?? const <String>[];
+        final paths = <List<NasLibraryTag>>[];
+        for (final parentId in parentIds) {
+          for (final path in pathsFor(parentId, visiting)) {
+            paths.add([...path, tag]);
+          }
+        }
+        return paths;
+      } finally {
+        visiting.remove(tagId);
+      }
+    }
+
+    final result = <NasTagPath>[];
+    final seen = <String>{};
+    for (final tagId in tagIds) {
+      final tag = byId[tagId];
+      if (tag == null) continue;
+      for (final path in pathsFor(tagId, <String>{})) {
+        final names = path.map((item) => item.name).toList(growable: false);
+        final key = '${tag.id}:${names.join('\u0000')}';
+        if (!seen.add(key)) continue;
+        result.add(NasTagPath(
+          placementId: tag.id,
+          tagId: tag.id,
+          tagName: tag.name,
+          names: names,
+        ));
+      }
+    }
+    return result;
+  }
+
   NasLibraryCategory? categoryForMovie(String movieId) {
     final rows = _db.select('''
       SELECT c.id, c.name, c.media_relative_path, c.created_at, c.updated_at
@@ -2653,28 +2964,23 @@ class NasLibraryDatabase {
   }
 
   List<NasTagPath> tagPathsForMovie(String movieId) {
-    final rows = _db.select('''
-      SELECT tag_placement_id FROM movie_tag_placements
-      WHERE movie_id = ? ORDER BY tag_placement_id
-    ''', [movieId]);
-    return rows
-        .map((row) => _tagPathForPlacement(row['tag_placement_id'] as String))
-        .whereType<NasTagPath>()
-        .toList(growable: false);
+    final linkedIds = _db.select('''
+      SELECT tag_id FROM movie_tag_links WHERE movie_id = ? ORDER BY tag_id
+    ''', [movieId]).map((row) => row['tag_id'] as String);
+    return _tagPathsForIds(linkedIds);
   }
 
-  List<NasTagPath> allTagPaths() => listTagPlacements()
-      .map((placement) => _tagPathForPlacement(placement.id))
-      .whereType<NasTagPath>()
-      .toList(growable: false);
+  List<NasTagPath> allTagPaths() =>
+      _tagPathsForIds(listTags(includeArchived: true).map((tag) => tag.id));
 
   List<NasLibraryTag> tagsForMovie(String movieId) {
-    final tags = <String, NasLibraryTag>{};
-    for (final path in tagPathsForMovie(movieId)) {
-      final tag = findTag(path.tagId);
-      if (tag != null) tags[tag.id] = tag;
-    }
-    return tags.values.toList(growable: false);
+    return _db.select('''
+      SELECT t.id, t.name, t.level, t.description, t.color,
+             t.created_at, t.updated_at, t.archived_at
+      FROM tags t JOIN movie_tag_links links ON links.tag_id = t.id
+      WHERE links.movie_id = ?
+      ORDER BY t.level, t.name COLLATE NOCASE, t.id
+    ''', [movieId]).map(_mapTag).toList(growable: false);
   }
 
   List<NasLibraryTag> _tagsForRelation(
@@ -2682,11 +2988,11 @@ class NasLibraryDatabase {
     List<Object?> parameters,
   ) =>
       _db.select('''
-        SELECT DISTINCT t.id, t.name, t.color, t.created_at, t.updated_at
+        SELECT DISTINCT t.id, t.name, t.level, t.description, t.color,
+               t.created_at, t.updated_at, t.archived_at
         FROM movies m
-        JOIN movie_tag_placements mtp ON mtp.movie_id = m.id
-        JOIN tag_placements tp ON tp.id = mtp.tag_placement_id
-        JOIN tags t ON t.id = tp.tag_id
+        JOIN movie_tag_links links ON links.movie_id = m.id
+        JOIN tags t ON t.id = links.tag_id
         WHERE $condition
         ORDER BY t.name COLLATE NOCASE, t.id
       ''', parameters).map(_mapTag).toList(growable: false);
@@ -2721,8 +3027,8 @@ class NasLibraryDatabase {
     required String movieId,
     required bool updateCategory,
     required String? categoryId,
-    required bool updateTagPlacements,
-    required List<String> tagPlacementIds,
+    required bool updateTagIds,
+    required List<String> tagIds,
   }) {
     if (findMovieForAdmin(movieId) == null) return false;
     if (updateCategory) {
@@ -2731,13 +3037,12 @@ class NasLibraryDatabase {
         [categoryId, _now(), movieId],
       );
     }
-    if (updateTagPlacements) {
-      _db.execute(
-          'DELETE FROM movie_tag_placements WHERE movie_id = ?', [movieId]);
-      for (final placementId in tagPlacementIds) {
+    if (updateTagIds) {
+      _db.execute('DELETE FROM movie_tag_links WHERE movie_id = ?', [movieId]);
+      for (final tagId in tagIds) {
         _db.execute(
-          'INSERT INTO movie_tag_placements(movie_id, tag_placement_id) VALUES (?, ?)',
-          [movieId, placementId],
+          'INSERT INTO movie_tag_links(movie_id, tag_id) VALUES (?, ?)',
+          [movieId, tagId],
         );
       }
     }
@@ -3108,42 +3413,13 @@ class NasLibraryDatabase {
   NasLibraryTag _mapTag(Row row) => NasLibraryTag(
         id: row['id'] as String,
         name: row['name'] as String,
+        level: row['level'] as int,
+        description: row['description'] as String? ?? '',
         color: row['color'] as String?,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
+        archivedAt: row['archived_at'] as String?,
       );
-
-  NasTagPlacement _mapTagPlacement(Row row) => NasTagPlacement(
-        id: row['id'] as String,
-        tagId: row['tag_id'] as String,
-        parentPlacementId: row['parent_placement_id'] as String?,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-      );
-
-  NasTagPath? _tagPathForPlacement(String placementId) {
-    final reversedNames = <String>[];
-    final visited = <String>{};
-    var current = findTagPlacement(placementId);
-    while (current != null && visited.add(current.id)) {
-      final tag = findTag(current.tagId);
-      if (tag == null) return null;
-      reversedNames.add(tag.name);
-      current = current.parentPlacementId == null
-          ? null
-          : findTagPlacement(current.parentPlacementId!);
-    }
-    if (reversedNames.isEmpty || current != null) return null;
-    final placement = findTagPlacement(placementId);
-    final tag = placement == null ? null : findTag(placement.tagId);
-    if (tag == null) return null;
-    return NasTagPath(
-      placementId: placementId,
-      tagId: tag.id,
-      tagName: tag.name,
-      names: reversedNames.reversed.toList(growable: false),
-    );
-  }
 
   void _markRootScanned(String rootId) {
     _db.execute(
