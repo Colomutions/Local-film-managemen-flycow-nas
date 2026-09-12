@@ -41,6 +41,8 @@ class NasLibraryMovie {
     required this.durationMs,
     required this.playCount,
     required this.updatedAt,
+    this.categoryId,
+    this.categoryName,
     this.videoWidth,
     this.videoHeight,
     this.resolutionLabel,
@@ -61,6 +63,8 @@ class NasLibraryMovie {
   final int? durationMs;
   final int playCount;
   final String updatedAt;
+  final String? categoryId;
+  final String? categoryName;
   final int? videoWidth;
   final int? videoHeight;
   final String? resolutionLabel;
@@ -258,6 +262,100 @@ class NasTagMoviePage {
   });
 
   final List<String> movieIds;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
+}
+
+/// 结构化影片搜索在数据库内使用的一个标签范围条件。
+class NasMovieSearchTagCondition {
+  const NasMovieSearchTagCondition({
+    required this.group,
+    required this.tagId,
+    required this.includeDescendants,
+  });
+
+  final String group;
+  final String tagId;
+  final bool includeDescendants;
+}
+
+class NasMovieSearchFilter {
+  const NasMovieSearchFilter({
+    required this.query,
+    required this.categoryId,
+    required this.resolutions,
+    required this.watchStates,
+    required this.sort,
+    required this.order,
+    required this.page,
+    required this.pageSize,
+    required this.tagConditions,
+  });
+
+  final String query;
+  final String? categoryId;
+  final Set<String> resolutions;
+  final Set<String> watchStates;
+  final String sort;
+  final String order;
+  final int page;
+  final int pageSize;
+  final List<NasMovieSearchTagCondition> tagConditions;
+}
+
+class NasMovieSearchPage {
+  const NasMovieSearchPage({
+    required this.items,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<NasLibraryMovie> items;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
+}
+
+/// 只读搜索目录的一级节点，不复用含管理资料的标签管理 DTO。
+class NasMovieSearchTagDirectoryRoot {
+  const NasMovieSearchTagDirectoryRoot({
+    required this.tag,
+    required this.movieCount,
+    required this.children,
+  });
+
+  final NasLibraryTag tag;
+  final int movieCount;
+  final List<NasMovieSearchTagDirectoryChild> children;
+}
+
+class NasMovieSearchTagDirectoryChild {
+  const NasMovieSearchTagDirectoryChild({
+    required this.tag,
+    required this.movieCount,
+    required this.thirdLevelCount,
+  });
+
+  final NasLibraryTag tag;
+  final int movieCount;
+  final int thirdLevelCount;
+}
+
+class NasMovieSearchThirdLevelTagPage {
+  const NasMovieSearchThirdLevelTagPage({
+    required this.items,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<NasTagChildSummary> items;
   final int number;
   final int size;
   final int total;
@@ -485,7 +583,7 @@ class NasPlaybackHistoryItem {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 20;
+  static const currentSchemaVersion = 21;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -1026,6 +1124,18 @@ class NasLibraryDatabase {
         [20, _now()],
       );
     }
+    if (current < 21) {
+      // 搜索页的观看状态和首次扫描排序都在 NAS 的全库 SQL 内完成。
+      _db.execute('''
+        CREATE INDEX playback_history_movie_started_idx
+          ON playback_history(movie_id, started_at DESC, id DESC);
+        CREATE INDEX movies_created_id_idx ON movies(created_at DESC, id);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [21, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -1295,6 +1405,278 @@ class NasLibraryDatabase {
               updatedAt: row['updated_at'] as String,
             )))
         .toList(growable: false);
+  }
+
+  /// 在 SQLite 中完成搜索、三组标签条件、排序和分页，绝不回传全量影片。
+  NasMovieSearchPage searchMovies(NasMovieSearchFilter filter) {
+    if (filter.page < 1 ||
+        filter.pageSize < 1 ||
+        filter.pageSize > 100 ||
+        !const {
+          'relevance',
+          'createdAt',
+          'title',
+          'updatedAt',
+          'durationMs',
+          'recent'
+        }.contains(filter.sort) ||
+        !filter.watchStates.every(
+          const {'unwatched', 'continue'}.contains,
+        ) ||
+        !const {'asc', 'desc'}.contains(filter.order)) {
+      throw ArgumentError('影片搜索参数无效');
+    }
+    final conditions = filter.tagConditions;
+    final requestedValues = <Object?>[];
+    final requestedSql = conditions.isEmpty
+        ? '''SELECT CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS INTEGER)
+            WHERE 0'''
+        : 'VALUES ${conditions.map((condition) {
+            requestedValues.addAll([
+              condition.group,
+              condition.tagId,
+              condition.includeDescendants ? 1 : 0,
+            ]);
+            return '(?, ?, ?)';
+          }).join(', ')}';
+    final query = filter.query.trim();
+    final queryLike = '%$query%';
+    final queryPrefix = '$query%';
+    final normalizedCatalog = _normalizeCatalogNumber(query);
+    final catalogLike = '%$normalizedCatalog%';
+    final catalogPrefix = '$normalizedCatalog%';
+    // 权重只影响搜索结果的服务端排序；任意筛选条件仍在同一条 SQL 内完成。
+    final relevanceSql = '''CASE WHEN terms.query = '' THEN 0 ELSE
+      CASE
+        WHEN lower(m.title) = lower(terms.query) THEN 1000
+        WHEN lower(m.title) LIKE lower(terms.query_prefix) THEN 900
+        WHEN lower(m.title) LIKE lower(terms.query_like) THEN 800
+        ELSE 0
+      END +
+      CASE
+        WHEN lower(COALESCE(m.original_title, '')) = lower(terms.query) THEN 700
+        WHEN lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_prefix) THEN 650
+        WHEN lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_like) THEN 600
+        ELSE 0
+      END +
+      CASE
+        WHEN terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
+          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) = lower(terms.catalog) THEN 550
+        WHEN terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
+          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_prefix) THEN 520
+        WHEN terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
+          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_like) THEN 480
+        ELSE 0
+      END +
+      CASE
+        WHEN EXISTS (
+          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
+          WHERE mal.movie_id = m.id AND (
+            lower(COALESCE(a.stage_name, '')) = lower(terms.query)
+            OR lower(COALESCE(a.original_name, '')) = lower(terms.query)
+            OR lower(COALESCE(a.translated_name, '')) = lower(terms.query)
+          )
+        ) THEN 400
+        WHEN EXISTS (
+          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
+          WHERE mal.movie_id = m.id AND (
+            lower(COALESCE(a.stage_name, '')) LIKE lower(terms.query_prefix)
+            OR lower(COALESCE(a.original_name, '')) LIKE lower(terms.query_prefix)
+            OR lower(COALESCE(a.translated_name, '')) LIKE lower(terms.query_prefix)
+          )
+        ) THEN 360
+        WHEN EXISTS (
+          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
+          WHERE mal.movie_id = m.id AND (
+            lower(COALESCE(a.stage_name, '')) LIKE lower(terms.query_like)
+            OR lower(COALESCE(a.original_name, '')) LIKE lower(terms.query_like)
+            OR lower(COALESCE(a.translated_name, '')) LIKE lower(terms.query_like)
+          )
+        ) THEN 320
+        ELSE 0
+      END +
+      CASE
+        WHEN EXISTS (
+          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
+          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
+            AND lower(t.name) = lower(terms.query)
+        ) THEN 280
+        WHEN EXISTS (
+          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
+          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
+            AND lower(t.name) LIKE lower(terms.query_prefix)
+        ) THEN 260
+        WHEN EXISTS (
+          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
+          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
+            AND lower(t.name) LIKE lower(terms.query_like)
+        ) THEN 240
+        ELSE 0
+      END +
+      CASE
+        WHEN lower(COALESCE(m.summary, '')) LIKE lower(terms.query_like) THEN 100
+        ELSE 0
+      END
+    END AS relevance_score''';
+    final clauses = <String>[
+      'e.is_available = 1',
+      '''(
+        terms.query = '' OR lower(m.title) LIKE lower(terms.query_like)
+        OR lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(m.summary, '')) LIKE lower(terms.query_like)
+        OR (terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
+          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_like))
+        OR EXISTS (
+          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
+          WHERE mal.movie_id = m.id AND (
+            lower(COALESCE(a.stage_name, '')) LIKE lower(terms.query_like)
+            OR lower(COALESCE(a.original_name, '')) LIKE lower(terms.query_like)
+            OR lower(COALESCE(a.translated_name, '')) LIKE lower(terms.query_like)
+          )
+        )
+        OR EXISTS (
+          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
+          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
+            AND lower(t.name) LIKE lower(terms.query_like)
+        )
+      )''',
+      '''(
+        NOT EXISTS (SELECT 1 FROM requested WHERE group_name = 'all')
+        OR NOT EXISTS (
+          SELECT 1 FROM requested r
+          WHERE r.group_name = 'all' AND NOT EXISTS (
+            SELECT 1 FROM tag_scope scope
+            JOIN movie_tag_links links ON links.tag_id = scope.tag_id
+            WHERE scope.group_name = r.group_name
+              AND scope.requested_tag_id = r.requested_tag_id
+              AND links.movie_id = m.id
+          )
+        )
+      )''',
+      '''(
+        NOT EXISTS (SELECT 1 FROM requested WHERE group_name = 'any')
+        OR EXISTS (
+          SELECT 1 FROM tag_scope scope
+          JOIN movie_tag_links links ON links.tag_id = scope.tag_id
+          WHERE scope.group_name = 'any' AND links.movie_id = m.id
+        )
+      )''',
+      '''NOT EXISTS (
+        SELECT 1 FROM tag_scope scope
+        JOIN movie_tag_links links ON links.tag_id = scope.tag_id
+        WHERE scope.group_name = 'exclude' AND links.movie_id = m.id
+      )''',
+    ];
+    final whereValues = <Object?>[];
+    if (filter.categoryId != null) {
+      clauses.add('m.category_id = ?');
+      whereValues.add(filter.categoryId);
+    }
+    if (filter.resolutions.isNotEmpty) {
+      clauses.add('''EXISTS (
+        SELECT 1 FROM episodes resolution_episode
+        WHERE resolution_episode.movie_id = m.id
+          AND resolution_episode.is_available = 1
+          AND resolution_episode.resolution_label IN (${List.filled(filter.resolutions.length, '?').join(', ')})
+      )''');
+      whereValues.addAll(filter.resolutions.toList()..sort());
+    }
+    if (filter.watchStates.isNotEmpty) {
+      final watchStateClauses = <String>[];
+      if (filter.watchStates.contains('unwatched')) {
+        watchStateClauses.add('''NOT EXISTS (
+          SELECT 1 FROM playback_history watched
+          WHERE watched.movie_id = m.id
+        )''');
+      }
+      if (filter.watchStates.contains('continue')) {
+        watchStateClauses.add('''EXISTS (
+          SELECT 1 FROM episode_playback_progress progress
+          WHERE progress.movie_id = m.id
+            AND progress.position_ms > 0
+            AND progress.duration_ms > 0
+            AND progress.position_ms < progress.duration_ms
+        )''');
+      }
+      clauses.add('(${watchStateClauses.join(' OR ')})');
+    }
+    final cte = '''WITH RECURSIVE
+      requested(group_name, requested_tag_id, include_descendants) AS (
+        $requestedSql
+      ),
+      search_terms(query, query_like, query_prefix, catalog, catalog_like, catalog_prefix) AS (
+        VALUES (?, ?, ?, ?, ?, ?)
+      ),
+      tag_scope(group_name, requested_tag_id, tag_id) AS (
+        SELECT group_name, requested_tag_id, requested_tag_id FROM requested
+        UNION
+        SELECT scope.group_name, scope.requested_tag_id, links.child_tag_id
+        FROM tag_scope scope
+        JOIN requested request ON request.group_name = scope.group_name
+          AND request.requested_tag_id = scope.requested_tag_id
+        JOIN tag_parent_links links ON links.parent_tag_id = scope.tag_id
+        JOIN tags child ON child.id = links.child_tag_id
+        WHERE request.include_descendants = 1 AND child.archived_at IS NULL
+      ),
+      matching_movies AS (
+        SELECT m.id, m.title, m.original_title, m.catalog_number,
+               m.publisher_id, publisher.display_name AS publisher_name,
+               m.series_id, series.display_name AS series_name,
+               m.summary, m.poster_file_name, m.play_count, m.created_at, m.updated_at,
+               $relevanceSql,
+               m.category_id, category.name AS category_name,
+               COUNT(e.id) AS episode_count,
+               SUM(COALESCE(e.duration_ms, 0)) AS duration_ms,
+               MAX(e.video_width) AS video_width,
+               MAX(e.video_height) AS video_height,
+               CASE WHEN COUNT(DISTINCT NULLIF(e.resolution_label, '')) > 1
+                    THEN '多种分辨率' ELSE MAX(e.resolution_label) END AS resolution_label
+        FROM movies m
+        CROSS JOIN search_terms terms
+        JOIN episodes e ON e.movie_id = m.id
+        LEFT JOIN publishers publisher ON publisher.id = m.publisher_id
+        LEFT JOIN series ON series.id = m.series_id
+        LEFT JOIN library_categories category ON category.id = m.category_id
+        WHERE ${clauses.join(' AND ')}
+        GROUP BY m.id
+      )''';
+    final parameters = [
+      ...requestedValues,
+      query,
+      queryLike,
+      queryPrefix,
+      normalizedCatalog,
+      catalogLike,
+      catalogPrefix,
+      ...whereValues,
+    ];
+    final total = _db
+        .select(
+            '$cte SELECT COUNT(*) AS count FROM matching_movies', parameters)
+        .single['count'] as int;
+    final upperOrder = filter.order.toUpperCase();
+    final orderBy = switch (filter.sort) {
+      'relevance' => 'relevance_score $upperOrder, created_at DESC, id ASC',
+      'createdAt' => 'created_at $upperOrder, id ASC',
+      'title' => 'title COLLATE NOCASE $upperOrder, id ASC',
+      'durationMs' => 'duration_ms $upperOrder, id ASC',
+      'recent' => 'play_count $upperOrder, id ASC',
+      _ => 'updated_at $upperOrder, id ASC',
+    };
+    final offset = (filter.page - 1) * filter.pageSize;
+    final rows = _db.select('''$cte
+      SELECT * FROM matching_movies
+      ORDER BY $orderBy
+      LIMIT ? OFFSET ?
+    ''', [...parameters, filter.pageSize, offset]);
+    final items = rows.map(_mapSearchMovie).toList(growable: false);
+    return NasMovieSearchPage(
+      items: items,
+      number: filter.page,
+      size: filter.pageSize,
+      total: total,
+      hasMore: offset + items.length < total,
+    );
   }
 
   List<NasPublisher> listPublishers({
@@ -2427,7 +2809,8 @@ class NasLibraryDatabase {
              SUM(CASE WHEN level = 3 THEN 1 ELSE 0 END) AS level_three
       FROM tags
     ''').single;
-    final links = _db.select('SELECT COUNT(*) AS count FROM movie_tag_links')
+    final links = _db
+        .select('SELECT COUNT(*) AS count FROM movie_tag_links')
         .single['count'] as int;
     return NasTagOverview(
       total: row['total'] as int,
@@ -2445,33 +2828,183 @@ class NasLibraryDatabase {
     final counts = _tagMovieCounts();
     final normalized = query.trim().toLowerCase();
     final roots = tags.where((tag) => tag.level == 1).toList(growable: false);
-    return roots.map((root) {
-      final children = (childrenByParent[root.id] ?? const <String>[])
-          .map((id) => byId[id])
-          .whereType<NasLibraryTag>()
-          .where((tag) => tag.level == 2)
-          .map((tag) => NasTagDirectoryChild(
-                tag: tag,
-                movieCount: counts[tag.id] ?? 0,
-              ))
-          .toList(growable: false);
-      if (normalized.isNotEmpty &&
-          !root.name.toLowerCase().contains(normalized) &&
-          !children.any((item) => item.tag.name.toLowerCase().contains(normalized))) {
-        return null;
+    return roots
+        .map((root) {
+          final children = (childrenByParent[root.id] ?? const <String>[])
+              .map((id) => byId[id])
+              .whereType<NasLibraryTag>()
+              .where((tag) => tag.level == 2)
+              .map((tag) => NasTagDirectoryChild(
+                    tag: tag,
+                    movieCount: counts[tag.id] ?? 0,
+                  ))
+              .toList(growable: false);
+          if (normalized.isNotEmpty &&
+              !root.name.toLowerCase().contains(normalized) &&
+              !children.any(
+                  (item) => item.tag.name.toLowerCase().contains(normalized))) {
+            return null;
+          }
+          final visibleChildren = normalized.isNotEmpty &&
+                  !root.name.toLowerCase().contains(normalized)
+              ? children
+                  .where((item) =>
+                      item.tag.name.toLowerCase().contains(normalized))
+                  .toList(growable: false)
+              : children;
+          return NasTagDirectoryRoot(
+            tag: root,
+            movieCount: counts[root.id] ?? 0,
+            children: visibleChildren,
+          );
+        })
+        .whereType<NasTagDirectoryRoot>()
+        .toList(growable: false);
+  }
+
+  /// 仅返回活跃的一、二级标签及进入二级时需要的一级路径上下文。
+  List<NasMovieSearchTagDirectoryRoot> movieSearchTagDirectory({
+    String query = '',
+  }) {
+    final queryLike = '%${query.trim()}%';
+    final rows = _db.select('''
+      WITH RECURSIVE descendants(ancestor_id, descendant_id) AS (
+        SELECT id, id FROM tags WHERE archived_at IS NULL
+        UNION
+        SELECT descendants.ancestor_id, links.child_tag_id
+        FROM descendants
+        JOIN tag_parent_links links ON links.parent_tag_id = descendants.descendant_id
+        JOIN tags child ON child.id = links.child_tag_id
+        WHERE child.archived_at IS NULL
+      ),
+      tag_counts AS (
+        SELECT descendants.ancestor_id AS tag_id,
+               COUNT(DISTINCT movie_tag_links.movie_id) AS movie_count
+        FROM descendants
+        LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
+        GROUP BY descendants.ancestor_id
+      )
+      SELECT root.id AS root_id, root.name AS root_name,
+             COALESCE(root_count.movie_count, 0) AS root_movie_count,
+             child.id AS child_id, child.name AS child_name,
+             COALESCE(child_count.movie_count, 0) AS child_movie_count,
+             (
+               SELECT COUNT(*) FROM tag_parent_links third_link
+               JOIN tags third ON third.id = third_link.child_tag_id
+               WHERE third_link.parent_tag_id = child.id
+                 AND third.level = 3 AND third.archived_at IS NULL
+             ) AS third_level_count
+      FROM tags root
+      LEFT JOIN tag_parent_links child_link ON child_link.parent_tag_id = root.id
+      LEFT JOIN tags child ON child.id = child_link.child_tag_id
+        AND child.level = 2 AND child.archived_at IS NULL
+      LEFT JOIN tag_counts root_count ON root_count.tag_id = root.id
+      LEFT JOIN tag_counts child_count ON child_count.tag_id = child.id
+      WHERE root.level = 1 AND root.archived_at IS NULL
+        AND (? = '%%' OR lower(root.name) LIKE lower(?)
+             OR lower(COALESCE(child.name, '')) LIKE lower(?))
+      ORDER BY root.name COLLATE NOCASE, root.id, child.name COLLATE NOCASE, child.id
+    ''', [queryLike, queryLike, queryLike]);
+    final rootOrder = <String>[];
+    final roots = <String, NasLibraryTag>{};
+    final rootCounts = <String, int>{};
+    final children = <String, List<NasMovieSearchTagDirectoryChild>>{};
+    for (final row in rows) {
+      final rootId = row['root_id'] as String;
+      if (!roots.containsKey(rootId)) {
+        rootOrder.add(rootId);
+        roots[rootId] = NasLibraryTag(
+          id: rootId,
+          name: row['root_name'] as String,
+          level: 1,
+          createdAt: '',
+          updatedAt: '',
+        );
+        rootCounts[rootId] = row['root_movie_count'] as int;
       }
-      final visibleChildren = normalized.isNotEmpty &&
-              !root.name.toLowerCase().contains(normalized)
-          ? children
-              .where((item) => item.tag.name.toLowerCase().contains(normalized))
-              .toList(growable: false)
-          : children;
-      return NasTagDirectoryRoot(
-        tag: root,
-        movieCount: counts[root.id] ?? 0,
-        children: visibleChildren,
-      );
-    }).whereType<NasTagDirectoryRoot>().toList(growable: false);
+      final childId = row['child_id'] as String?;
+      if (childId == null) continue;
+      children.putIfAbsent(rootId, () => []).add(
+            NasMovieSearchTagDirectoryChild(
+              tag: NasLibraryTag(
+                id: childId,
+                name: row['child_name'] as String,
+                level: 2,
+                createdAt: '',
+                updatedAt: '',
+              ),
+              movieCount: row['child_movie_count'] as int,
+              thirdLevelCount: row['third_level_count'] as int,
+            ),
+          );
+    }
+    return rootOrder
+        .map(
+          (id) => NasMovieSearchTagDirectoryRoot(
+            tag: roots[id]!,
+            movieCount: rootCounts[id]!,
+            children: children[id] ?? const [],
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  /// 固定 30 条读取某个二级标签的直属三级标签，不展开其余目录。
+  NasMovieSearchThirdLevelTagPage movieSearchThirdLevelTags({
+    required String parentTagId,
+    String query = '',
+    int page = 1,
+    int pageSize = 30,
+  }) {
+    final parent = findTag(parentTagId);
+    if (parent == null || parent.archivedAt != null || parent.level != 2) {
+      throw ArgumentError('二级标签不存在或不可用');
+    }
+    if (page < 1 || pageSize != 30) {
+      throw ArgumentError('三级标签分页参数无效');
+    }
+    final queryLike = '%${query.trim()}%';
+    const from = '''
+      FROM tag_parent_links link
+      JOIN tags child ON child.id = link.child_tag_id
+      LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = child.id
+      WHERE link.parent_tag_id = ? AND child.level = 3
+        AND child.archived_at IS NULL
+        AND (? = '%%' OR lower(child.name) LIKE lower(?))
+    ''';
+    final parameters = <Object?>[parentTagId, queryLike, queryLike];
+    final total = _db
+        .select('SELECT COUNT(DISTINCT child.id) AS count $from', parameters)
+        .single['count'] as int;
+    final offset = (page - 1) * pageSize;
+    final rows = _db.select('''
+      SELECT child.id, child.name,
+             COUNT(DISTINCT movie_tag_links.movie_id) AS movie_count
+      $from
+      GROUP BY child.id
+      ORDER BY child.name COLLATE NOCASE, child.id
+      LIMIT ? OFFSET ?
+    ''', [...parameters, pageSize, offset]);
+    return NasMovieSearchThirdLevelTagPage(
+      items: rows
+          .map(
+            (row) => NasTagChildSummary(
+              tag: NasLibraryTag(
+                id: row['id'] as String,
+                name: row['name'] as String,
+                level: 3,
+                createdAt: '',
+                updatedAt: '',
+              ),
+              movieCount: row['movie_count'] as int,
+            ),
+          )
+          .toList(growable: false),
+      number: page,
+      size: pageSize,
+      total: total,
+      hasMore: offset + rows.length < total,
+    );
   }
 
   NasTagDetails? tagDetails({
@@ -2485,7 +3018,10 @@ class NasLibraryDatabase {
     final byId = {for (final item in allTags) item.id: item};
     final parentsByChild = _tagParentsByChild();
     final parentIds = parentsByChild[tagId] ?? const <String>[];
-    final parents = parentIds.map((id) => byId[id]).whereType<NasLibraryTag>().toList(growable: false);
+    final parents = parentIds
+        .map((id) => byId[id])
+        .whereType<NasLibraryTag>()
+        .toList(growable: false);
     final directChildCount = _db.select(
       'SELECT COUNT(*) AS count FROM tag_parent_links WHERE parent_tag_id = ?',
       [tagId],
@@ -2515,7 +3051,8 @@ class NasLibraryDatabase {
     int page = 1,
     int pageSize = 10,
   }) {
-    if (page < 1 || pageSize != 10 ||
+    if (page < 1 ||
+        pageSize != 10 ||
         !const {'movieCount', 'name', 'createdAt'}.contains(sort) ||
         !const {'asc', 'desc'}.contains(order)) {
       throw ArgumentError('子标签分页参数无效');
@@ -2524,13 +3061,15 @@ class NasLibraryDatabase {
     final byId = {for (final tag in tags) tag.id: tag};
     final counts = _tagMovieCounts();
     final normalized = query.trim().toLowerCase();
-    final items = ( _tagChildrenByParent()[parentTagId] ?? const <String>[])
+    final items = (_tagChildrenByParent()[parentTagId] ?? const <String>[])
         .map((id) => byId[id])
         .whereType<NasLibraryTag>()
-        .where((tag) => normalized.isEmpty || tag.name.toLowerCase().contains(normalized))
+        .where((tag) =>
+            normalized.isEmpty || tag.name.toLowerCase().contains(normalized))
         .where((tag) =>
             associated == null || ((counts[tag.id] ?? 0) > 0) == associated)
-        .map((tag) => NasTagChildSummary(tag: tag, movieCount: counts[tag.id] ?? 0))
+        .map((tag) =>
+            NasTagChildSummary(tag: tag, movieCount: counts[tag.id] ?? 0))
         .toList(growable: false);
     items.sort((left, right) {
       final comparison = switch (sort) {
@@ -2563,8 +3102,10 @@ class NasLibraryDatabase {
     int page = 1,
     int pageSize = 15,
   }) {
-    if (page < 1 || pageSize != 15 ||
-        !const {'lastPlayedAt', 'createdAt', 'title', 'durationMs'}.contains(sort) ||
+    if (page < 1 ||
+        pageSize != 15 ||
+        !const {'lastPlayedAt', 'createdAt', 'title', 'durationMs'}
+            .contains(sort) ||
         !const {'asc', 'desc'}.contains(order)) {
       throw ArgumentError('关联影片分页参数无效');
     }
@@ -2588,7 +3129,8 @@ class NasLibraryDatabase {
       parameters.add(categoryId);
     }
     if (resolution != null) {
-      clauses.add('EXISTS (SELECT 1 FROM episodes re WHERE re.movie_id = m.id AND re.resolution_label = ?)');
+      clauses.add(
+          'EXISTS (SELECT 1 FROM episodes re WHERE re.movie_id = m.id AND re.resolution_label = ?)');
       parameters.add(resolution);
     }
     final where = clauses.join(' AND ');
@@ -2598,7 +3140,9 @@ class NasLibraryDatabase {
       SELECT l.child_tag_id FROM tag_parent_links l
       JOIN tag_scope scope ON scope.tag_id = l.parent_tag_id
     )''';
-    final count = _db.select('$cte SELECT COUNT(*) AS count FROM movies m WHERE $where', parameters)
+    final count = _db
+        .select('$cte SELECT COUNT(*) AS count FROM movies m WHERE $where',
+            parameters)
         .single['count'] as int;
     final expression = switch (sort) {
       'title' => 'm.title COLLATE NOCASE',
@@ -2631,42 +3175,51 @@ class NasLibraryDatabase {
     final byId = {for (final tag in tags) tag.id: tag};
     final parents = _tagParentsByChild();
     return NasTagTaxonomyTransfer(
-      tags: tags.map((tag) => NasTaxonomyTagDefinition(
-        name: tag.name,
-        level: tag.level,
-        description: tag.description,
-        color: tag.color,
-        parents: (parents[tag.id] ?? const <String>[])
-            .map((id) => byId[id]?.name)
-            .whereType<String>()
-            .toList(growable: false),
-      )).toList(growable: false),
+      tags: tags
+          .map((tag) => NasTaxonomyTagDefinition(
+                name: tag.name,
+                level: tag.level,
+                description: tag.description,
+                color: tag.color,
+                parents: (parents[tag.id] ?? const <String>[])
+                    .map((id) => byId[id]?.name)
+                    .whereType<String>()
+                    .toList(growable: false),
+              ))
+          .toList(growable: false),
     );
   }
 
   NasTaxonomyTransferResult importTagTaxonomy(NasTagTaxonomyTransfer transfer) {
     if (transfer.validationConflicts.isNotEmpty) {
       return NasTaxonomyTransferResult(
-        added: const [], skipped: transfer.sourceSkipped, conflicts: transfer.validationConflicts,
+        added: const [],
+        skipped: transfer.sourceSkipped,
+        conflicts: transfer.validationConflicts,
       );
     }
     final violations = taxonomyViolations();
     if (violations.isNotEmpty) {
       return NasTaxonomyTransferResult(
-        added: const [], skipped: transfer.sourceSkipped, conflicts: violations,
+        added: const [],
+        skipped: transfer.sourceSkipped,
+        conflicts: violations,
       );
     }
     final tagsByName = {
-      for (final tag in listTags(includeArchived: true)) normalizeTaxonomyName(tag.name): tag,
+      for (final tag in listTags(includeArchived: true))
+        normalizeTaxonomyName(tag.name): tag,
     };
     final definitions = {
-      for (final definition in transfer.tags) normalizeTaxonomyName(definition.name): definition,
+      for (final definition in transfer.tags)
+        normalizeTaxonomyName(definition.name): definition,
     };
     final conflicts = <String>[];
     for (final definition in transfer.tags) {
       final existing = tagsByName[normalizeTaxonomyName(definition.name)];
       if (existing != null && existing.level != definition.level) {
-        conflicts.add('标签层级冲突：${definition.name} 已是${_tagLevelName(existing.level)}标签');
+        conflicts.add(
+            '标签层级冲突：${definition.name} 已是${_tagLevelName(existing.level)}标签');
       }
       for (final parentName in definition.parents) {
         final key = normalizeTaxonomyName(parentName);
@@ -2684,17 +3237,22 @@ class NasLibraryDatabase {
     }
     if (conflicts.isNotEmpty) {
       return NasTaxonomyTransferResult(
-        added: const [], skipped: transfer.sourceSkipped, conflicts: conflicts,
+        added: const [],
+        skipped: transfer.sourceSkipped,
+        conflicts: conflicts,
       );
     }
-    final links = _db.select('SELECT child_tag_id, parent_tag_id FROM tag_parent_links')
-        .map((row) => '${row['child_tag_id']}:${row['parent_tag_id']}').toSet();
+    final links = _db
+        .select('SELECT child_tag_id, parent_tag_id FROM tag_parent_links')
+        .map((row) => '${row['child_tag_id']}:${row['parent_tag_id']}')
+        .toSet();
     final added = <String>[];
     final skipped = <String>[...transfer.sourceSkipped];
     _db.execute('BEGIN IMMEDIATE');
     try {
       for (var level = 1; level <= 3; level++) {
-        for (final definition in transfer.tags.where((item) => item.level == level)) {
+        for (final definition
+            in transfer.tags.where((item) => item.level == level)) {
           final key = normalizeTaxonomyName(definition.name);
           if (tagsByName.containsKey(key)) {
             skipped.add('${_tagLevelName(level)}标签：${tagsByName[key]!.name}');
@@ -2702,9 +3260,13 @@ class NasLibraryDatabase {
           }
           final timestamp = _now();
           final tag = NasLibraryTag(
-            id: newUuidV4(), name: definition.name, level: level,
-            description: definition.description, color: definition.color,
-            createdAt: timestamp, updatedAt: timestamp,
+            id: newUuidV4(),
+            name: definition.name,
+            level: level,
+            description: definition.description,
+            color: definition.color,
+            createdAt: timestamp,
+            updatedAt: timestamp,
           );
           _insertTag(tag);
           tagsByName[key] = tag;
@@ -2732,7 +3294,8 @@ class NasLibraryDatabase {
       _db.execute('ROLLBACK');
       rethrow;
     }
-    return NasTaxonomyTransferResult(added: added, skipped: skipped, conflicts: const []);
+    return NasTaxonomyTransferResult(
+        added: added, skipped: skipped, conflicts: const []);
   }
 
   List<String> taxonomyViolations() {
@@ -2803,7 +3366,9 @@ class NasLibraryDatabase {
     }
     for (final parentId in parentIds) {
       final parent = findTag(parentId);
-      if (parent == null || parent.archivedAt != null || parent.level != level - 1) {
+      if (parent == null ||
+          parent.archivedAt != null ||
+          parent.level != level - 1) {
         throw ArgumentError('标签父级不存在、已归档或层级不匹配');
       }
     }
@@ -2849,7 +3414,8 @@ class NasLibraryDatabase {
       FROM tag_parent_links
       ORDER BY parent_tag_id, child_tag_id
     ''')) {
-      values.putIfAbsent(row['child_tag_id'] as String, () => [])
+      values
+          .putIfAbsent(row['child_tag_id'] as String, () => [])
           .add(row['parent_tag_id'] as String);
     }
     return values;
@@ -2881,7 +3447,8 @@ class NasLibraryDatabase {
       GROUP BY descendants.ancestor_id
     ''');
     return {
-      for (final row in rows) row['tag_id'] as String: row['movie_count'] as int,
+      for (final row in rows)
+        row['tag_id'] as String: row['movie_count'] as int,
     };
   }
 
@@ -2894,20 +3461,22 @@ class NasLibraryDatabase {
   }) {
     if (tag.level == 1) return [tag];
     final parentIds = parentsByChild[tag.id] ?? const <String>[];
-    final selectedParentId = contextParentId != null && parentIds.contains(contextParentId)
-        ? contextParentId
-        : parentIds.isEmpty
-            ? null
-            : parentIds.first;
+    final selectedParentId =
+        contextParentId != null && parentIds.contains(contextParentId)
+            ? contextParentId
+            : parentIds.isEmpty
+                ? null
+                : parentIds.first;
     final parent = selectedParentId == null ? null : byId[selectedParentId];
     if (parent == null) return [tag];
     if (tag.level == 2) return [parent, tag];
     final grandparentIds = parentsByChild[parent.id] ?? const <String>[];
-    final grandparentId = contextRootId != null && grandparentIds.contains(contextRootId)
-        ? contextRootId
-        : grandparentIds.isEmpty
-            ? null
-            : grandparentIds.first;
+    final grandparentId =
+        contextRootId != null && grandparentIds.contains(contextRootId)
+            ? contextRootId
+            : grandparentIds.isEmpty
+                ? null
+                : grandparentIds.first;
     final grandparent = grandparentId == null ? null : byId[grandparentId];
     return [if (grandparent != null) grandparent, parent, tag];
   }
@@ -2920,7 +3489,10 @@ class NasLibraryDatabase {
       final tag = byId[tagId];
       if (tag == null || !visiting.add(tagId)) return const [];
       try {
-        if (tag.level == 1) return [[tag]];
+        if (tag.level == 1)
+          return [
+            [tag]
+          ];
         final parentIds = parentsByChild[tagId] ?? const <String>[];
         final paths = <List<NasLibraryTag>>[];
         for (final parentId in parentIds) {
@@ -3327,6 +3899,33 @@ class NasLibraryDatabase {
         updatedAt: row['updated_at'] as String,
       );
 
+  /// 搜索列表已经由 SQL 聚合，不能再为每部影片读取标签或路径。
+  NasLibraryMovie _mapSearchMovie(Row row) => NasLibraryMovie(
+        id: row['id'] as String,
+        title: row['title'] as String,
+        originalTitle: row['original_title'] as String?,
+        catalogNumber: row['catalog_number'] as String?,
+        publisherId: row['publisher_id'] as String?,
+        publisherName: row['publisher_name'] as String?,
+        seriesId: row['series_id'] as String?,
+        seriesName: row['series_name'] as String?,
+        summary: row['summary'] as String,
+        // 海报墙不展示演员；关键词中的演员匹配也已在同一个 SQL 查询内完成。
+        actors: const [],
+        posterFileName: row['poster_file_name'] as String?,
+        playCount: row['play_count'] as int,
+        episodeCount: row['episode_count'] as int,
+        durationMs: (row['duration_ms'] as int?) == 0
+            ? null
+            : row['duration_ms'] as int?,
+        updatedAt: row['updated_at'] as String,
+        categoryId: row['category_id'] as String?,
+        categoryName: row['category_name'] as String?,
+        videoWidth: row['video_width'] as int?,
+        videoHeight: row['video_height'] as int?,
+        resolutionLabel: row['resolution_label'] as String?,
+      );
+
   NasLibraryMovie _withResolution(NasLibraryMovie movie) {
     final rows = _db.select(
       'SELECT DISTINCT video_width, video_height, resolution_label FROM episodes WHERE movie_id = ? AND is_available = 1 AND video_width IS NOT NULL AND video_height IS NOT NULL',
@@ -3354,6 +3953,8 @@ class NasLibraryDatabase {
       durationMs: movie.durationMs,
       playCount: movie.playCount,
       updatedAt: movie.updatedAt,
+      categoryId: movie.categoryId,
+      categoryName: movie.categoryName,
       videoWidth: row?['video_width'] as int?,
       videoHeight: row?['video_height'] as int?,
       resolutionLabel: label,

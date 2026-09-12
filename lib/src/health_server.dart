@@ -394,6 +394,17 @@ class NasHealthServer {
       if (request.method == 'GET' && path == '/api/v1/movies') {
         return await _movies(request);
       }
+      if (request.method == 'POST' && path == '/api/v1/movies/search') {
+        return await _movieSearch(request);
+      }
+      if (request.method == 'GET' &&
+          path == '/api/v1/movie-search/tags/directory') {
+        return await _movieSearchTagDirectory(request);
+      }
+      if (request.method == 'GET' &&
+          path == '/api/v1/movie-search/tags/third-level') {
+        return await _movieSearchThirdLevelTags(request);
+      }
       if (request.method == 'GET' && path == '/api/v1/categories') {
         return await _categories(request);
       }
@@ -724,6 +735,143 @@ class NasHealthServer {
         'hasMore': offset + paged.length < movies.length,
       },
     });
+  }
+
+  /// 面向浏览端的全库结构化搜索；标签条件绝不在 Windows 侧二次计算。
+  Future<void> _movieSearch(HttpRequest request) async {
+    final filter = _movieSearchFilter(await _readJsonBody(request));
+    if (filter == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final hasDatabaseLibrary =
+        config.managedCategoryLibrary || _libraryDatabase.hasScannedMediaRoots;
+    if (!hasDatabaseLibrary) {
+      if (filter.categoryId != null ||
+          filter.resolutions.isNotEmpty ||
+          filter.watchStates.isNotEmpty ||
+          filter.tagConditions.isNotEmpty) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
+      }
+      final items = _library.listMovies(query: filter.query);
+      final offset = (filter.page - 1) * filter.pageSize;
+      final paged = offset >= items.length
+          ? const <Map<String, Object?>>[]
+          : items.skip(offset).take(filter.pageSize).toList(growable: false);
+      return _writeJson(request.response, HttpStatus.ok, {
+        'data': {'items': paged},
+        'page': {
+          'number': filter.page,
+          'size': filter.pageSize,
+          'total': items.length,
+          'hasMore': offset + paged.length < items.length,
+        },
+      });
+    }
+    if (filter.categoryId != null &&
+        _libraryDatabase.findCategory(filter.categoryId!) == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    for (final condition in filter.tagConditions) {
+      final tag = _libraryDatabase.findTag(condition.tagId);
+      if (tag == null ||
+          tag.archivedAt != null ||
+          tag.level < 1 ||
+          tag.level > 3 ||
+          (tag.level == 3 && condition.includeDescendants)) {
+        return _error(request, HttpStatus.badRequest, 'invalid_request');
+      }
+    }
+    try {
+      final page = _libraryDatabase.searchMovies(filter);
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'items':
+              page.items.map(_databaseSearchSummary).toList(growable: false),
+        },
+        'page': {
+          'number': page.number,
+          'size': page.size,
+          'total': page.total,
+          'hasMore': page.hasMore,
+        },
+      });
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  /// 搜索抽屉仅请求一、二级目录，避免为打开抽屉读取全部三级标签。
+  Future<void> _movieSearchTagDirectory(HttpRequest request) async {
+    final query = request.uri.queryParameters['q'] ?? '';
+    if (query.length > 120) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final items = _libraryDatabase.movieSearchTagDirectory(query: query);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': items
+            .map(
+              (root) => {
+                'tag': _movieSearchTagPayload(root.tag),
+                'movieCount': root.movieCount,
+                'children': root.children
+                    .map(
+                      (child) => {
+                        'tag': _movieSearchTagPayload(child.tag),
+                        'movieCount': child.movieCount,
+                        'thirdLevelCount': child.thirdLevelCount,
+                      },
+                    )
+                    .toList(growable: false),
+              },
+            )
+            .toList(growable: false),
+      },
+    });
+  }
+
+  /// 当前二级节点的三级标签固定分页，不能以目录预取替代。
+  Future<void> _movieSearchThirdLevelTags(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final parentTagId = parameters['parentTagId']?.trim();
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '30') ?? 0;
+    final query = parameters['q'] ?? '';
+    if (parentTagId == null ||
+        parentTagId.isEmpty ||
+        page < 1 ||
+        pageSize != 30 ||
+        query.length > 120) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      final result = _libraryDatabase.movieSearchThirdLevelTags(
+        parentTagId: parentTagId,
+        query: query,
+        page: page,
+        pageSize: pageSize,
+      );
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'items': result.items
+              .map(
+                (item) => {
+                  'tag': _movieSearchTagPayload(item.tag),
+                  'movieCount': item.movieCount,
+                },
+              )
+              .toList(growable: false),
+        },
+        'page': {
+          'number': result.number,
+          'size': result.size,
+          'total': result.total,
+          'hasMore': result.hasMore,
+        },
+      });
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
   }
 
   Future<void> _movieDetails(HttpRequest request) async {
@@ -2023,6 +2171,116 @@ class NasHealthServer {
     return left.compareTo(right);
   }
 
+  NasMovieSearchFilter? _movieSearchFilter(Map<String, dynamic>? body) {
+    const fields = {
+      'q',
+      'categoryId',
+      'resolutions',
+      'watchStates',
+      'sort',
+      'order',
+      'page',
+      'pageSize',
+      'tagConditions',
+    };
+    if (body == null ||
+        body.keys.any((key) => !fields.contains(key)) ||
+        !body.keys.toSet().containsAll(fields) ||
+        body['q'] is! String ||
+        (body['categoryId'] != null && body['categoryId'] is! String) ||
+        body['resolutions'] is! List ||
+        body['watchStates'] is! List ||
+        body['sort'] is! String ||
+        body['order'] is! String ||
+        body['page'] is! int ||
+        body['pageSize'] is! int ||
+        body['tagConditions'] is! Map) {
+      return null;
+    }
+    final query = (body['q'] as String).trim();
+    final categoryId = (body['categoryId'] as String?)?.trim();
+    final page = body['page'] as int;
+    final pageSize = body['pageSize'] as int;
+    final resolutions = (body['resolutions'] as List)
+        .map((value) => value is String ? value.trim() : null)
+        .toList(growable: false);
+    final watchStates = (body['watchStates'] as List)
+        .map((value) => value is String ? value.trim() : null)
+        .toList(growable: false);
+    if (query.length > 240 ||
+        categoryId?.isEmpty == true ||
+        resolutions.any((value) => value == null || value.isEmpty) ||
+        resolutions.toSet().length != resolutions.length ||
+        resolutions.length > 8 ||
+        watchStates.any((value) => value == null || value.isEmpty) ||
+        watchStates.toSet().length != watchStates.length ||
+        !watchStates.cast<String>().every(
+              const {'unwatched', 'continue'}.contains,
+            )) {
+      return null;
+    }
+    final rawConditions = Map<String, dynamic>.from(
+      body['tagConditions'] as Map,
+    );
+    const groups = {'all', 'any', 'exclude'};
+    if (rawConditions.keys.any((key) => !groups.contains(key)) ||
+        !rawConditions.keys.toSet().containsAll(groups)) {
+      return null;
+    }
+    final conditions = <NasMovieSearchTagCondition>[];
+    final seenTagIds = <String>{};
+    for (final group in groups) {
+      final values = rawConditions[group];
+      if (values is! List || values.length > 80) return null;
+      for (final raw in values) {
+        if (raw is! Map) return null;
+        final item = Map<String, dynamic>.from(raw);
+        if (item.keys.length != 2 ||
+            !item.keys.contains('tagId') ||
+            !item.keys.contains('includeDescendants') ||
+            item['tagId'] is! String ||
+            item['includeDescendants'] is! bool) {
+          return null;
+        }
+        final tagId = (item['tagId'] as String).trim();
+        if (tagId.isEmpty || !seenTagIds.add(tagId)) return null;
+        conditions.add(
+          NasMovieSearchTagCondition(
+            group: group,
+            tagId: tagId,
+            includeDescendants: item['includeDescendants'] as bool,
+          ),
+        );
+      }
+    }
+    if (conditions.length > 120 ||
+        page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        !const {
+          'relevance',
+          'createdAt',
+          'title',
+          'updatedAt',
+          'durationMs',
+          'recent'
+        }.contains(body['sort']) ||
+        !const {'asc', 'desc'}.contains(body['order'])) {
+      return null;
+    }
+    return NasMovieSearchFilter(
+      query: query,
+      categoryId: categoryId,
+      resolutions: resolutions.cast<String>().toSet(),
+      watchStates: watchStates.cast<String>().toSet(),
+      sort: body['sort'] as String,
+      order: body['order'] as String,
+      page: page,
+      pageSize: pageSize,
+      tagConditions: conditions,
+    );
+  }
+
   Map<String, Object?>? _publisherInputValues(
     Map<String, dynamic>? body, {
     required bool creating,
@@ -2194,6 +2452,42 @@ class NasHealthServer {
             .tagPathsForMovie(movie.id)
             .map((path) => path.names)
             .toList(growable: false),
+        'episodeCount': movie.episodeCount,
+        'durationMs': movie.durationMs,
+        'resolutionLabel': movie.resolutionLabel,
+        'resolutionWidth': movie.videoWidth,
+        'resolutionHeight': movie.videoHeight,
+        'posterUrl': movie.posterFileName == null
+            ? null
+            : '/api/v1/assets/posters/${movie.id}',
+        'isFavorite': false,
+        'playCount': movie.playCount,
+        'resumePositionMs': 0,
+        'updatedAt': movie.updatedAt,
+      };
+
+  /// 搜索列表不携带标签或路径，避免逐部影片读取标签后让客户端再次筛选。
+  Map<String, Object?> _databaseSearchSummary(NasLibraryMovie movie) => {
+        'id': movie.id,
+        'title': movie.title,
+        'originalTitle': movie.originalTitle,
+        'catalogNumber': movie.catalogNumber,
+        'publisher': movie.publisherId == null
+            ? null
+            : {
+                'id': movie.publisherId,
+                'displayName': movie.publisherName,
+              },
+        'series': movie.seriesId == null
+            ? null
+            : {
+                'id': movie.seriesId,
+                'displayName': movie.seriesName,
+                'publisherId': movie.publisherId,
+              },
+        'category': movie.categoryId == null
+            ? null
+            : {'id': movie.categoryId, 'name': movie.categoryName},
         'episodeCount': movie.episodeCount,
         'durationMs': movie.durationMs,
         'resolutionLabel': movie.resolutionLabel,
@@ -3260,6 +3554,13 @@ class NasHealthServer {
         'createdAt': tag.createdAt,
         'updatedAt': tag.updatedAt,
         'archivedAt': tag.archivedAt,
+      };
+
+  /// 浏览端搜索目录只暴露匹配所需的稳定身份和展示名称。
+  Map<String, Object?> _movieSearchTagPayload(NasLibraryTag tag) => {
+        'id': tag.id,
+        'name': tag.name,
+        'level': tag.level,
       };
 
   _TagManagementInput? _tagManagementInput(
