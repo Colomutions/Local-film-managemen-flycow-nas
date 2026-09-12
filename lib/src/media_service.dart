@@ -56,17 +56,35 @@ class NasMediaService {
     }
   }
 
-  /// Renames a single source file without leaving its directory.  Both the
-  /// source and destination are resolved below the media root so callers never
-  /// receive or operate on a host path.
+  /// 在指定物理来源盘内解析路径。返回值仍只保留该来源盘内的相对路径。
+  Future<NasMediaFile?> fileForRootRelativePath({
+    required String rootPath,
+    required String relativePath,
+  }) async {
+    final rootRelative = _rootRelativePath(rootPath);
+    if (rootRelative == null || !_isSafeRelativePath(relativePath)) {
+      return null;
+    }
+    final file = await fileForRelativePath('$rootRelative/$relativePath');
+    return file == null ? null : NasMediaFile(file.file, relativePath);
+  }
+
+  /// 在不离开所属目录的前提下重命名单个来源文件，并始终在媒体根目录内校验路径。
   Future<NasMediaFile> renameFileInPlace({
     required String relativePath,
     required String sourceName,
+    String? rootPath,
   }) async {
     if (!_isSafeRelativePath(relativePath) || !_isSafeSourceName(sourceName)) {
       throw const NasMediaRenameException('invalid_source_name');
     }
-    final source = await fileForRelativePath(relativePath);
+    final effectiveRootPath = rootPath ?? mediaDir;
+    final source = rootPath == null
+        ? await fileForRelativePath(relativePath)
+        : await fileForRootRelativePath(
+            rootPath: effectiveRootPath,
+            relativePath: relativePath,
+          );
     if (source == null) throw const NasMediaRenameException('resource_not_found');
     final currentName = source.relativePath.split('/').last;
     final currentDot = currentName.lastIndexOf('.');
@@ -78,8 +96,8 @@ class NasMediaService {
     }
     final parentSegments = source.relativePath.split('/')..removeLast();
     final renamedRelativePath = [...parentSegments, sourceName].join('/');
-    final root = Directory(mediaDir);
-    final rootPath = await root.resolveSymbolicLinks();
+    final root = Directory(effectiveRootPath);
+    final resolvedRootPath = await root.resolveSymbolicLinks();
     final candidate = File([
       root.path,
       ...parentSegments,
@@ -90,17 +108,21 @@ class NasMediaService {
         throw const NasMediaRenameException('source_name_conflict');
       }
       final resolvedParent = await source.file.parent.resolveSymbolicLinks();
-      final prefix = rootPath.endsWith(Platform.pathSeparator)
-          ? rootPath
-          : '$rootPath${Platform.pathSeparator}';
+      final prefix = resolvedRootPath.endsWith(Platform.pathSeparator)
+          ? resolvedRootPath
+          : '$resolvedRootPath${Platform.pathSeparator}';
       if (!resolvedParent.startsWith(prefix)) {
         throw const NasMediaRenameException('invalid_source_name');
       }
       final renamed = await source.file.rename(candidate.path);
-      final checked = await fileForRelativePath(renamedRelativePath);
+      final checked = rootPath == null
+          ? await fileForRelativePath(renamedRelativePath)
+          : await fileForRootRelativePath(
+              rootPath: effectiveRootPath,
+              relativePath: renamedRelativePath,
+            );
       if (checked == null) {
-        // This should be unreachable after the source path checks.  Prefer a
-        // best-effort rollback to leaving a file outside the managed boundary.
+        // 路径校验后不应到达这里；优先尽力回滚，避免文件停留在受管边界外。
         try {
           if (await renamed.exists() && !(await source.file.exists())) {
             await renamed.rename(source.file.path);
@@ -119,10 +141,11 @@ class NasMediaService {
   Future<void> restoreRenamedFile({
     required NasMediaFile renamedFile,
     required String originalRelativePath,
+    String? rootPath,
   }) async {
     if (!_isSafeRelativePath(originalRelativePath)) return;
     final original = File([
-      mediaDir,
+      rootPath ?? mediaDir,
       ...originalRelativePath.split('/'),
     ].join(Platform.pathSeparator));
     try {
@@ -184,6 +207,38 @@ class NasMediaService {
           .replaceAll(Platform.pathSeparator, '/');
       if (canonicalRelative.isEmpty) return null;
       return NasMediaDirectory(Directory(resolvedDirectory), canonicalRelative);
+    } on FileSystemException {
+      return null;
+    }
+  }
+
+  /// 以物理来源盘为边界解析分类来源目录，避免跨盘或符号链接逃逸。
+  Future<NasMediaDirectory?> directoryForRootRelativePath({
+    required String rootPath,
+    required String relativePath,
+  }) async {
+    final rootRelative = _rootRelativePath(rootPath);
+    if (rootRelative == null || !_isSafeRelativePath(relativePath)) {
+      return null;
+    }
+    final directory = await directoryForRelativePath('$rootRelative/$relativePath');
+    return directory == null
+        ? null
+        : NasMediaDirectory(directory.directory, relativePath.replaceAll('\\', '/'));
+  }
+
+  String? _rootRelativePath(String rootPath) {
+    try {
+      final base = Directory(mediaDir).absolute.path;
+      final root = Directory(rootPath).absolute.path;
+      final prefix = base.endsWith(Platform.pathSeparator)
+          ? base
+          : '$base${Platform.pathSeparator}';
+      if (!root.startsWith(prefix)) return null;
+      final relative = root
+          .substring(prefix.length)
+          .replaceAll(Platform.pathSeparator, '/');
+      return _isSafeRelativePath(relative) ? relative : null;
     } on FileSystemException {
       return null;
     }

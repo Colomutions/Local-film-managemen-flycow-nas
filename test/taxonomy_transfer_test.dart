@@ -6,8 +6,10 @@ import '../lib/src/library/taxonomy_transfer.dart';
 import '../lib/src/library_database.dart';
 
 Future<void> main() async {
-  final directory = await Directory.systemTemp.createTemp('mujing-taxonomy-test-');
-  final databasePath = '${directory.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite';
+  final directory =
+      await Directory.systemTemp.createTemp('mujing-taxonomy-test-');
+  final databasePath =
+      '${directory.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite';
   await Directory('${directory.path}${Platform.pathSeparator}db').create();
   _createVersion19TaxonomyDatabase(databasePath);
 
@@ -40,12 +42,18 @@ Future<void> main() async {
       '三级标签返回直接父级',
     );
     _expect(
-      database.tagDirectory().singleWhere((item) => item.tag.id == genre.id).children
+      database
+          .tagDirectory()
+          .singleWhere((item) => item.tag.id == genre.id)
+          .children
           .any((item) => item.tag.id == crime.id),
       '二级多父级显示在第一个一级目录下',
     );
     _expect(
-      database.tagDirectory().singleWhere((item) => item.tag.id == mood.id).children
+      database
+          .tagDirectory()
+          .singleWhere((item) => item.tag.id == mood.id)
+          .children
           .any((item) => item.tag.id == crime.id),
       '二级多父级显示在第二个一级目录下',
     );
@@ -83,7 +91,7 @@ Future<void> main() async {
 
     final validTransfer = const NasTagTaxonomyTransfer(
       tags: [
-        NasTaxonomyTagDefinition(name: '地区', level: 1),
+        NasTaxonomyTagDefinition(name: '地区', level: 1, color: '#654321'),
         NasTaxonomyTagDefinition(name: '时代', level: 1),
         NasTaxonomyTagDefinition(name: '欧洲', level: 2, parents: ['地区']),
         NasTaxonomyTagDefinition(name: '战后', level: 2, parents: ['时代']),
@@ -97,6 +105,27 @@ Future<void> main() async {
     final imported = database.importTagTaxonomy(validTransfer);
     _expect(imported.conflicts.isEmpty, '三级导入没有冲突');
     _expect(imported.added.length == 9, '导入写入五个实体和四条多父归属');
+    final importedTags = {
+      for (final tag in database.listTags()) tag.name: tag,
+    };
+    _expect(importedTags['地区']!.color == '#654321', '标签导入保留文件中的显式颜色');
+    _expect(
+      [
+        '时代',
+        '欧洲',
+        '战后',
+        '法国黑色电影',
+      ].every(
+        (name) => const {
+          '#ffc266',
+          '#58d5ff',
+          '#73d8a4',
+          '#b59aff',
+          '#ff8eaa',
+        }.contains(importedTags[name]!.color),
+      ),
+      '缺省标签颜色由 NAS 随机补齐',
+    );
     final repeated = database.importTagTaxonomy(validTransfer);
     _expect(repeated.added.isEmpty && repeated.skipped.isNotEmpty, '重复导入安全跳过');
 
@@ -105,21 +134,32 @@ Future<void> main() async {
       'version': 2,
       'tags': [
         {'name': '角色混用', 'level': 1},
-        {'name': '角色混用', 'level': 2, 'parents': ['地区']},
+        {
+          'name': '角色混用',
+          'level': 2,
+          'parents': ['地区']
+        },
       ],
     });
     _expect(invalidTransfer.validationConflicts.length == 1, '导入先发现层级角色混用');
     final rejected = database.importTagTaxonomy(invalidTransfer);
-    _expect(rejected.added.isEmpty && rejected.conflicts.length == 1, '冲突导入整体不写库');
     _expect(
-      !database.listTags(includeArchived: true).any((tag) => tag.name == '角色混用'),
+        rejected.added.isEmpty && rejected.conflicts.length == 1, '冲突导入整体不写库');
+    _expect(
+      !database
+          .listTags(includeArchived: true)
+          .any((tag) => tag.name == '角色混用'),
       '冲突标签没有部分写入',
     );
     final wrongParent = NasTagTaxonomyTransfer.decode({
       'format': 'mujing-tags',
       'version': 2,
       'tags': [
-        {'name': '越级子级', 'level': 3, 'parents': ['地区']},
+        {
+          'name': '越级子级',
+          'level': 3,
+          'parents': ['地区']
+        },
       ],
     });
     _expect(
@@ -146,12 +186,43 @@ Future<void> main() async {
     _expect(stopwatch.elapsed < const Duration(seconds: 20), '大样本批量导入在合理时间内完成');
     final firstPage = database.tagChildren(parentTagId: batchRoot.id, page: 1);
     final secondPage = database.tagChildren(parentTagId: batchRoot.id, page: 2);
-    _expect(firstPage.items.length == 10 && secondPage.items.length == 10, '直属子标签固定十条分页');
+    _expect(firstPage.items.length == 10 && secondPage.items.length == 10,
+        '直属子标签固定十条分页');
     _expect(firstPage.total == 1200 && firstPage.hasMore, '直属子标签返回正确分页元数据');
 
     _expect(
-      NasTagTaxonomyTransfer.decode(database.exportTagTaxonomy().toJson()).tags.isNotEmpty,
+      NasTagTaxonomyTransfer.decode(database.exportTagTaxonomy().toJson())
+          .tags
+          .isNotEmpty,
       '三级标签导出和导入格式可以往返解析',
+    );
+
+    final categoryImport = database.importCategoryTaxonomy(
+      const NasCategoryTaxonomyTransfer(
+        categories: [
+          NasTaxonomyCategoryDefinition(name: '导入随机分类'),
+          NasTaxonomyCategoryDefinition(name: '导入固定分类', color: '#123456'),
+        ],
+      ),
+    );
+    _expect(categoryImport.conflicts.isEmpty, '分类导入没有冲突');
+    final importedCategories = {
+      for (final category in database.listCategories()) category.name: category,
+    };
+    _expect(
+      const {
+        '#1677FF',
+        '#8B5CF6',
+        '#0FAF8F',
+        '#E86A33',
+        '#E5484D',
+        '#D89B16',
+      }.contains(importedCategories['导入随机分类']!.color),
+      '缺省分类颜色由 NAS 随机补齐',
+    );
+    _expect(
+      importedCategories['导入固定分类']!.color == '#123456',
+      '分类导入保留文件中的显式颜色',
     );
   } finally {
     await database.close();
@@ -165,9 +236,12 @@ Future<void> main() async {
         .toSet();
     _expect(!names.contains('tag_placements'), '旧路径归属表已定向移除');
     _expect(!names.contains('movie_tag_placements'), '旧影片路径关联表已定向移除');
-    _expect(names.contains('tag_parent_links') && names.contains('movie_tag_links'), '新概念关联表已创建');
     _expect(
-      migrated.select('SELECT COUNT(*) AS count FROM movies').single['count'] == 1,
+        names.contains('tag_parent_links') && names.contains('movie_tag_links'),
+        '新概念关联表已创建');
+    _expect(
+      migrated.select('SELECT COUNT(*) AS count FROM movies').single['count'] ==
+          1,
       '升级不会删除影片记录',
     );
   } finally {
@@ -184,8 +258,41 @@ void _createVersion19TaxonomyDatabase(String path) {
     database.execute('''
       CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       INSERT INTO schema_migrations(version, applied_at) VALUES (19, '2026-09-11T00:00:00Z');
-      CREATE TABLE movies (id TEXT PRIMARY KEY);
-      INSERT INTO movies(id) VALUES ('preserved-movie');
+      CREATE TABLE movies (
+        id TEXT PRIMARY KEY,
+        category_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO movies(id, created_at, updated_at)
+        VALUES ('preserved-movie', '2026-01-01', '2026-01-01');
+      CREATE TABLE media_roots (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        last_scanned_at TEXT
+      );
+      CREATE TABLE episodes (
+        id TEXT PRIMARY KEY,
+        movie_id TEXT NOT NULL,
+        relative_path TEXT NOT NULL
+      );
+      CREATE TABLE library_categories (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        color TEXT,
+        media_relative_path TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE playback_history (
+        id TEXT PRIMARY KEY,
+        movie_id TEXT NOT NULL,
+        episode_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        end_position_ms INTEGER,
+        duration_ms INTEGER
+      );
       CREATE TABLE tags (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,

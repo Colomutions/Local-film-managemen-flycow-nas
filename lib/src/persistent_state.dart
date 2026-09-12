@@ -6,16 +6,21 @@ class NasDeviceToken {
     required this.deviceId,
     required this.scope,
     required this.expiresAt,
+    this.platform = 'unknown',
   });
 
   final String deviceId;
   final String scope;
   final DateTime expiresAt;
 
+  /// 配对客户端声明的平台。旧 token 没有该字段时保持为 unknown。
+  final String platform;
+
   Map<String, Object> toJson() => {
         'deviceId': deviceId,
         'scope': scope,
         'expiresAt': expiresAt.toUtc().toIso8601String(),
+        'platform': platform,
       };
 
   static NasDeviceToken? fromJson(Object? value) {
@@ -23,6 +28,11 @@ class NasDeviceToken {
     final deviceId = value['deviceId'];
     final scope = value['scope'];
     final expiresAt = DateTime.tryParse(value['expiresAt'] as String? ?? '');
+    final rawPlatform = value['platform'];
+    final platform = rawPlatform is String &&
+            const {'windows', 'android', 'unknown'}.contains(rawPlatform)
+        ? rawPlatform
+        : 'unknown';
     if (deviceId is! String ||
         deviceId.isEmpty ||
         (scope != 'viewer' && scope != 'admin') ||
@@ -33,6 +43,7 @@ class NasDeviceToken {
       deviceId: deviceId,
       scope: scope,
       expiresAt: expiresAt.toUtc(),
+      platform: platform,
     );
   }
 }

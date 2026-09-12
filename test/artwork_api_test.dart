@@ -82,6 +82,25 @@ Future<void> main() async {
     _expect(firstPoster.bytes.toString() == _pngOne.toString(),
         'poster returns uploaded bytes');
 
+    final carouselUpload = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/movies/${movie['id']}/carousel-images',
+      token: adminToken,
+      bytes: _pngOne,
+      contentType: 'image/png',
+    );
+    _expect(carouselUpload.statusCode == HttpStatus.created,
+        'admin uploads carousel image');
+    final carouselUrl =
+        (carouselUpload.json['data'] as Map<String, dynamic>)['url'] as String;
+    final carousel =
+        await _request(base, 'GET', carouselUrl, token: viewerToken);
+    _expect(carousel.statusCode == HttpStatus.ok,
+        'viewer reads carousel image for UUID movie id');
+    _expect(carousel.bytes.toString() == _pngOne.toString(),
+        'carousel returns uploaded bytes');
+
     final replaced = await _request(base, 'POST', posterPath,
         token: adminToken, bytes: _pngTwo, contentType: 'image/png');
     _expect(replaced.statusCode == HttpStatus.ok, 'admin replaces poster');

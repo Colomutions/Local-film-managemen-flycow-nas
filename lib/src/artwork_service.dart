@@ -128,8 +128,7 @@ class NasArtworkService {
 
   Future<NasArtworkFile?> carouselImage(String? fileName) async {
     if (fileName == null ||
-        !RegExp(r'^movie-[A-Za-z0-9-]+-[A-Za-z0-9-]+\.(png|jpe?g|webp)$')
-            .hasMatch(fileName)) {
+        !RegExp(r'^[A-Za-z0-9-]+\.(png|jpe?g|webp)$').hasMatch(fileName)) {
       return null;
     }
     final mimeType = _mimeTypeForFileName(fileName);

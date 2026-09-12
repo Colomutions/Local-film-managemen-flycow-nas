@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:sqlite3/sqlite3.dart';
 
@@ -11,6 +12,29 @@ import 'movie_actor.dart';
 
 String _normalizeCatalogNumber(String value) =>
     value.trim().toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
+
+const _importCategoryColorOptions = [
+  '#1677FF',
+  '#8B5CF6',
+  '#0FAF8F',
+  '#E86A33',
+  '#E5484D',
+  '#D89B16',
+];
+
+const _importTagColorOptions = [
+  '#ffc266',
+  '#58d5ff',
+  '#73d8a4',
+  '#b59aff',
+  '#ff8eaa',
+];
+
+final _importColorRandom = Random();
+
+/// 导入文件没有声明颜色时，由 NAS 统一生成并持久化随机主题色。
+String _randomImportColor(List<String> options) =>
+    options[_importColorRandom.nextInt(options.length)];
 
 String? _nullableTrimmed(String? value) {
   final normalized = value?.trim();
@@ -39,6 +63,7 @@ class NasLibraryMovie {
     required this.posterFileName,
     required this.episodeCount,
     required this.durationMs,
+    required this.entryType,
     required this.playCount,
     required this.updatedAt,
     this.categoryId,
@@ -61,6 +86,9 @@ class NasLibraryMovie {
   final String? posterFileName;
   final int episodeCount;
   final int? durationMs;
+
+  /// `single` 表示普通影片，`series` 表示可包含零到多集的影集。
+  final String entryType;
   final int playCount;
   final String updatedAt;
   final String? categoryId;
@@ -74,11 +102,14 @@ class NasLibraryEpisode {
   const NasLibraryEpisode({
     required this.id,
     required this.movieId,
+    required this.mediaRootId,
     required this.title,
     required this.relativePath,
     required this.fileSize,
     required this.isAvailable,
     required this.updatedAt,
+    required this.sourceName,
+    required this.sourceOnline,
     this.durationMs,
     this.videoWidth,
     this.videoHeight,
@@ -88,11 +119,16 @@ class NasLibraryEpisode {
 
   final String id;
   final String movieId;
+  final String mediaRootId;
   final String title;
   final String relativePath;
   final int fileSize;
   final bool isAvailable;
   final String updatedAt;
+
+  /// 仅供客户端展示的来源盘名称，绝不包含 NAS 宿主机路径。
+  final String sourceName;
+  final bool sourceOnline;
   final int? durationMs;
   final int? videoWidth;
   final int? videoHeight;
@@ -111,6 +147,7 @@ class NasMediaRoot {
     required this.createdAt,
     required this.updatedAt,
     required this.lastScannedAt,
+    required this.isOnline,
   });
 
   final String id;
@@ -122,6 +159,41 @@ class NasMediaRoot {
   final String createdAt;
   final String updatedAt;
   final String? lastScannedAt;
+  final bool isOnline;
+}
+
+/// 一个逻辑分类绑定到某块物理来源盘中的一个目录。
+class NasCategoryMediaSource {
+  const NasCategoryMediaSource({
+    required this.id,
+    required this.categoryId,
+    required this.mediaRootId,
+    required this.sourceName,
+    required this.relativePath,
+    required this.isOnline,
+    this.lastScannedAt,
+  });
+
+  final String id;
+  final String categoryId;
+  final String mediaRootId;
+  final String sourceName;
+  final String relativePath;
+  final bool isOnline;
+  final String? lastScannedAt;
+
+  /// 面向 API 的安全目录键；不携带容器或宿主机绝对路径。
+  String get directoryKey => '$sourceName/$relativePath';
+}
+
+class NasCategoryMediaSourceInput {
+  const NasCategoryMediaSourceInput({
+    required this.mediaRootId,
+    required this.relativePath,
+  });
+
+  final String mediaRootId;
+  final String relativePath;
 }
 
 class NasLibraryCategory {
@@ -132,6 +204,7 @@ class NasLibraryCategory {
     this.mediaRelativePath,
     required this.createdAt,
     required this.updatedAt,
+    this.mediaSources = const [],
   });
 
   final String id;
@@ -140,6 +213,73 @@ class NasLibraryCategory {
   final String? mediaRelativePath;
   final String createdAt;
   final String updatedAt;
+  final List<NasCategoryMediaSource> mediaSources;
+}
+
+class NasEpisodePage {
+  const NasEpisodePage({
+    required this.items,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<NasLibraryEpisode> items;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
+}
+
+class NasScannedMediaFile {
+  const NasScannedMediaFile({
+    required this.episode,
+    required this.movieId,
+    required this.movieTitle,
+    required this.entryType,
+    required this.categoryId,
+  });
+
+  final NasLibraryEpisode episode;
+  final String movieId;
+  final String movieTitle;
+  final String entryType;
+  final String? categoryId;
+}
+
+class NasScannedMediaFilePage {
+  const NasScannedMediaFilePage({
+    required this.items,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+  });
+
+  final List<NasScannedMediaFile> items;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
+}
+
+class NasCollectionMigrationCandidate {
+  const NasCollectionMigrationCandidate({
+    required this.key,
+    required this.categoryId,
+    required this.title,
+    required this.episodeIds,
+    required this.sourceMovieIds,
+    required this.requiresMetadataChoice,
+  });
+
+  final String key;
+  final String categoryId;
+  final String title;
+  final List<String> episodeIds;
+  final List<String> sourceMovieIds;
+  final bool requiresMetadataChoice;
 }
 
 class NasLibraryTag {
@@ -363,11 +503,17 @@ class NasMovieSearchThirdLevelTagPage {
 }
 
 class NasScanResult {
-  const NasScanResult(
-      {required this.scannedFiles, required this.availableEpisodes});
+  const NasScanResult({
+    required this.scannedFiles,
+    required this.availableEpisodes,
+    this.conflicts = const [],
+  });
 
   final int scannedFiles;
   final int availableEpisodes;
+
+  /// 已跳过的嵌套影集范围，仅返回安全的相对目录标识。
+  final List<String> conflicts;
 }
 
 class NasCarouselImage {
@@ -582,8 +728,121 @@ class NasPlaybackHistoryItem {
   final int? durationMs;
 }
 
+/// 观影记录查询的全部筛选和排序均由 NAS 执行，客户端只保存当前条件与页码。
+class NasWatchHistoryQuery {
+  const NasWatchHistoryQuery({
+    required this.query,
+    required this.startedOnOrAfter,
+    required this.startedBefore,
+    required this.devicePlatform,
+    required this.sort,
+    required this.order,
+    required this.page,
+    required this.pageSize,
+  });
+
+  final String query;
+  final String? startedOnOrAfter;
+  final String? startedBefore;
+  final String? devicePlatform;
+  final String sort;
+  final String order;
+  final int page;
+  final int pageSize;
+}
+
+/// 一次正式播放对应一条稳定记录，始终同时保存逻辑影视和具体分集身份。
+class NasWatchHistoryRecord {
+  const NasWatchHistoryRecord({
+    required this.recordId,
+    required this.movieId,
+    required this.episodeId,
+    required this.title,
+    required this.episodeTitle,
+    required this.startedAt,
+    required this.lastReportedAt,
+    required this.watchDurationMs,
+    required this.lastPositionMs,
+    required this.durationMs,
+    required this.status,
+    required this.deviceId,
+    required this.devicePlatform,
+    this.originalTitle,
+    this.catalogNumber,
+    this.posterFileName,
+    this.sourceName,
+    this.endedAt,
+  });
+
+  final String recordId;
+  final String movieId;
+  final String episodeId;
+  final String title;
+  final String episodeTitle;
+  final String startedAt;
+  final String lastReportedAt;
+  final int watchDurationMs;
+  final int lastPositionMs;
+  final int? durationMs;
+  final String status;
+  final String deviceId;
+  final String devicePlatform;
+  final String? originalTitle;
+  final String? catalogNumber;
+  final String? posterFileName;
+  final String? sourceName;
+  final String? endedAt;
+}
+
+class NasWatchHistoryStats {
+  const NasWatchHistoryStats({
+    required this.recordCount,
+    required this.watchDurationMs,
+    required this.continueCount,
+    required this.activeDeviceCount,
+  });
+
+  final int recordCount;
+  final int watchDurationMs;
+  final int continueCount;
+  final int activeDeviceCount;
+}
+
+class NasWatchHistoryPage {
+  const NasWatchHistoryPage({
+    required this.items,
+    required this.number,
+    required this.size,
+    required this.total,
+    required this.hasMore,
+    required this.stats,
+    required this.continueItems,
+    required this.deviceCounts,
+  });
+
+  final List<NasWatchHistoryRecord> items;
+  final int number;
+  final int size;
+  final int total;
+  final bool hasMore;
+  final NasWatchHistoryStats stats;
+  final List<NasWatchHistoryRecord> continueItems;
+  final Map<String, int> deviceCounts;
+}
+
+/// NAS 为一个影视条目统一计算的续播目标，始终指向具体分集。
+class NasPlaybackResumeTarget {
+  const NasPlaybackResumeTarget({
+    required this.episodeId,
+    required this.positionMs,
+  });
+
+  final String episodeId;
+  final int positionMs;
+}
+
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 21;
+  static const currentSchemaVersion = 24;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -1136,6 +1395,76 @@ class NasLibraryDatabase {
         [21, _now()],
       );
     }
+    if (current < 22) {
+      // 影集归属和盘状态只保存在 NAS：影片条目不再绑定某个物理盘。
+      _db.execute('''
+        ALTER TABLE media_roots ADD COLUMN is_online INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE movies ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'single'
+          CHECK(entry_type IN ('single', 'series'));
+        ALTER TABLE movies ADD COLUMN collection_key TEXT;
+        ALTER TABLE episodes ADD COLUMN natural_sort_key TEXT NOT NULL DEFAULT '';
+        ALTER TABLE episodes ADD COLUMN manual_order INTEGER;
+
+        CREATE TABLE category_media_sources (
+          id TEXT PRIMARY KEY,
+          category_id TEXT NOT NULL REFERENCES library_categories(id) ON DELETE CASCADE,
+          media_root_id TEXT NOT NULL REFERENCES media_roots(id) ON DELETE RESTRICT,
+          relative_path TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(category_id, media_root_id, relative_path)
+        );
+        CREATE UNIQUE INDEX movies_collection_key_idx
+          ON movies(collection_key) WHERE collection_key IS NOT NULL;
+        CREATE INDEX category_media_sources_category_idx
+          ON category_media_sources(category_id, media_root_id, relative_path);
+        CREATE INDEX episodes_movie_sort_idx
+          ON episodes(movie_id, manual_order, natural_sort_key, relative_path, id);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [22, _now()],
+      );
+    }
+    if (current < 23) {
+      // 归并来源保留其审计关系和旧引用，但不再参与普通影视或资料统计。
+      _db.execute('''
+        ALTER TABLE movies ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'
+          CHECK(lifecycle_state IN ('active', 'merged'));
+        ALTER TABLE movies ADD COLUMN merged_into_movie_id TEXT
+          REFERENCES movies(id) ON DELETE RESTRICT;
+        ALTER TABLE movies ADD COLUMN merged_at TEXT;
+        CREATE INDEX movies_lifecycle_state_idx
+          ON movies(lifecycle_state, category_id, entry_type);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [23, _now()],
+      );
+    }
+    if (current < 24) {
+      // 在既有 playback_history 上原地扩展，旧记录仍可读取且不产生第二套历史数据。
+      _db.execute('''
+        ALTER TABLE playback_history ADD COLUMN last_reported_at TEXT;
+        ALTER TABLE playback_history ADD COLUMN watch_duration_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE playback_history ADD COLUMN last_position_ms INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE playback_history ADD COLUMN playback_status TEXT NOT NULL DEFAULT 'ended';
+        ALTER TABLE playback_history ADD COLUMN device_id TEXT NOT NULL DEFAULT 'legacy';
+        ALTER TABLE playback_history ADD COLUMN device_platform TEXT NOT NULL DEFAULT 'unknown';
+        UPDATE playback_history
+        SET last_reported_at = COALESCE(ended_at, started_at),
+            last_position_ms = COALESCE(end_position_ms, 0),
+            playback_status = CASE WHEN ended_at IS NULL THEN 'playing' ELSE 'ended' END;
+        CREATE INDEX playback_history_filter_idx
+          ON playback_history(device_platform, started_at DESC, id DESC);
+        CREATE INDEX playback_history_episode_recent_idx
+          ON playback_history(episode_id, last_reported_at DESC, id DESC);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [24, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -1162,13 +1491,15 @@ class NasLibraryDatabase {
         [rootName, timestamp, existing.first['id']],
       );
     }
-    return _mediaRootForContainerPath(containerPath)!;
+    final root = _mediaRootForContainerPath(containerPath)!;
+    _backfillLegacyCategorySources(root.id);
+    return root;
   }
 
   List<NasMediaRoot> listMediaRoots() {
     final rows = _db.select('''
       SELECT id, name, container_path, read_only, enabled, created_at,
-             updated_at, last_scanned_at
+             updated_at, last_scanned_at, is_online
       FROM media_roots ORDER BY created_at
     ''');
     return rows.map(_mapMediaRoot).toList(growable: false);
@@ -1177,7 +1508,7 @@ class NasLibraryDatabase {
   NasMediaRoot? findMediaRoot(String mediaRootId) {
     final rows = _db.select('''
       SELECT id, name, container_path, read_only, enabled, created_at,
-             updated_at, last_scanned_at
+             updated_at, last_scanned_at, is_online
       FROM media_roots WHERE id = ?
     ''', [mediaRootId]);
     return rows.isEmpty ? null : _mapMediaRoot(rows.single);
@@ -1220,6 +1551,18 @@ class NasLibraryDatabase {
           'Category scan requires both category and directory.');
     }
     final rootId = configuredRoot.id;
+    final root = directoryRelativePath == null
+        ? Directory(configuredRoot.containerPath)
+        : (await mediaService.directoryForRelativePath(directoryRelativePath))
+            ?.directory;
+    if (root == null) {
+      _markRootOffline(rootId);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
+    if (!await root.exists()) {
+      _markRootOffline(rootId);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
     if (categoryId == null) {
       _db.execute(
         'UPDATE episodes SET is_available = 0, updated_at = ? WHERE media_root_id = ?',
@@ -1230,18 +1573,6 @@ class NasLibraryDatabase {
         UPDATE episodes SET is_available = 0, updated_at = ?
         WHERE movie_id IN (SELECT id FROM movies WHERE category_id = ?)
       ''', [_now(), categoryId]);
-    }
-    final root = directoryRelativePath == null
-        ? Directory(configuredRoot.containerPath)
-        : (await mediaService.directoryForRelativePath(directoryRelativePath))
-            ?.directory;
-    if (root == null) {
-      _markRootScanned(rootId);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    if (!await root.exists()) {
-      _markRootScanned(rootId);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
     }
     final canonicalRoot = await root.resolveSymbolicLinks();
     final prefix = canonicalRoot.endsWith(Platform.pathSeparator)
@@ -1336,21 +1667,285 @@ class NasLibraryDatabase {
     required String mediaRootId,
     required NasMediaService mediaService,
     NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
-  }) {
+  }) async {
     final category = findCategory(categoryId);
-    final directoryRelativePath = category?.mediaRelativePath;
-    if (category == null ||
-        directoryRelativePath == null ||
-        directoryRelativePath.isEmpty) {
+    if (category == null) {
       throw ArgumentError.value(
           categoryId, 'categoryId', 'has no media directory');
     }
-    return scanMediaRoot(
-      mediaRootId: mediaRootId,
-      mediaService: mediaService,
-      categoryId: categoryId,
-      directoryRelativePath: directoryRelativePath,
-      metadataProbe: metadataProbe,
+    final sources = mediaSourcesForCategory(categoryId);
+    if (sources.isEmpty) {
+      final directoryRelativePath = category.mediaRelativePath;
+      if (directoryRelativePath == null || directoryRelativePath.isEmpty) {
+        throw ArgumentError.value(
+            categoryId, 'categoryId', 'has no media directory');
+      }
+      return scanMediaRoot(
+        mediaRootId: mediaRootId,
+        mediaService: mediaService,
+        categoryId: categoryId,
+        directoryRelativePath: directoryRelativePath,
+        metadataProbe: metadataProbe,
+      );
+    }
+    var scannedFiles = 0;
+    var availableEpisodes = 0;
+    final conflicts = <String>[];
+    for (final source in sources) {
+      final result = await _scanCategorySource(
+        categoryId: categoryId,
+        source: source,
+        mediaService: mediaService,
+        metadataProbe: metadataProbe,
+      );
+      scannedFiles += result.scannedFiles;
+      availableEpisodes += result.availableEpisodes;
+      conflicts.addAll(result.conflicts);
+    }
+    return NasScanResult(
+      scannedFiles: scannedFiles,
+      availableEpisodes: availableEpisodes,
+      conflicts: conflicts,
+    );
+  }
+
+  /// 分类扫描在单一物理来源盘内完成；盘不可读时绝不改写既有分集可用性。
+  Future<NasScanResult> _scanCategorySource({
+    required String categoryId,
+    required NasCategoryMediaSource source,
+    required NasMediaService mediaService,
+    required NasMediaMetadataProbe metadataProbe,
+  }) async {
+    final mediaRoot = findMediaRoot(source.mediaRootId);
+    if (mediaRoot == null || !mediaRoot.enabled) {
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
+    try {
+      if (!await Directory(mediaRoot.containerPath).exists()) {
+        _markRootOffline(mediaRoot.id);
+        return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+      }
+    } on FileSystemException {
+      _markRootOffline(mediaRoot.id);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
+    final directory = mediaRoot.containerPath == mediaService.mediaDir
+        ? await mediaService.directoryForRelativePath(source.relativePath)
+        : await mediaService.directoryForRootRelativePath(
+            rootPath: mediaRoot.containerPath,
+            relativePath: source.relativePath,
+          );
+    if (directory == null) {
+      // 来源盘在线而已绑定目录缺失，才可以确认该来源下的文件已不存在。
+      _markUnavailableEpisodesForSource(categoryId, source);
+      _markRootScanned(mediaRoot.id);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
+    final files = <File>[];
+    try {
+      await for (final entity in directory.directory.list(
+        recursive: true,
+        followLinks: false,
+      )) {
+        if (entity is File && _isVideo(entity.path)) files.add(entity);
+      }
+    } on FileSystemException {
+      _markRootOffline(mediaRoot.id);
+      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
+    }
+    final canonicalDirectory = await directory.directory.resolveSymbolicLinks();
+    final prefix = canonicalDirectory.endsWith(Platform.pathSeparator)
+        ? canonicalDirectory
+        : '$canonicalDirectory${Platform.pathSeparator}';
+    // 成功穷举后才标记不可用，避免挂载中断导致“离线即删除”。
+    _markUnavailableEpisodesForSource(categoryId, source);
+    var scannedFiles = 0;
+    final conflicts = <String>[];
+    for (final entity in files) {
+      String canonicalFile;
+      try {
+        canonicalFile = await entity.resolveSymbolicLinks();
+      } on FileSystemException {
+        continue;
+      }
+      if (!canonicalFile.startsWith(prefix)) continue;
+      final inCategoryPath = canonicalFile
+          .substring(prefix.length)
+          .replaceAll(Platform.pathSeparator, '/');
+      final grouping = _episodeGrouping(inCategoryPath);
+      if (grouping.isConflict) {
+        conflicts.add(
+            '${source.sourceName}/${source.relativePath}/${grouping.conflictPath}');
+        continue;
+      }
+      final relativePath = '${source.relativePath}/$inCategoryPath';
+      final checked = mediaRoot.containerPath == mediaService.mediaDir
+          ? await mediaService.fileForRelativePath(relativePath)
+          : await mediaService.fileForRootRelativePath(
+              rootPath: mediaRoot.containerPath,
+              relativePath: relativePath,
+            );
+      if (checked == null) continue;
+      final stat = await checked.file.stat();
+      final existing = _db.select('''
+        SELECT e.id, e.movie_id, e.file_size, e.media_modified_at,
+               e.duration_ms, e.video_width, e.video_height, e.resolution_label,
+               m.collection_key
+        FROM episodes e JOIN movies m ON m.id = e.movie_id
+        WHERE e.media_root_id = ? AND e.relative_path = ?
+      ''', [mediaRoot.id, relativePath]);
+      final collectionKey =
+          grouping.rootPath == null ? null : '$categoryId:${grouping.rootPath}';
+      final existingCollectionKey = existing.isEmpty
+          ? null
+          : existing.single['collection_key'] as String?;
+      if (collectionKey != null &&
+          existing.isNotEmpty &&
+          existingCollectionKey != collectionKey) {
+        // 旧逐文件数据和管理员手工归组只能在预览确认后迁移。
+        _markExistingEpisodeAvailable(existing.single['id'] as String);
+        conflicts.add(
+            '${source.sourceName}/${source.relativePath}/${grouping.rootPath}');
+        continue;
+      }
+      final fileSize = stat.size;
+      final modifiedAt = stat.modified.microsecondsSinceEpoch;
+      final unchanged = existing.isNotEmpty &&
+          existing.single['file_size'] == fileSize &&
+          existing.single['media_modified_at'] == modifiedAt &&
+          (existing.single['duration_ms'] != null ||
+              existing.single['video_width'] != null ||
+              existing.single['video_height'] != null);
+      final metadata = unchanged ? null : await metadataProbe.probe(checked);
+      final movieId = existing.isNotEmpty
+          ? existing.single['movie_id'] as String
+          : _movieIdForScannedEpisode(
+              categoryId: categoryId,
+              collectionKey: collectionKey,
+              title: grouping.displayTitle ?? _titleFromPath(inCategoryPath),
+            );
+      final timestamp = _now();
+      _db.execute('''
+        INSERT INTO episodes(
+          id, movie_id, media_root_id, title, relative_path, duration_ms,
+          video_width, video_height, resolution_label, media_modified_at,
+          file_size, is_available, natural_sort_key, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
+          duration_ms = excluded.duration_ms,
+          video_width = excluded.video_width,
+          video_height = excluded.video_height,
+          resolution_label = excluded.resolution_label,
+          media_modified_at = excluded.media_modified_at,
+          file_size = excluded.file_size,
+          is_available = 1,
+          natural_sort_key = excluded.natural_sort_key,
+          updated_at = excluded.updated_at
+      ''', [
+        newUuidV4(),
+        movieId,
+        mediaRoot.id,
+        _titleFromPath(inCategoryPath),
+        relativePath,
+        unchanged ? existing.single['duration_ms'] : metadata?.durationMs,
+        unchanged ? existing.single['video_width'] : metadata?.width,
+        unchanged ? existing.single['video_height'] : metadata?.height,
+        unchanged
+            ? existing.single['resolution_label']
+            : metadata?.resolutionLabel,
+        modifiedAt,
+        fileSize,
+        _naturalSortKey(inCategoryPath),
+        timestamp,
+      ]);
+      scannedFiles++;
+    }
+    _markRootScanned(mediaRoot.id);
+    return NasScanResult(
+      scannedFiles: scannedFiles,
+      availableEpisodes: scannedFiles,
+      conflicts: conflicts.toSet().toList(growable: false),
+    );
+  }
+
+  void _markUnavailableEpisodesForSource(
+    String categoryId,
+    NasCategoryMediaSource source,
+  ) {
+    final rows = _db.select('''
+      SELECT e.id, e.relative_path FROM episodes e
+      JOIN movies m ON m.id = e.movie_id
+      WHERE m.category_id = ? AND e.media_root_id = ?
+    ''', [categoryId, source.mediaRootId]);
+    final prefix = '${source.relativePath}/';
+    final ids = rows
+        .where((row) {
+          final path = row['relative_path'] as String;
+          return path == source.relativePath || path.startsWith(prefix);
+        })
+        .map((row) => row['id'] as String)
+        .toList(growable: false);
+    for (final id in ids) {
+      _db.execute(
+          'UPDATE episodes SET is_available = 0, updated_at = ? WHERE id = ?',
+          [_now(), id]);
+    }
+  }
+
+  void _markExistingEpisodeAvailable(String episodeId) {
+    _db.execute(
+        'UPDATE episodes SET is_available = 1, updated_at = ? WHERE id = ?',
+        [_now(), episodeId]);
+  }
+
+  String _movieIdForScannedEpisode({
+    required String categoryId,
+    required String? collectionKey,
+    required String title,
+  }) {
+    if (collectionKey != null) {
+      final existing = _db.select(
+        'SELECT id FROM movies WHERE collection_key = ?',
+        [collectionKey],
+      );
+      if (existing.isNotEmpty) return existing.single['id'] as String;
+    }
+    final id = newUuidV4();
+    final timestamp = _now();
+    _db.execute('''
+      INSERT INTO movies(
+        id, title, category_id, entry_type, collection_key, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      id,
+      title,
+      categoryId,
+      collectionKey == null ? 'single' : 'series',
+      collectionKey,
+      timestamp,
+      timestamp,
+    ]);
+    return id;
+  }
+
+  _EpisodeGrouping _episodeGrouping(String path) {
+    final segments = path.split('/');
+    if (segments.length < 2) return const _EpisodeGrouping();
+    final roots = <({int index, String title})>[];
+    for (var index = 0; index < segments.length - 1; index++) {
+      final title = _collectionTitleFromDirectory(segments[index]);
+      if (title != null) roots.add((index: index, title: title));
+    }
+    if (roots.length > 1) {
+      return _EpisodeGrouping(
+        conflictPath: segments.take(roots.last.index + 1).join('/'),
+      );
+    }
+    if (roots.isEmpty) return const _EpisodeGrouping();
+    final root = roots.single;
+    return _EpisodeGrouping(
+      rootPath: segments.take(root.index + 1).join('/'),
+      displayTitle: root.title,
     );
   }
 
@@ -1363,13 +1958,16 @@ class NasLibraryDatabase {
              m.publisher_id, p.display_name AS publisher_name,
              m.series_id, s.display_name AS series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
-             m.updated_at, COUNT(e.id) AS episode_count,
+             m.category_id, c.name AS category_name,
+             m.updated_at, m.entry_type, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m
       LEFT JOIN publishers p ON p.id = m.publisher_id
       LEFT JOIN series s ON s.id = m.series_id
-      JOIN episodes e ON e.movie_id = m.id
-      WHERE e.is_available = 1 AND (
+      LEFT JOIN library_categories c ON c.id = m.category_id
+      LEFT JOIN episodes e ON e.movie_id = m.id
+       WHERE m.lifecycle_state = 'active'
+         AND (m.entry_type = 'series' OR e.id IS NOT NULL) AND (
         ? = '%%'
         OR lower(m.title) LIKE lower(?)
         OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
@@ -1402,9 +2000,68 @@ class NasLibraryDatabase {
               durationMs: (row['duration_ms'] as int?) == 0
                   ? null
                   : row['duration_ms'] as int?,
+              entryType: row['entry_type'] as String,
               updatedAt: row['updated_at'] as String,
+              categoryId: row['category_id'] as String?,
+              categoryName: row['category_name'] as String?,
             )))
         .toList(growable: false);
+  }
+
+  /// 影集目标选择专用的服务端分页查询，绝不借用客户端当前影片墙。
+  NasMovieSearchPage searchSeries({
+    String query = '',
+    required String categoryId,
+    int page = 1,
+    int pageSize = 20,
+  }) {
+    if (page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        query.length > 120 ||
+        findCategory(categoryId) == null) {
+      throw ArgumentError('影集查询参数无效');
+    }
+    final like = '%${query.trim()}%';
+    final total = _db.select('''
+      SELECT COUNT(*) AS count FROM movies m
+      WHERE m.lifecycle_state = 'active' AND m.entry_type = 'series'
+        AND m.category_id = ?
+        AND (? = '%%' OR lower(m.title) LIKE lower(?)
+          OR lower(COALESCE(m.original_title, '')) LIKE lower(?))
+    ''', [categoryId, like, like, like]).single['count'] as int;
+    final offset = (page - 1) * pageSize;
+    final rows = _db.select('''
+      SELECT m.id, m.title, m.original_title, m.catalog_number,
+             m.publisher_id, publisher.display_name AS publisher_name,
+             m.series_id, series.display_name AS series_name,
+             m.summary, m.poster_file_name, m.play_count, m.updated_at,
+             m.entry_type, m.category_id, category.name AS category_name,
+             COUNT(e.id) AS episode_count, SUM(COALESCE(e.duration_ms, 0)) AS duration_ms,
+             MAX(e.video_width) AS video_width, MAX(e.video_height) AS video_height,
+             CASE WHEN COUNT(DISTINCT NULLIF(e.resolution_label, '')) > 1
+                  THEN '多种分辨率' ELSE MAX(e.resolution_label) END AS resolution_label
+      FROM movies m
+      LEFT JOIN episodes e ON e.movie_id = m.id
+      LEFT JOIN publishers publisher ON publisher.id = m.publisher_id
+      LEFT JOIN series ON series.id = m.series_id
+      LEFT JOIN library_categories category ON category.id = m.category_id
+      WHERE m.lifecycle_state = 'active' AND m.entry_type = 'series'
+        AND m.category_id = ?
+        AND (? = '%%' OR lower(m.title) LIKE lower(?)
+          OR lower(COALESCE(m.original_title, '')) LIKE lower(?))
+      GROUP BY m.id
+      ORDER BY m.title COLLATE NOCASE, m.id
+      LIMIT ? OFFSET ?
+    ''', [categoryId, like, like, like, pageSize, offset]);
+    final items = rows.map(_mapSearchMovie).toList(growable: false);
+    return NasMovieSearchPage(
+      items: items,
+      number: page,
+      size: pageSize,
+      total: total,
+      hasMore: offset + items.length < total,
+    );
   }
 
   /// 在 SQLite 中完成搜索、三组标签条件、排序和分页，绝不回传全量影片。
@@ -1519,7 +2176,9 @@ class NasLibraryDatabase {
       END
     END AS relevance_score''';
     final clauses = <String>[
-      'e.is_available = 1',
+      "m.lifecycle_state = 'active'",
+      // 已离线来源上的影视条目仍必须可见；可播放性由分集接口单独返回。
+      "(m.entry_type = 'series' OR EXISTS (SELECT 1 FROM episodes visible_episode WHERE visible_episode.movie_id = m.id))",
       '''(
         terms.query = '' OR lower(m.title) LIKE lower(terms.query_like)
         OR lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_like)
@@ -1538,6 +2197,11 @@ class NasLibraryDatabase {
           SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
           WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
             AND lower(t.name) LIKE lower(terms.query_like)
+        )
+        OR EXISTS (
+          SELECT 1 FROM episodes named_episode
+          WHERE named_episode.movie_id = m.id
+            AND lower(named_episode.title) LIKE lower(terms.query_like)
         )
       )''',
       '''(
@@ -1623,6 +2287,7 @@ class NasLibraryDatabase {
                m.publisher_id, publisher.display_name AS publisher_name,
                m.series_id, series.display_name AS series_name,
                m.summary, m.poster_file_name, m.play_count, m.created_at, m.updated_at,
+               m.entry_type,
                $relevanceSql,
                m.category_id, category.name AS category_name,
                COUNT(e.id) AS episode_count,
@@ -1633,7 +2298,7 @@ class NasLibraryDatabase {
                     THEN '多种分辨率' ELSE MAX(e.resolution_label) END AS resolution_label
         FROM movies m
         CROSS JOIN search_terms terms
-        JOIN episodes e ON e.movie_id = m.id
+        LEFT JOIN episodes e ON e.movie_id = m.id
         LEFT JOIN publishers publisher ON publisher.id = m.publisher_id
         LEFT JOIN series ON series.id = m.series_id
         LEFT JOIN library_categories category ON category.id = m.category_id
@@ -1688,11 +2353,13 @@ class NasLibraryDatabase {
       SELECT p.id, p.display_name, p.original_name, p.country_region,
              p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
              p.archived_at,
-             (SELECT COUNT(*) FROM movies m WHERE m.publisher_id = p.id) AS movie_count,
+              (SELECT COUNT(*) FROM movies m
+                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active') AS movie_count,
              (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
              (SELECT SUM(COALESCE(e.duration_ms, 0))
                 FROM movies m JOIN episodes e ON e.movie_id = m.id
-               WHERE m.publisher_id = p.id AND e.is_available = 1) AS duration_ms
+                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active'
+                  AND e.is_available = 1) AS duration_ms
       FROM publishers p
       WHERE (? = 1 OR p.archived_at IS NULL)
         AND (? = '%%' OR lower(p.display_name) LIKE lower(?)
@@ -1707,11 +2374,13 @@ class NasLibraryDatabase {
       SELECT p.id, p.display_name, p.original_name, p.country_region,
              p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
              p.archived_at,
-             (SELECT COUNT(*) FROM movies m WHERE m.publisher_id = p.id) AS movie_count,
+              (SELECT COUNT(*) FROM movies m
+                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active') AS movie_count,
              (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
              (SELECT SUM(COALESCE(e.duration_ms, 0))
                 FROM movies m JOIN episodes e ON e.movie_id = m.id
-               WHERE m.publisher_id = p.id AND e.is_available = 1) AS duration_ms
+                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active'
+                  AND e.is_available = 1) AS duration_ms
       FROM publishers p WHERE p.id = ?
     ''', [publisherId]);
     return rows.isEmpty ? null : _mapPublisher(rows.single);
@@ -1772,7 +2441,8 @@ class NasLibraryDatabase {
 
   bool publisherHasReferences(String publisherId) => _db.select('''
     SELECT 1
-    WHERE EXISTS(SELECT 1 FROM movies WHERE publisher_id = ?)
+    WHERE EXISTS(SELECT 1 FROM movies
+      WHERE publisher_id = ? AND lifecycle_state = 'active')
        OR EXISTS(SELECT 1 FROM series WHERE publisher_id = ?)
        OR EXISTS(SELECT 1 FROM actor_publisher_links WHERE publisher_id = ?)
   ''', [publisherId, publisherId, publisherId]).isNotEmpty;
@@ -1796,12 +2466,15 @@ class NasLibraryDatabase {
       SELECT s.id, s.display_name, s.original_name, s.translated_name,
              s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
              s.updated_at, s.archived_at,
-             (SELECT COUNT(*) FROM movies m WHERE m.series_id = s.id) AS movie_count,
+              (SELECT COUNT(*) FROM movies m
+                WHERE m.series_id = s.id AND m.lifecycle_state = 'active') AS movie_count,
              (SELECT COUNT(e.id) FROM movies m JOIN episodes e ON e.movie_id = m.id
-               WHERE m.series_id = s.id AND e.is_available = 1) AS episode_count,
+                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
+                  AND e.is_available = 1) AS episode_count,
              (SELECT SUM(COALESCE(e.duration_ms, 0))
                 FROM movies m JOIN episodes e ON e.movie_id = m.id
-               WHERE m.series_id = s.id AND e.is_available = 1) AS duration_ms
+                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
+                  AND e.is_available = 1) AS duration_ms
       FROM series s
       WHERE (? = 1 OR s.archived_at IS NULL)
         AND (? IS NULL OR s.publisher_id = ?)
@@ -1826,12 +2499,15 @@ class NasLibraryDatabase {
       SELECT s.id, s.display_name, s.original_name, s.translated_name,
              s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
              s.updated_at, s.archived_at,
-             (SELECT COUNT(*) FROM movies m WHERE m.series_id = s.id) AS movie_count,
+              (SELECT COUNT(*) FROM movies m
+                WHERE m.series_id = s.id AND m.lifecycle_state = 'active') AS movie_count,
              (SELECT COUNT(e.id) FROM movies m JOIN episodes e ON e.movie_id = m.id
-               WHERE m.series_id = s.id AND e.is_available = 1) AS episode_count,
+                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
+                  AND e.is_available = 1) AS episode_count,
              (SELECT SUM(COALESCE(e.duration_ms, 0))
                 FROM movies m JOIN episodes e ON e.movie_id = m.id
-               WHERE m.series_id = s.id AND e.is_available = 1) AS duration_ms
+                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
+                  AND e.is_available = 1) AS duration_ms
       FROM series s WHERE s.id = ?
     ''', [seriesId]);
     return rows.isEmpty ? null : _mapSeries(rows.single);
@@ -2041,9 +2717,10 @@ class NasLibraryDatabase {
              a.measurements, a.body_type, a.country, a.debut_month,
              a.debut_description, a.photo_asset_id, a.publisher_names_json,
              a.created_at, a.updated_at, a.archived_at,
-             COUNT(l.movie_id) AS movie_count
-      FROM actors a
-      LEFT JOIN movie_actor_links l ON l.actor_id = a.id
+              COUNT(CASE WHEN linked_movie.lifecycle_state = 'active' THEN l.movie_id END) AS movie_count
+       FROM actors a
+       LEFT JOIN movie_actor_links l ON l.actor_id = a.id
+       LEFT JOIN movies linked_movie ON linked_movie.id = l.movie_id
       WHERE (? = 1 OR a.archived_at IS NULL)
         AND (? IS NULL OR a.gender = ?)
       GROUP BY a.id
@@ -2065,9 +2742,10 @@ class NasLibraryDatabase {
              a.measurements, a.body_type, a.country, a.debut_month,
              a.debut_description, a.photo_asset_id, a.publisher_names_json,
              a.created_at, a.updated_at, a.archived_at,
-             COUNT(l.movie_id) AS movie_count
-      FROM actors a
-      LEFT JOIN movie_actor_links l ON l.actor_id = a.id
+              COUNT(CASE WHEN linked_movie.lifecycle_state = 'active' THEN l.movie_id END) AS movie_count
+       FROM actors a
+       LEFT JOIN movie_actor_links l ON l.actor_id = a.id
+       LEFT JOIN movies linked_movie ON linked_movie.id = l.movie_id
       WHERE a.id = ?
       GROUP BY a.id
     ''', [actorId]);
@@ -2087,7 +2765,9 @@ class NasLibraryDatabase {
 
   List<NasLibraryMovie> moviesForActor(String actorId, {String query = ''}) {
     final movieIds = _db.select('''
-      SELECT movie_id FROM movie_actor_links WHERE actor_id = ?
+      SELECT links.movie_id FROM movie_actor_links links
+      JOIN movies m ON m.id = links.movie_id
+      WHERE links.actor_id = ? AND m.lifecycle_state = 'active'
     ''', [actorId]).map((row) => row['movie_id'] as String).toSet();
     if (movieIds.isEmpty) return const [];
     return listMovies(query: query)
@@ -2100,7 +2780,8 @@ class NasLibraryDatabase {
       SELECT l2.actor_id, COUNT(*) AS movie_count
       FROM movie_actor_links l1
       JOIN movie_actor_links l2 ON l2.movie_id = l1.movie_id
-      WHERE l1.actor_id = ? AND l2.actor_id != ?
+      JOIN movies m ON m.id = l1.movie_id
+      WHERE l1.actor_id = ? AND l2.actor_id != ? AND m.lifecycle_state = 'active'
       GROUP BY l2.actor_id
       ORDER BY movie_count DESC, l2.actor_id ASC
     ''', [actorId, actorId]);
@@ -2215,9 +2896,22 @@ class NasLibraryDatabase {
         'archived_at': _now(),
       });
 
-  /// 删除无影片关联的演员；有关联时由调用方先校验或由外键限制拒绝。
+  /// 删除无活跃影片关联的演员；归并审计关系不再阻止资料清理。
   bool deleteActor(String actorId) {
     if (findActor(actorId) == null) return false;
+    final hasActiveReferences = _db.select('''
+      SELECT 1 FROM movie_actor_links links
+      JOIN movies m ON m.id = links.movie_id
+      WHERE links.actor_id = ? AND m.lifecycle_state = 'active'
+      LIMIT 1
+    ''', [actorId]).isNotEmpty;
+    if (hasActiveReferences) return false;
+    _db.execute('''
+      DELETE FROM movie_actor_links
+      WHERE actor_id = ? AND movie_id IN (
+        SELECT id FROM movies WHERE lifecycle_state = 'merged'
+      )
+    ''', [actorId]);
     _db.execute('DELETE FROM actors WHERE id = ?', [actorId]);
     return true;
   }
@@ -2389,11 +3083,16 @@ class NasLibraryDatabase {
       .isNotEmpty;
 
   NasLibraryMovie? findMovie(String movieId) {
-    final movies = listMovies();
-    for (final movie in movies) {
-      if (movie.id == movieId) return movie;
+    final movie = findMovieForAdmin(movieId);
+    if (movie == null ||
+        _db.select(
+          "SELECT 1 FROM movies WHERE id = ? AND lifecycle_state = 'active'",
+          [movieId],
+        ).isEmpty ||
+        (movie.entryType != 'series' && movie.episodeCount == 0)) {
+      return null;
     }
-    return null;
+    return movie;
   }
 
   NasLibraryMovie? findMovieForAdmin(String movieId) {
@@ -2402,11 +3101,13 @@ class NasLibraryDatabase {
              m.publisher_id, p.display_name AS publisher_name,
              m.series_id, s.display_name AS series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
-             m.updated_at, COUNT(e.id) AS episode_count,
+             m.category_id, c.name AS category_name,
+             m.updated_at, m.entry_type, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
       FROM movies m
       LEFT JOIN publishers p ON p.id = m.publisher_id
       LEFT JOIN series s ON s.id = m.series_id
+      LEFT JOIN library_categories c ON c.id = m.category_id
       LEFT JOIN episodes e ON e.movie_id = m.id
       WHERE m.id = ?
       GROUP BY m.id
@@ -2475,26 +3176,501 @@ class NasLibraryDatabase {
 
   List<NasLibraryEpisode> episodesForMovie(String movieId) {
     final rows = _db.select('''
-      SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms,
-             video_width, video_height, resolution_label, media_modified_at, updated_at
-      FROM episodes WHERE movie_id = ? ORDER BY title COLLATE NOCASE
+      SELECT e.id, e.movie_id, e.media_root_id, e.title, e.relative_path, e.file_size, e.is_available,
+             e.duration_ms, e.video_width, e.video_height, e.resolution_label,
+             e.media_modified_at, e.updated_at, e.natural_sort_key, e.manual_order,
+             root.name AS source_name, root.is_online AS source_online
+      FROM episodes e JOIN media_roots root ON root.id = e.media_root_id
+      WHERE e.movie_id = ?
+      ORDER BY e.manual_order IS NOT NULL DESC, e.manual_order,
+               e.natural_sort_key COLLATE NOCASE, e.relative_path COLLATE NOCASE, e.id
     ''', [movieId]);
-    return rows
-        .map((row) => NasLibraryEpisode(
-              id: row['id'] as String,
-              movieId: row['movie_id'] as String,
-              title: row['title'] as String,
-              relativePath: row['relative_path'] as String,
-              fileSize: row['file_size'] as int,
-              isAvailable: (row['is_available'] as int) == 1,
-              durationMs: row['duration_ms'] as int?,
-              videoWidth: row['video_width'] as int?,
-              videoHeight: row['video_height'] as int?,
-              resolutionLabel: row['resolution_label'] as String?,
-              mediaModifiedAt: row['media_modified_at'] as int?,
-              updatedAt: row['updated_at'] as String,
-            ))
+    return rows.map(_mapEpisode).toList(growable: false);
+  }
+
+  NasEpisodePage episodePageForMovie({
+    required String movieId,
+    String query = '',
+    required int page,
+    required int pageSize,
+    String? anchorEpisodeId,
+  }) {
+    if (page < 1 || pageSize < 1 || pageSize > 100 || query.length > 120) {
+      throw ArgumentError('分集分页参数无效');
+    }
+    final like = '%${query.trim()}%';
+    final total = _db.select('''
+      SELECT COUNT(*) AS count FROM episodes
+      WHERE movie_id = ? AND (? = '%%' OR lower(title) LIKE lower(?))
+    ''', [movieId, like, like]).single['count'] as int;
+    var effectivePage = page;
+    if (anchorEpisodeId != null) {
+      final ordered = _db.select('''
+        SELECT id FROM episodes
+        WHERE movie_id = ? AND (? = '%%' OR lower(title) LIKE lower(?))
+        ORDER BY manual_order IS NOT NULL DESC, manual_order,
+                 natural_sort_key COLLATE NOCASE, relative_path COLLATE NOCASE, id
+      ''', [movieId, like, like]);
+      final index = ordered.indexWhere((row) => row['id'] == anchorEpisodeId);
+      if (index < 0) throw ArgumentError('分集不属于影视条目');
+      effectivePage = index ~/ pageSize + 1;
+    }
+    final offset = (effectivePage - 1) * pageSize;
+    final rows = _db.select('''
+      SELECT e.id, e.movie_id, e.media_root_id, e.title, e.relative_path, e.file_size, e.is_available,
+             e.duration_ms, e.video_width, e.video_height, e.resolution_label,
+             e.media_modified_at, e.updated_at, e.natural_sort_key, e.manual_order,
+             root.name AS source_name, root.is_online AS source_online
+      FROM episodes e JOIN media_roots root ON root.id = e.media_root_id
+      WHERE e.movie_id = ? AND (? = '%%' OR lower(e.title) LIKE lower(?))
+      ORDER BY e.manual_order IS NOT NULL DESC, e.manual_order,
+               e.natural_sort_key COLLATE NOCASE, e.relative_path COLLATE NOCASE, e.id
+      LIMIT ? OFFSET ?
+    ''', [movieId, like, like, pageSize, offset]);
+    final items = rows.map(_mapEpisode).toList(growable: false);
+    return NasEpisodePage(
+      items: items,
+      number: effectivePage,
+      size: pageSize,
+      total: total,
+      hasMore: offset + items.length < total,
+    );
+  }
+
+  NasScannedMediaFilePage scannedMediaFiles({
+    required int page,
+    required int pageSize,
+    String query = '',
+  }) {
+    if (page < 1 || pageSize < 1 || pageSize > 100 || query.length > 120) {
+      throw ArgumentError('媒体文件分页参数无效');
+    }
+    final like = '%${query.trim()}%';
+    final total = _db.select('''
+      SELECT COUNT(*) AS count FROM episodes e JOIN movies m ON m.id = e.movie_id
+      WHERE ? = '%%' OR lower(e.title) LIKE lower(?) OR lower(m.title) LIKE lower(?)
+    ''', [like, like, like]).single['count'] as int;
+    final offset = (page - 1) * pageSize;
+    final rows = _db.select('''
+      SELECT e.id, e.movie_id, e.media_root_id, e.title, e.relative_path,
+             e.file_size, e.is_available, e.duration_ms, e.video_width,
+             e.video_height, e.resolution_label, e.media_modified_at, e.updated_at,
+             e.natural_sort_key, e.manual_order, root.name AS source_name,
+              root.is_online AS source_online, m.title AS movie_title,
+              m.entry_type, m.category_id
+      FROM episodes e
+      JOIN movies m ON m.id = e.movie_id
+      JOIN media_roots root ON root.id = e.media_root_id
+      WHERE ? = '%%' OR lower(e.title) LIKE lower(?) OR lower(m.title) LIKE lower(?)
+      ORDER BY e.updated_at DESC, e.id
+      LIMIT ? OFFSET ?
+    ''', [like, like, like, pageSize, offset]);
+    final items = rows
+        .map(
+          (row) => NasScannedMediaFile(
+            episode: _mapEpisode(row),
+            movieId: row['movie_id'] as String,
+            movieTitle: row['movie_title'] as String,
+            entryType: row['entry_type'] as String,
+            categoryId: row['category_id'] as String?,
+          ),
+        )
         .toList(growable: false);
+    return NasScannedMediaFilePage(
+      items: items,
+      number: page,
+      size: pageSize,
+      total: total,
+      hasMore: offset + items.length < total,
+    );
+  }
+
+  NasLibraryMovie createEmptySeries({
+    required String title,
+    required String categoryId,
+  }) {
+    final normalizedTitle = title.trim();
+    if (normalizedTitle.isEmpty || findCategory(categoryId) == null) {
+      throw ArgumentError('影集资料无效');
+    }
+    final timestamp = _now();
+    final id = newUuidV4();
+    _db.execute('''
+      INSERT INTO movies(id, title, category_id, entry_type, created_at, updated_at)
+      VALUES (?, ?, ?, 'series', ?, ?)
+    ''', [id, normalizedTitle, categoryId, timestamp, timestamp]);
+    return findMovieForAdmin(id)!;
+  }
+
+  bool mergeEpisodesIntoSeries({
+    required String targetMovieId,
+    required List<String> episodeIds,
+    required String metadataSourceMovieId,
+  }) {
+    if (episodeIds.isEmpty ||
+        episodeIds.length > 500 ||
+        episodeIds.toSet().length != episodeIds.length) {
+      return false;
+    }
+    final target = findMovieForAdmin(targetMovieId);
+    if (target == null ||
+        target.entryType != 'series' ||
+        _db.select(
+          "SELECT 1 FROM movies WHERE id = ? AND lifecycle_state = 'active'",
+          [targetMovieId],
+        ).isEmpty) {
+      return false;
+    }
+    final placeholders = List.filled(episodeIds.length, '?').join(', ');
+    final rows = _db.select('''
+      SELECT e.id, e.movie_id, m.category_id
+      FROM episodes e JOIN movies m ON m.id = e.movie_id
+      WHERE e.id IN ($placeholders)
+    ''', episodeIds);
+    if (rows.length != episodeIds.length) return false;
+    final sourceMovieIds = rows.map((row) => row['movie_id'] as String).toSet();
+    final sourceMoviePlaceholders =
+        List.filled(sourceMovieIds.length, '?').join(', ');
+    if (metadataSourceMovieId != targetMovieId &&
+        !sourceMovieIds.contains(metadataSourceMovieId)) {
+      return false;
+    }
+    final targetCategory = _db.select(
+      'SELECT category_id FROM movies WHERE id = ?',
+      [targetMovieId],
+    ).single['category_id'] as String?;
+    // 分类是影集的逻辑归属。任何跨分类归并都必须走未来单独设计的迁移流程。
+    if (targetCategory == null ||
+        rows.any((row) => row['category_id'] != targetCategory)) {
+      return false;
+    }
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      if (metadataSourceMovieId != targetMovieId) {
+        _copyMovieMetadataToSeries(
+          fromMovieId: metadataSourceMovieId,
+          targetMovieId: targetMovieId,
+        );
+      }
+      final movedPlaybackCount = _db.select('''
+        SELECT COUNT(*) AS count FROM playback_history
+        WHERE movie_id != ? AND episode_id IN ($placeholders)
+      ''', [targetMovieId, ...episodeIds]).single['count'] as int;
+      _db.execute('''
+        UPDATE movies
+        SET play_count = MAX(0, play_count - (
+          SELECT COUNT(*) FROM playback_history history
+          WHERE history.movie_id = movies.id
+            AND history.episode_id IN ($placeholders)
+        ))
+        WHERE id IN ($sourceMoviePlaceholders) AND id != ?
+      ''', [
+        ...episodeIds,
+        ...sourceMovieIds,
+        targetMovieId,
+      ]);
+      _db.execute('''
+        UPDATE movies SET play_count = play_count + ? WHERE id = ?
+      ''', [movedPlaybackCount, targetMovieId]);
+      _db.execute('''
+        UPDATE playback_history SET movie_id = ?
+        WHERE episode_id IN ($placeholders) AND movie_id != ?
+      ''', [targetMovieId, ...episodeIds, targetMovieId]);
+      _db.execute('''
+        UPDATE episodes SET movie_id = ? WHERE id IN ($placeholders)
+      ''', [targetMovieId, ...episodeIds]);
+      _db.execute('''
+        UPDATE episode_playback_progress SET movie_id = ?
+        WHERE episode_id IN ($placeholders)
+      ''', [targetMovieId, ...episodeIds]);
+      // 保留旧条目与全部关系以便审计，却从普通查询和统计中明确排除。
+      _db.execute('''
+        UPDATE movies
+        SET lifecycle_state = 'merged', merged_into_movie_id = ?, merged_at = ?,
+            updated_at = ?
+        WHERE id IN ($sourceMoviePlaceholders) AND id != ?
+          AND NOT EXISTS (SELECT 1 FROM episodes WHERE episodes.movie_id = movies.id)
+      ''', [
+        targetMovieId,
+        _now(),
+        _now(),
+        ...sourceMovieIds,
+        targetMovieId,
+      ]);
+      _db.execute(
+        "UPDATE movies SET entry_type = 'series', updated_at = ? WHERE id = ?",
+        [_now(), targetMovieId],
+      );
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return true;
+  }
+
+  List<NasLibraryMovie>? splitEpisodesIntoSingles({
+    required String movieId,
+    required List<String> episodeIds,
+  }) {
+    if (episodeIds.isEmpty ||
+        episodeIds.length > 500 ||
+        episodeIds.toSet().length != episodeIds.length) {
+      return null;
+    }
+    final source = findMovieForAdmin(movieId);
+    if (source == null || source.entryType != 'series') return null;
+    final placeholders = List.filled(episodeIds.length, '?').join(', ');
+    final episodes = _db.select('''
+      SELECT id, title FROM episodes WHERE movie_id = ? AND id IN ($placeholders)
+    ''', [movieId, ...episodeIds]);
+    if (episodes.length != episodeIds.length) return null;
+    final sourceEpisodeCount = _db.select(
+      'SELECT COUNT(*) AS count FROM episodes WHERE movie_id = ?',
+      [movieId],
+    ).single['count'] as int;
+    final isCompleteSplit = sourceEpisodeCount == episodeIds.length;
+    final created = <NasLibraryMovie>[];
+    final sourceImages = carouselImagesForMovie(movieId);
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      // 必须在迁移历史关联前扣除原影集的计数，避免被已迁走的记录误算为零。
+      _db.execute('''
+        UPDATE movies
+        SET play_count = MAX(0, play_count - (
+          SELECT COUNT(*) FROM playback_history history
+          WHERE history.movie_id = movies.id AND history.episode_id IN ($placeholders)
+        ))
+        WHERE id = ?
+      ''', [...episodeIds, movieId]);
+      for (final episode in episodes) {
+        final id = newUuidV4();
+        final timestamp = _now();
+        _db.execute('''
+          INSERT INTO movies(
+            id, title, original_title, catalog_number, publisher_id, series_id,
+            summary, category_id, poster_file_name, entry_type, play_count,
+            created_at, updated_at
+          ) SELECT ?, ?, original_title, catalog_number, publisher_id, series_id,
+                   summary, category_id, poster_file_name, 'single',
+                   (SELECT COUNT(*) FROM playback_history WHERE movie_id = ? AND episode_id = ?),
+                   ?, ?
+          FROM movies WHERE id = ?
+        ''', [
+          id,
+          episode['title'],
+          movieId,
+          episode['id'],
+          timestamp,
+          timestamp,
+          movieId,
+        ]);
+        _db.execute('''
+          INSERT INTO movie_actor_links(movie_id, actor_id)
+          SELECT ?, actor_id FROM movie_actor_links WHERE movie_id = ?
+        ''', [id, movieId]);
+        _db.execute('''
+          INSERT INTO movie_tag_links(movie_id, tag_id)
+          SELECT ?, tag_id FROM movie_tag_links WHERE movie_id = ?
+        ''', [id, movieId]);
+        _db.execute('UPDATE episodes SET movie_id = ? WHERE id = ?',
+            [id, episode['id']]);
+        _db.execute(
+          'UPDATE episode_playback_progress SET movie_id = ? WHERE episode_id = ?',
+          [id, episode['id']],
+        );
+        _db.execute(
+          'UPDATE playback_history SET movie_id = ? WHERE episode_id = ?',
+          [id, episode['id']],
+        );
+        // 部分拆分时原影集仍可访问，完整拆分时首个新条目接管原记录；
+        // 其余新条目都得到独立图片文件和记录，绝不共享或删除原资产。
+        if (!isCompleteSplit || created.isNotEmpty) {
+          _copyCarouselImages(sourceImages, id);
+        }
+        created.add(findMovieForAdmin(id)!);
+      }
+      if (isCompleteSplit && created.isNotEmpty) {
+        _db.execute(
+          'UPDATE movie_carousel_images SET movie_id = ? WHERE movie_id = ?',
+          [created.first.id, movieId],
+        );
+      }
+      // 完整拆分后，原影集已经被拆出的独立条目替代。保留原行供审计，
+      // 但不能再让没有分集的来源条目参与任何普通列表或资料统计。
+      _db.execute('''
+        UPDATE movies
+        SET entry_type = 'single', collection_key = NULL,
+            lifecycle_state = CASE WHEN ? THEN 'merged' ELSE lifecycle_state END,
+            merged_into_movie_id = CASE WHEN ? THEN NULL ELSE merged_into_movie_id END,
+            merged_at = CASE WHEN ? THEN ? ELSE merged_at END,
+            updated_at = ?
+        WHERE id = ? AND NOT EXISTS (SELECT 1 FROM episodes WHERE movie_id = ?)
+      ''', [
+        isCompleteSplit ? 1 : 0,
+        isCompleteSplit ? 1 : 0,
+        isCompleteSplit ? 1 : 0,
+        _now(),
+        _now(),
+        movieId,
+        movieId,
+      ]);
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return created;
+  }
+
+  List<NasCollectionMigrationCandidate> collectionMigrationPreview() {
+    final groups = <String, _LegacyCollectionGroup>{};
+    for (final category in listCategories()) {
+      for (final source in category.mediaSources) {
+        final rows = _db.select('''
+          SELECT e.id, e.movie_id, e.relative_path, m.entry_type, m.collection_key
+          FROM episodes e JOIN movies m ON m.id = e.movie_id
+          WHERE e.media_root_id = ? AND m.category_id = ?
+            AND m.lifecycle_state = 'active'
+        ''', [source.mediaRootId, category.id]);
+        final prefix = '${source.relativePath}/';
+        for (final row in rows) {
+          final path = row['relative_path'] as String;
+          if (!path.startsWith(prefix) ||
+              row['entry_type'] != 'single' ||
+              row['collection_key'] != null) {
+            continue;
+          }
+          final grouping = _episodeGrouping(path.substring(prefix.length));
+          if (grouping.isConflict || grouping.rootPath == null) continue;
+          final key = '${category.id}:${grouping.rootPath}';
+          final group = groups.putIfAbsent(
+            key,
+            () => _LegacyCollectionGroup(
+              categoryId: category.id,
+              title: grouping.displayTitle!,
+            ),
+          );
+          group.episodeIds.add(row['id'] as String);
+          group.sourceMovieIds.add(row['movie_id'] as String);
+        }
+      }
+    }
+    return groups.entries
+        .map(
+          (entry) => NasCollectionMigrationCandidate(
+            key: entry.key,
+            categoryId: entry.value.categoryId,
+            title: entry.value.title,
+            episodeIds: entry.value.episodeIds.toList(growable: false),
+            sourceMovieIds: entry.value.sourceMovieIds.toList(growable: false),
+            requiresMetadataChoice: entry.value.sourceMovieIds.length > 1,
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  NasLibraryMovie? applyCollectionMigration({
+    required String key,
+    required String metadataSourceMovieId,
+  }) {
+    NasCollectionMigrationCandidate? candidate;
+    for (final item in collectionMigrationPreview()) {
+      if (item.key == key) {
+        candidate = item;
+        break;
+      }
+    }
+    if (candidate == null ||
+        !candidate.sourceMovieIds.contains(metadataSourceMovieId)) {
+      return null;
+    }
+    final id = _movieIdForScannedEpisode(
+      categoryId: candidate.categoryId,
+      collectionKey: candidate.key,
+      title: candidate.title,
+    );
+    if (!mergeEpisodesIntoSeries(
+      targetMovieId: id,
+      episodeIds: candidate.episodeIds,
+      metadataSourceMovieId: metadataSourceMovieId,
+    )) {
+      return null;
+    }
+    return findMovieForAdmin(id);
+  }
+
+  void _copyMovieMetadataToSeries({
+    required String fromMovieId,
+    required String targetMovieId,
+  }) {
+    _db.execute('''
+      UPDATE movies SET
+        title = (SELECT title FROM movies WHERE id = ?),
+        original_title = (SELECT original_title FROM movies WHERE id = ?),
+        catalog_number = (SELECT catalog_number FROM movies WHERE id = ?),
+        publisher_id = (SELECT publisher_id FROM movies WHERE id = ?),
+        series_id = (SELECT series_id FROM movies WHERE id = ?),
+        summary = (SELECT summary FROM movies WHERE id = ?),
+        poster_file_name = (SELECT poster_file_name FROM movies WHERE id = ?),
+        updated_at = ?
+      WHERE id = ?
+    ''', [
+      fromMovieId,
+      fromMovieId,
+      fromMovieId,
+      fromMovieId,
+      fromMovieId,
+      fromMovieId,
+      fromMovieId,
+      _now(),
+      targetMovieId,
+    ]);
+    _db.execute(
+        'DELETE FROM movie_actor_links WHERE movie_id = ?', [targetMovieId]);
+    _db.execute('''
+      INSERT INTO movie_actor_links(movie_id, actor_id)
+      SELECT ?, actor_id FROM movie_actor_links WHERE movie_id = ?
+    ''', [targetMovieId, fromMovieId]);
+    _db.execute(
+        'DELETE FROM movie_tag_links WHERE movie_id = ?', [targetMovieId]);
+    _db.execute('''
+      INSERT INTO movie_tag_links(movie_id, tag_id)
+      SELECT ?, tag_id FROM movie_tag_links WHERE movie_id = ?
+    ''', [targetMovieId, fromMovieId]);
+    _db.execute('''
+      UPDATE movie_carousel_images SET movie_id = ? WHERE movie_id = ?
+    ''', [targetMovieId, fromMovieId]);
+  }
+
+  /// 为拆出的影视条目复制截图文件和记录。
+  ///
+  /// 部分拆分保留源记录；完整拆分会由首个新条目接管源记录，其余条目各自复制。
+  /// 复制失败会回滚数据库变更，源图片文件绝不删除。
+  void _copyCarouselImages(
+      List<NasCarouselImage> images, String targetMovieId) {
+    for (final image in images) {
+      final extensionIndex = image.fileName.lastIndexOf('.');
+      if (extensionIndex <= 0) {
+        throw StateError('截图文件名无效，无法安全拆分');
+      }
+      final extension = image.fileName.substring(extensionIndex);
+      final copiedFileName = '$targetMovieId-${newUuidV4()}$extension';
+      final sourceFile = File(
+        '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel${Platform.pathSeparator}${image.fileName}',
+      );
+      if (!sourceFile.existsSync()) {
+        throw StateError('截图资产缺失，无法安全拆分');
+      }
+      final destinationFile = File(
+        '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel${Platform.pathSeparator}$copiedFileName',
+      );
+      sourceFile.copySync(destinationFile.path);
+      _db.execute(
+        'INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at) VALUES (?, ?, ?, ?)',
+        [newUuidV4(), targetMovieId, copiedFileName, _now()],
+      );
+    }
   }
 
   NasLibraryEpisode? findEpisode(String episodeId) {
@@ -2524,7 +3700,7 @@ class NasLibraryDatabase {
   List<NasLibraryCategory> listCategories() => _db
       .select(
           'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
-      .map(_mapCategory)
+      .map(_mapCategoryWithSources)
       .toList(growable: false);
 
   NasLibraryCategory? findCategory(String categoryId) {
@@ -2532,7 +3708,90 @@ class NasLibraryDatabase {
       'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories WHERE id = ?',
       [categoryId],
     );
-    return rows.isEmpty ? null : _mapCategory(rows.single);
+    return rows.isEmpty ? null : _mapCategoryWithSources(rows.single);
+  }
+
+  List<NasCategoryMediaSource> mediaSourcesForCategory(String categoryId) {
+    final rows = _db.select('''
+      SELECT source.id, source.category_id, source.media_root_id,
+             root.name AS source_name, source.relative_path,
+             root.is_online, root.last_scanned_at
+      FROM category_media_sources source
+      JOIN media_roots root ON root.id = source.media_root_id
+      WHERE source.category_id = ?
+      ORDER BY root.name COLLATE NOCASE, source.relative_path COLLATE NOCASE, source.id
+    ''', [categoryId]);
+    return rows
+        .map(
+          (row) => NasCategoryMediaSource(
+            id: row['id'] as String,
+            categoryId: row['category_id'] as String,
+            mediaRootId: row['media_root_id'] as String,
+            sourceName: row['source_name'] as String,
+            relativePath: row['relative_path'] as String,
+            isOnline: (row['is_online'] as int) == 1,
+            lastScannedAt: row['last_scanned_at'] as String?,
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  bool replaceCategoryMediaSources({
+    required String categoryId,
+    required List<NasCategoryMediaSourceInput> sources,
+  }) {
+    if (findCategory(categoryId) == null || sources.length > 32) return false;
+    final normalized = <NasCategoryMediaSourceInput>[];
+    for (final source in sources) {
+      final relativePath = _normalizeRelativePath(source.relativePath);
+      if (relativePath == null || findMediaRoot(source.mediaRootId) == null) {
+        return false;
+      }
+      normalized.add(NasCategoryMediaSourceInput(
+        mediaRootId: source.mediaRootId,
+        relativePath: relativePath,
+      ));
+    }
+    if (normalized
+            .map((source) => '${source.mediaRootId}:${source.relativePath}')
+            .toSet()
+            .length !=
+        normalized.length) {
+      return false;
+    }
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      _db.execute('DELETE FROM category_media_sources WHERE category_id = ?',
+          [categoryId]);
+      final timestamp = _now();
+      for (final source in normalized) {
+        _db.execute('''
+          INSERT INTO category_media_sources(
+            id, category_id, media_root_id, relative_path, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        ''', [
+          newUuidV4(),
+          categoryId,
+          source.mediaRootId,
+          source.relativePath,
+          timestamp,
+          timestamp,
+        ]);
+      }
+      _db.execute(
+        'UPDATE library_categories SET media_relative_path = ?, updated_at = ? WHERE id = ?',
+        [
+          normalized.isEmpty ? null : normalized.first.relativePath,
+          timestamp,
+          categoryId
+        ],
+      );
+      _db.execute('COMMIT');
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return true;
   }
 
   bool hasCategoryName(String name, {String? excludingId}) {
@@ -2570,7 +3829,18 @@ class NasLibraryDatabase {
         category.updatedAt
       ],
     );
-    return category;
+    if (mediaRelativePath != null && listMediaRoots().isNotEmpty) {
+      replaceCategoryMediaSources(
+        categoryId: category.id,
+        sources: [
+          NasCategoryMediaSourceInput(
+            mediaRootId: listMediaRoots().first.id,
+            relativePath: mediaRelativePath,
+          ),
+        ],
+      );
+    }
+    return findCategory(category.id)!;
   }
 
   NasLibraryCategory? updateCategory(
@@ -2586,9 +3856,7 @@ class NasLibraryDatabase {
     if (hasCategoryName(name, excludingId: categoryId)) {
       throw ArgumentError.value(name, 'name', 'already exists');
     }
-    if (updateMediaRelativePath) {
-      _db.execute('DELETE FROM movies WHERE category_id = ?', [categoryId]);
-    }
+    // 改绑目录绝不删除影片或人工资料；后续扫描仅更新该来源确认缺失的分集。
     _db.execute(
       updateMediaRelativePath
           ? 'UPDATE library_categories SET name = ?, color = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
@@ -2608,13 +3876,29 @@ class NasLibraryDatabase {
               categoryId
             ],
     );
+    if (updateMediaRelativePath &&
+        mediaRelativePath != null &&
+        listMediaRoots().isNotEmpty) {
+      replaceCategoryMediaSources(
+        categoryId: categoryId,
+        sources: [
+          NasCategoryMediaSourceInput(
+            mediaRootId: listMediaRoots().first.id,
+            relativePath: mediaRelativePath,
+          ),
+        ],
+      );
+    }
     return findCategory(categoryId);
   }
 
   bool deleteCategory(String categoryId, {bool deleteMovies = false}) {
     if (findCategory(categoryId) == null) return false;
     if (deleteMovies) {
-      _db.execute('DELETE FROM movies WHERE category_id = ?', [categoryId]);
+      _db.execute(
+        "DELETE FROM movies WHERE category_id = ? AND lifecycle_state = 'active'",
+        [categoryId],
+      );
     }
     _db.execute('DELETE FROM library_categories WHERE id = ?', [categoryId]);
     return true;
@@ -2657,7 +3941,11 @@ class NasLibraryDatabase {
           skipped.add('分类：${existing[normalized]!.name}');
           continue;
         }
-        createCategory(definition.name, color: definition.color);
+        createCategory(
+          definition.name,
+          color: definition.color ??
+              _randomImportColor(_importCategoryColorOptions),
+        );
         added.add('分类：${definition.name}');
       }
       _db.execute('COMMIT');
@@ -2786,7 +4074,9 @@ class NasLibraryDatabase {
     if (tag == null) return false;
     _requireWritableTaxonomy();
     final movieLinks = _db.select(
-      'SELECT COUNT(*) AS count FROM movie_tag_links WHERE tag_id = ?',
+      '''SELECT COUNT(*) AS count FROM movie_tag_links links
+         JOIN movies m ON m.id = links.movie_id
+         WHERE links.tag_id = ? AND m.lifecycle_state = 'active' ''',
       [tagId],
     ).single['count'] as int;
     final childLinks = _db.select(
@@ -2796,6 +4086,12 @@ class NasLibraryDatabase {
     if (movieLinks > 0 || childLinks > 0) {
       throw StateError('标签仍有关联影片或子级，只能归档');
     }
+    _db.execute('''
+      DELETE FROM movie_tag_links
+      WHERE tag_id = ? AND movie_id IN (
+        SELECT id FROM movies WHERE lifecycle_state = 'merged'
+      )
+    ''', [tagId]);
     _db.execute('DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
     _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
     return true;
@@ -2809,9 +4105,10 @@ class NasLibraryDatabase {
              SUM(CASE WHEN level = 3 THEN 1 ELSE 0 END) AS level_three
       FROM tags
     ''').single;
-    final links = _db
-        .select('SELECT COUNT(*) AS count FROM movie_tag_links')
-        .single['count'] as int;
+    final links =
+        _db.select('''SELECT COUNT(*) AS count FROM movie_tag_links links
+          JOIN movies m ON m.id = links.movie_id
+          WHERE m.lifecycle_state = 'active' ''').single['count'] as int;
     return NasTagOverview(
       total: row['total'] as int,
       levelOne: (row['level_one'] as int?) ?? 0,
@@ -2879,9 +4176,11 @@ class NasLibraryDatabase {
       ),
       tag_counts AS (
         SELECT descendants.ancestor_id AS tag_id,
-               COUNT(DISTINCT movie_tag_links.movie_id) AS movie_count
+                COUNT(DISTINCT CASE WHEN movie.lifecycle_state = 'active'
+                  THEN movie_tag_links.movie_id END) AS movie_count
         FROM descendants
         LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
+        LEFT JOIN movies movie ON movie.id = movie_tag_links.movie_id
         GROUP BY descendants.ancestor_id
       )
       SELECT root.id AS root_id, root.name AS root_name,
@@ -2968,6 +4267,7 @@ class NasLibraryDatabase {
       FROM tag_parent_links link
       JOIN tags child ON child.id = link.child_tag_id
       LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = child.id
+      LEFT JOIN movies linked_movie ON linked_movie.id = movie_tag_links.movie_id
       WHERE link.parent_tag_id = ? AND child.level = 3
         AND child.archived_at IS NULL
         AND (? = '%%' OR lower(child.name) LIKE lower(?))
@@ -2979,7 +4279,8 @@ class NasLibraryDatabase {
     final offset = (page - 1) * pageSize;
     final rows = _db.select('''
       SELECT child.id, child.name,
-             COUNT(DISTINCT movie_tag_links.movie_id) AS movie_count
+             COUNT(DISTINCT CASE WHEN linked_movie.lifecycle_state = 'active'
+               THEN movie_tag_links.movie_id END) AS movie_count
       $from
       GROUP BY child.id
       ORDER BY child.name COLLATE NOCASE, child.id
@@ -3110,6 +4411,7 @@ class NasLibraryDatabase {
       throw ArgumentError('关联影片分页参数无效');
     }
     final clauses = <String>[
+      "m.lifecycle_state = 'active'",
       'm.id IN (SELECT movie_id FROM movie_tag_links WHERE tag_id IN (SELECT tag_id FROM tag_scope))',
     ];
     final parameters = <Object?>[tagId];
@@ -3264,7 +4566,8 @@ class NasLibraryDatabase {
             name: definition.name,
             level: level,
             description: definition.description,
-            color: definition.color,
+            color:
+                definition.color ?? _randomImportColor(_importTagColorOptions),
             createdAt: timestamp,
             updatedAt: timestamp,
           );
@@ -3441,9 +4744,11 @@ class NasLibraryDatabase {
         JOIN tag_parent_links links ON links.parent_tag_id = descendants.descendant_id
       )
       SELECT descendants.ancestor_id AS tag_id,
-             COUNT(DISTINCT movie_tag_links.movie_id) AS movie_count
-      FROM descendants
-      LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
+              COUNT(DISTINCT CASE WHEN movie.lifecycle_state = 'active'
+                THEN movie_tag_links.movie_id END) AS movie_count
+       FROM descendants
+       LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
+       LEFT JOIN movies movie ON movie.id = movie_tag_links.movie_id
       GROUP BY descendants.ancestor_id
     ''');
     return {
@@ -3565,7 +4870,7 @@ class NasLibraryDatabase {
         FROM movies m
         JOIN movie_tag_links links ON links.movie_id = m.id
         JOIN tags t ON t.id = links.tag_id
-        WHERE $condition
+        WHERE m.lifecycle_state = 'active' AND $condition
         ORDER BY t.name COLLATE NOCASE, t.id
       ''', parameters).map(_mapTag).toList(growable: false);
 
@@ -3577,7 +4882,7 @@ class NasLibraryDatabase {
       SELECT l.actor_id, COUNT(DISTINCT l.movie_id) AS movie_count
       FROM movie_actor_links l
       JOIN movies m ON m.id = l.movie_id
-      WHERE $condition
+       WHERE m.lifecycle_state = 'active' AND $condition
       GROUP BY l.actor_id
       ORDER BY movie_count DESC, l.actor_id ASC
     ''', parameters);
@@ -3677,36 +4982,263 @@ class NasLibraryDatabase {
     return rows.isEmpty ? 0 : rows.single['position_ms'] as int;
   }
 
+  NasPlaybackResumeTarget? resumeTargetForMovie(String movieId) {
+    final progressed = _db.select('''
+      SELECT episode_id, position_ms
+      FROM episode_playback_progress
+      WHERE movie_id = ?
+        AND position_ms > 0
+        AND duration_ms > 0
+        AND position_ms < duration_ms
+      ORDER BY updated_at DESC, episode_id DESC
+      LIMIT 1
+    ''', [movieId]);
+    if (progressed.isNotEmpty) {
+      return NasPlaybackResumeTarget(
+        episodeId: progressed.single['episode_id'] as String,
+        positionMs: progressed.single['position_ms'] as int,
+      );
+    }
+
+    final latestStarted = _db.select('''
+      SELECT episode_id
+      FROM playback_history
+      WHERE movie_id = ?
+      ORDER BY started_at DESC, id DESC
+      LIMIT 1
+    ''', [movieId]);
+    if (latestStarted.isEmpty) return null;
+    return NasPlaybackResumeTarget(
+      episodeId: latestStarted.single['episode_id'] as String,
+      positionMs: 0,
+    );
+  }
+
   String recordPlaybackStarted({
     required String movieId,
     required String episodeId,
+    String deviceId = 'legacy',
+    String devicePlatform = 'unknown',
+    String? startedAt,
+    int? durationMs,
   }) {
     final historyId = newUuidV4();
-    final timestamp = _now();
+    final timestamp = startedAt ?? _now();
     _db.execute(
       'UPDATE movies SET play_count = play_count + 1, updated_at = ? WHERE id = ?',
       [timestamp, movieId],
     );
     _db.execute(
-      '''INSERT INTO playback_history(id, movie_id, episode_id, started_at)
-         VALUES (?, ?, ?, ?)''',
-      [historyId, movieId, episodeId, timestamp],
+      '''INSERT INTO playback_history(
+           id, movie_id, episode_id, started_at, last_reported_at,
+           watch_duration_ms, last_position_ms, playback_status,
+           device_id, device_platform, duration_ms, end_position_ms
+         ) VALUES (?, ?, ?, ?, ?, 0, 0, 'playing', ?, ?, ?, 0)''',
+      [
+        historyId,
+        movieId,
+        episodeId,
+        timestamp,
+        timestamp,
+        deviceId,
+        devicePlatform,
+        durationMs,
+      ],
     );
     return historyId;
+  }
+
+  /// 只更新当前正式播放会话绑定的那一条记录，绝不按影片合并历史活动。
+  void reportPlaybackHistory({
+    required String historyId,
+    required String lastReportedAt,
+    required int watchDurationMs,
+    required int lastPositionMs,
+    required int? durationMs,
+    required String playbackStatus,
+  }) {
+    _db.execute('''
+      UPDATE playback_history
+      SET last_reported_at = ?, watch_duration_ms = ?, last_position_ms = ?,
+          duration_ms = ?, end_position_ms = ?, playback_status = ?
+      WHERE id = ?
+    ''', [
+      lastReportedAt,
+      watchDurationMs,
+      lastPositionMs,
+      durationMs,
+      lastPositionMs,
+      playbackStatus,
+      historyId,
+    ]);
   }
 
   void finishPlaybackHistory({
     required String historyId,
     required int? endPositionMs,
     required int? durationMs,
+    String? lastReportedAt,
+    int? watchDurationMs,
+    String playbackStatus = 'ended',
   }) {
     _db.execute(
       '''UPDATE playback_history
-         SET ended_at = ?, end_position_ms = ?, duration_ms = ?
+         SET ended_at = ?, last_reported_at = ?, end_position_ms = ?,
+             last_position_ms = ?, duration_ms = ?, watch_duration_ms = ?,
+             playback_status = ?
          WHERE id = ?''',
-      [_now(), endPositionMs, durationMs, historyId],
+      [
+        _now(),
+        lastReportedAt ?? _now(),
+        endPositionMs,
+        endPositionMs ?? 0,
+        durationMs,
+        watchDurationMs ?? 0,
+        playbackStatus,
+        historyId,
+      ],
     );
   }
+
+  NasWatchHistoryPage watchHistoryPage(NasWatchHistoryQuery query) {
+    final clauses = <String>[];
+    final parameters = <Object?>[];
+    final normalizedQuery = query.query.trim();
+    final like = '%$normalizedQuery%';
+    final catalogLike = '%${_normalizeCatalogNumber(normalizedQuery)}%';
+    if (normalizedQuery.isNotEmpty) {
+      clauses.add('''(
+        lower(m.title) LIKE lower(?)
+        OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
+        OR lower(e.title) LIKE lower(?)
+        OR lower(REPLACE(REPLACE(REPLACE(COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(?)
+      )''');
+      parameters.addAll([like, like, like, catalogLike]);
+    }
+    if (query.startedOnOrAfter != null) {
+      clauses.add('h.started_at >= ?');
+      parameters.add(query.startedOnOrAfter);
+    }
+    if (query.startedBefore != null) {
+      clauses.add('h.started_at < ?');
+      parameters.add(query.startedBefore);
+    }
+    if (query.devicePlatform != null) {
+      clauses.add('h.device_platform = ?');
+      parameters.add(query.devicePlatform);
+    }
+    final where = clauses.isEmpty ? '1 = 1' : clauses.join(' AND ');
+    final sortExpression = switch (query.sort) {
+      'watchDurationMs' => 'h.watch_duration_ms',
+      'lastReportedAt' => 'h.last_reported_at',
+      _ => 'h.started_at',
+    };
+    final direction = query.order == 'asc' ? 'ASC' : 'DESC';
+    final offset = (query.page - 1) * query.pageSize;
+    const from = '''
+      FROM playback_history h
+      JOIN movies m ON m.id = h.movie_id
+      JOIN episodes e ON e.id = h.episode_id
+      LEFT JOIN media_roots root ON root.id = e.media_root_id
+    ''';
+    final total = _db
+        .select('SELECT COUNT(*) AS count $from WHERE $where', parameters)
+        .single['count'] as int;
+    final rows = _db.select('''
+      SELECT h.id, h.movie_id, h.episode_id, h.started_at, h.last_reported_at,
+             h.ended_at, h.watch_duration_ms, h.last_position_ms,
+             h.duration_ms, h.playback_status, h.device_id, h.device_platform,
+             m.title, m.original_title, m.catalog_number, m.poster_file_name,
+             e.title AS episode_title, root.name AS source_name
+      $from
+      WHERE $where
+      ORDER BY $sortExpression $direction, h.id $direction
+      LIMIT ? OFFSET ?
+    ''', [...parameters, query.pageSize, offset]);
+    final statsRow = _db.select('''
+      SELECT COUNT(*) AS record_count,
+             COALESCE(SUM(h.watch_duration_ms), 0) AS watch_duration_ms,
+             COUNT(DISTINCT h.device_id) AS active_device_count
+      $from
+      WHERE $where
+    ''', parameters).single;
+    final deviceRows = _db.select('''
+      SELECT h.device_platform, COUNT(*) AS count
+      $from
+      WHERE $where
+      GROUP BY h.device_platform
+    ''', parameters);
+    return NasWatchHistoryPage(
+      items: rows.map(_mapWatchHistoryRecord).toList(growable: false),
+      number: query.page,
+      size: query.pageSize,
+      total: total,
+      hasMore: offset + rows.length < total,
+      stats: NasWatchHistoryStats(
+        recordCount: statsRow['record_count'] as int,
+        watchDurationMs: statsRow['watch_duration_ms'] as int,
+        continueCount: _continueWatchingItems().length,
+        activeDeviceCount: statsRow['active_device_count'] as int,
+      ),
+      continueItems: _continueWatchingItems(),
+      deviceCounts: {
+        for (final row in deviceRows)
+          row['device_platform'] as String: row['count'] as int,
+      },
+    );
+  }
+
+  List<NasWatchHistoryRecord> _continueWatchingItems() {
+    final rows = _db.select('''
+      SELECT COALESCE(h.id, '') AS id, p.movie_id, p.episode_id,
+             COALESCE(h.started_at, p.updated_at) AS started_at,
+             COALESCE(h.last_reported_at, p.updated_at) AS last_reported_at,
+             h.ended_at, COALESCE(h.watch_duration_ms, 0) AS watch_duration_ms,
+             p.position_ms AS last_position_ms, p.duration_ms,
+             COALESCE(h.playback_status, 'paused') AS playback_status,
+             COALESCE(h.device_id, 'legacy') AS device_id,
+             COALESCE(h.device_platform, 'unknown') AS device_platform,
+             m.title, m.original_title, m.catalog_number, m.poster_file_name,
+             e.title AS episode_title, root.name AS source_name
+      FROM episode_playback_progress p
+      JOIN movies m ON m.id = p.movie_id
+      JOIN episodes e ON e.id = p.episode_id
+      LEFT JOIN media_roots root ON root.id = e.media_root_id
+      LEFT JOIN playback_history h ON h.id = (
+        SELECT latest.id FROM playback_history latest
+        WHERE latest.episode_id = p.episode_id
+        ORDER BY latest.last_reported_at DESC, latest.id DESC
+        LIMIT 1
+      )
+      WHERE p.position_ms > 0 AND p.duration_ms > 0
+        AND p.position_ms < p.duration_ms
+      ORDER BY p.updated_at DESC, p.episode_id DESC
+      LIMIT 12
+    ''');
+    return rows.map(_mapWatchHistoryRecord).toList(growable: false);
+  }
+
+  NasWatchHistoryRecord _mapWatchHistoryRecord(Row row) =>
+      NasWatchHistoryRecord(
+        recordId: row['id'] as String,
+        movieId: row['movie_id'] as String,
+        episodeId: row['episode_id'] as String,
+        title: row['title'] as String,
+        episodeTitle: row['episode_title'] as String,
+        startedAt: row['started_at'] as String,
+        lastReportedAt: row['last_reported_at'] as String,
+        watchDurationMs: row['watch_duration_ms'] as int,
+        lastPositionMs: row['last_position_ms'] as int,
+        durationMs: row['duration_ms'] as int?,
+        status: row['playback_status'] as String,
+        deviceId: row['device_id'] as String,
+        devicePlatform: row['device_platform'] as String,
+        originalTitle: row['original_title'] as String?,
+        catalogNumber: row['catalog_number'] as String?,
+        posterFileName: row['poster_file_name'] as String?,
+        sourceName: row['source_name'] as String?,
+        endedAt: row['ended_at'] as String?,
+      );
 
   List<NasPlaybackHistoryItem> listPlaybackHistory({String titleQuery = ''}) {
     final query = titleQuery.trim();
@@ -3896,7 +5428,10 @@ class NasLibraryDatabase {
         durationMs: (row['duration_ms'] as int?) == 0
             ? null
             : row['duration_ms'] as int?,
+        entryType: row['entry_type'] as String,
         updatedAt: row['updated_at'] as String,
+        categoryId: row['category_id'] as String?,
+        categoryName: row['category_name'] as String?,
       );
 
   /// 搜索列表已经由 SQL 聚合，不能再为每部影片读取标签或路径。
@@ -3918,6 +5453,7 @@ class NasLibraryDatabase {
         durationMs: (row['duration_ms'] as int?) == 0
             ? null
             : row['duration_ms'] as int?,
+        entryType: row['entry_type'] as String,
         updatedAt: row['updated_at'] as String,
         categoryId: row['category_id'] as String?,
         categoryName: row['category_name'] as String?,
@@ -3951,6 +5487,7 @@ class NasLibraryDatabase {
       posterFileName: movie.posterFileName,
       episodeCount: movie.episodeCount,
       durationMs: movie.durationMs,
+      entryType: movie.entryType,
       playCount: movie.playCount,
       updatedAt: movie.updatedAt,
       categoryId: movie.categoryId,
@@ -3978,7 +5515,7 @@ class NasLibraryDatabase {
   NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
     final rows = _db.select('''
       SELECT id, name, container_path, read_only, enabled, created_at,
-             updated_at, last_scanned_at
+             updated_at, last_scanned_at, is_online
       FROM media_roots WHERE container_path = ?
     ''', [containerPath]);
     return rows.isEmpty ? null : _mapMediaRoot(rows.single);
@@ -3993,6 +5530,7 @@ class NasLibraryDatabase {
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
         lastScannedAt: row['last_scanned_at'] as String?,
+        isOnline: (row['is_online'] as int? ?? 0) == 1,
       );
 
   NasLibraryCategory _mapCategory(Row row) => NasLibraryCategory(
@@ -4003,6 +5541,37 @@ class NasLibraryDatabase {
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
       );
+
+  NasLibraryEpisode _mapEpisode(Row row) => NasLibraryEpisode(
+        id: row['id'] as String,
+        movieId: row['movie_id'] as String,
+        mediaRootId: row['media_root_id'] as String,
+        title: row['title'] as String,
+        relativePath: row['relative_path'] as String,
+        fileSize: row['file_size'] as int,
+        isAvailable: (row['is_available'] as int) == 1,
+        durationMs: row['duration_ms'] as int?,
+        videoWidth: row['video_width'] as int?,
+        videoHeight: row['video_height'] as int?,
+        resolutionLabel: row['resolution_label'] as String?,
+        mediaModifiedAt: row['media_modified_at'] as int?,
+        updatedAt: row['updated_at'] as String,
+        sourceName: row['source_name'] as String? ?? '未知来源盘',
+        sourceOnline: (row['source_online'] as int? ?? 0) == 1,
+      );
+
+  NasLibraryCategory _mapCategoryWithSources(Row row) {
+    final category = _mapCategory(row);
+    return NasLibraryCategory(
+      id: category.id,
+      name: category.name,
+      color: category.color,
+      mediaRelativePath: category.mediaRelativePath,
+      createdAt: category.createdAt,
+      updatedAt: category.updatedAt,
+      mediaSources: mediaSourcesForCategory(category.id),
+    );
+  }
 
   NasCarouselImage _mapCarouselImage(Row row) => NasCarouselImage(
         id: row['id'] as String,
@@ -4022,15 +5591,69 @@ class NasLibraryDatabase {
         archivedAt: row['archived_at'] as String?,
       );
 
+  void _backfillLegacyCategorySources(String rootId) {
+    final categories = _db.select('''
+      SELECT id, media_relative_path FROM library_categories
+      WHERE media_relative_path IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM category_media_sources source
+          WHERE source.category_id = library_categories.id
+        )
+    ''');
+    final timestamp = _now();
+    for (final category in categories) {
+      final path = _normalizeRelativePath(
+        category['media_relative_path'] as String?,
+      );
+      if (path == null) continue;
+      _db.execute('''
+        INSERT INTO category_media_sources(
+          id, category_id, media_root_id, relative_path, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      ''', [newUuidV4(), category['id'], rootId, path, timestamp, timestamp]);
+    }
+  }
+
   void _markRootScanned(String rootId) {
     _db.execute(
-      'UPDATE media_roots SET last_scanned_at = ?, updated_at = ? WHERE id = ?',
+      'UPDATE media_roots SET last_scanned_at = ?, is_online = 1, updated_at = ? WHERE id = ?',
       [_now(), _now(), rootId],
+    );
+  }
+
+  void _markRootOffline(String rootId) {
+    _db.execute(
+      'UPDATE media_roots SET is_online = 0, updated_at = ? WHERE id = ?',
+      [_now(), rootId],
     );
   }
 
   static bool _isVideo(String path) =>
       RegExp(r'\.(mp4|m4v|mkv|mov|webm)$', caseSensitive: false).hasMatch(path);
+
+  static String? _collectionTitleFromDirectory(String value) {
+    final match = RegExp(r'^(.*?)\s*[-－—]\s*影集\s*$').firstMatch(value);
+    final title = match?.group(1)?.trim();
+    return title == null || title.isEmpty ? null : title;
+  }
+
+  static String _naturalSortKey(String value) =>
+      value.toLowerCase().replaceAllMapped(
+          RegExp(r'\d+'), (match) => match.group(0)!.padLeft(16, '0'));
+
+  static String? _normalizeRelativePath(String? value) {
+    final normalized = value?.trim().replaceAll('\\', '/');
+    if (normalized == null ||
+        normalized.isEmpty ||
+        normalized.startsWith('/') ||
+        normalized.split('/').any(
+              (segment) => segment.isEmpty || segment == '.' || segment == '..',
+            )) {
+      return null;
+    }
+    return normalized;
+  }
+
   static String _titleFromPath(String relativePath) {
     final name = relativePath.split('/').last;
     final dot = name.lastIndexOf('.');
@@ -4038,6 +5661,29 @@ class NasLibraryDatabase {
   }
 
   static String _now() => DateTime.now().toUtc().toIso8601String();
+}
+
+class _EpisodeGrouping {
+  const _EpisodeGrouping({
+    this.rootPath,
+    this.displayTitle,
+    this.conflictPath,
+  });
+
+  final String? rootPath;
+  final String? displayTitle;
+  final String? conflictPath;
+
+  bool get isConflict => conflictPath != null;
+}
+
+class _LegacyCollectionGroup {
+  _LegacyCollectionGroup({required this.categoryId, required this.title});
+
+  final String categoryId;
+  final String title;
+  final Set<String> episodeIds = <String>{};
+  final Set<String> sourceMovieIds = <String>{};
 }
 
 List<String> _decodeTextList(String? value) {

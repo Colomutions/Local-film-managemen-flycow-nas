@@ -85,6 +85,18 @@ class NasHealthServer {
       rootName: config.mediaRootName,
       containerPath: config.mediaDir,
     );
+    // 双盘覆盖以 /media/disk1、/media/disk2 作为物理来源盘；不存在时保留旧单根兼容。
+    final topDirectories = await _mediaService.childDirectories(null);
+    for (final directory in topDirectories) {
+      final diskName = directory.relativePath.split('/').single;
+      if (!RegExp(r'^disk\d+$', caseSensitive: false).hasMatch(diskName)) {
+        continue;
+      }
+      _libraryDatabase.ensureConfiguredMediaRoot(
+        rootName: diskName,
+        containerPath: directory.directory.path,
+      );
+    }
     if (!config.managedCategoryLibrary && config.scanOnStart) {
       await _libraryDatabase.scanMediaRoot(
         mediaRootId: _configuredMediaRoot!.id,
@@ -308,6 +320,29 @@ class NasHealthServer {
           RegExp(r'^/api/v1/admin/episodes/[^/]+$').hasMatch(path)) {
         return await _updateAdminEpisode(request);
       }
+      if (request.method == 'GET' && path == '/api/v1/admin/media-files') {
+        return await _adminMediaFiles(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/admin/collections') {
+        return await _createAdminCollection(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/collections/[^/]+/episodes$')
+              .hasMatch(path)) {
+        return await _mergeAdminCollectionEpisodes(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/collections/[^/]+/split$').hasMatch(path)) {
+        return await _splitAdminCollectionEpisodes(request);
+      }
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/collection-migrations/preview') {
+        return await _collectionMigrationPreview(request);
+      }
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/collection-migrations/apply') {
+        return await _applyCollectionMigration(request);
+      }
       if (request.method == 'POST' && path == '/api/v1/admin/scan-jobs') {
         return await _createScanJob(request);
       }
@@ -394,6 +429,9 @@ class NasHealthServer {
       if (request.method == 'GET' && path == '/api/v1/movies') {
         return await _movies(request);
       }
+      if (request.method == 'GET' && path == '/api/v1/collections') {
+        return await _collections(request);
+      }
       if (request.method == 'POST' && path == '/api/v1/movies/search') {
         return await _movieSearch(request);
       }
@@ -458,6 +496,10 @@ class NasHealthServer {
         return await _actorDetails(request);
       }
       if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/movies/[^/]+/episodes$').hasMatch(path)) {
+        return await _movieEpisodes(request);
+      }
+      if (request.method == 'GET' &&
           RegExp(r'^/api/v1/movies/[^/]+$').hasMatch(path)) {
         return await _movieDetails(request);
       }
@@ -469,6 +511,9 @@ class NasHealthServer {
       }
       if (request.method == 'GET' && path == '/api/v1/history') {
         return await _history(request);
+      }
+      if (request.method == 'GET' && path == '/api/v1/watch-history') {
+        return await _watchHistory(request);
       }
       if ((request.method == 'GET' || request.method == 'HEAD') &&
           RegExp(r'^/api/v1/assets/posters/[^/]+$').hasMatch(path)) {
@@ -483,7 +528,7 @@ class NasHealthServer {
         return await _managedAsset(request);
       }
       if (request.method == 'POST' && path == '/api/v1/playback/sessions') {
-        return await _createPlaybackSession(request, tokenHash);
+        return await _createPlaybackSession(request, tokenHash, device);
       }
       if (request.method == 'POST' &&
           RegExp(r'^/api/v1/playback/sessions/[^/]+/started$').hasMatch(path)) {
@@ -614,10 +659,16 @@ class NasHealthServer {
     if (requestedScope != 'viewer' && requestedScope != 'admin') {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final rawPlatform = body['platform'];
+    final platform = rawPlatform is String &&
+            const {'windows', 'android'}.contains(rawPlatform)
+        ? rawPlatform
+        : 'unknown';
     final expiresAt = DateTime.now().toUtc().add(const Duration(minutes: 5));
     final sessionId = newUuidV4();
     _pairingSessions[sessionId] = _PairingSession(
       scope: requestedScope as String,
+      platform: platform,
       expiresAt: expiresAt,
     );
     await _writeJson(request.response, HttpStatus.ok, {
@@ -646,6 +697,7 @@ class NasHealthServer {
       deviceId: deviceId,
       scope: session.scope,
       expiresAt: expiresAt,
+      platform: session.platform,
     );
     await _persistState();
     await _writeJson(request.response, HttpStatus.ok, {
@@ -654,6 +706,7 @@ class NasHealthServer {
         'accessToken': token,
         'expiresAt': expiresAt.toIso8601String(),
         'scope': session.scope,
+        'platform': session.platform,
       },
     });
   }
@@ -735,6 +788,44 @@ class NasHealthServer {
         'hasMore': offset + paged.length < movies.length,
       },
     });
+  }
+
+  /// 影集管理目标只按需查询 NAS 中同一分类的影集，不能依赖影片墙当前页。
+  Future<void> _collections(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final categoryId = parameters['categoryId'];
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '20') ?? 0;
+    final query = parameters['q'] ?? '';
+    if (categoryId == null ||
+        categoryId.isEmpty ||
+        page < 1 ||
+        pageSize < 1 ||
+        pageSize > 100 ||
+        query.length > 120) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      final result = _libraryDatabase.searchSeries(
+        categoryId: categoryId,
+        query: query,
+        page: page,
+        pageSize: pageSize,
+      );
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'items': result.items.map(_databaseSummary).toList(growable: false),
+        },
+        'page': {
+          'number': result.number,
+          'size': result.size,
+          'total': result.total,
+          'hasMore': result.hasMore,
+        },
+      });
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
   }
 
   /// 面向浏览端的全库结构化搜索；标签条件绝不在 Windows 侧二次计算。
@@ -890,6 +981,44 @@ class NasHealthServer {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     await _writeJson(request.response, HttpStatus.ok, {'data': movie});
+  }
+
+  /// 分集检索、搜索与分页始终在 NAS 完成，客户端不下载整部影集后过滤。
+  Future<void> _movieEpisodes(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '10') ?? 0;
+    final query = parameters['q'] ?? '';
+    final episodeId = parameters['episodeId'];
+    final movieId = request.uri.pathSegments[3];
+    if (page < 1 || pageSize < 1 || pageSize > 100 || query.length > 120) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    if (_libraryDatabase.findMovieForAdmin(movieId) == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    try {
+      final result = _libraryDatabase.episodePageForMovie(
+        movieId: movieId,
+        query: query,
+        page: page,
+        pageSize: pageSize,
+        anchorEpisodeId: episodeId,
+      );
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'items': result.items.map(_episodePayload).toList(growable: false),
+        },
+        'page': {
+          'number': result.number,
+          'size': result.size,
+          'total': result.total,
+          'hasMore': result.hasMore,
+        },
+      });
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
   }
 
   Future<void> _actors(HttpRequest request) async {
@@ -2453,6 +2582,7 @@ class NasHealthServer {
             .map((path) => path.names)
             .toList(growable: false),
         'episodeCount': movie.episodeCount,
+        'entryType': movie.entryType,
         'durationMs': movie.durationMs,
         'resolutionLabel': movie.resolutionLabel,
         'resolutionWidth': movie.videoWidth,
@@ -2489,6 +2619,7 @@ class NasHealthServer {
             ? null
             : {'id': movie.categoryId, 'name': movie.categoryName},
         'episodeCount': movie.episodeCount,
+        'entryType': movie.entryType,
         'durationMs': movie.durationMs,
         'resolutionLabel': movie.resolutionLabel,
         'resolutionWidth': movie.videoWidth,
@@ -2503,29 +2634,33 @@ class NasHealthServer {
       };
 
   Future<Map<String, Object?>> _databaseDetails(NasLibraryMovie movie) async {
-    final episodes = <Map<String, Object?>>[];
-    for (final episode in _libraryDatabase.episodesForMovie(movie.id)) {
-      final file =
-          await _mediaService.fileForRelativePath(episode.relativePath);
-      episodes.add({
-        'id': episode.id,
-        'title': episode.title,
-        'sourceName': episode.relativePath.split('/').last,
-        'durationMs': episode.durationMs,
-        'resolutionLabel': episode.resolutionLabel,
-        'videoWidth': episode.videoWidth,
-        'videoHeight': episode.videoHeight,
-        'fileSize': episode.fileSize,
-        'isAvailable': episode.isAvailable && file != null,
-      });
-    }
+    final episodePage = _libraryDatabase.episodePageForMovie(
+      movieId: movie.id,
+      page: 1,
+      pageSize: 10,
+    );
+    final resumeTarget = _libraryDatabase.resumeTargetForMovie(movie.id);
     return {
       ..._databaseSummary(movie),
       'actors':
           movie.actors.map(_movieActorDetailsPayload).toList(growable: false),
       'summary': movie.summary,
       'lastPlayedAt': _libraryDatabase.lastPlaybackStartedAtForMovie(movie.id),
-      'episodes': episodes,
+      'continuePlayback': resumeTarget == null
+          ? null
+          : {
+              'episodeId': resumeTarget.episodeId,
+              'positionMs': resumeTarget.positionMs,
+            },
+      // 保留首段数据给旧只读客户端；完整选集必须继续请求分页接口。
+      'episodes':
+          episodePage.items.map(_episodePayload).toList(growable: false),
+      'episodePage': {
+        'number': episodePage.number,
+        'size': episodePage.size,
+        'total': episodePage.total,
+        'hasMore': episodePage.hasMore,
+      },
       'carouselImages': _libraryDatabase
           .carouselImagesForMovie(movie.id)
           .map(
@@ -2631,25 +2766,31 @@ class NasHealthServer {
   Future<void> _createAdminCategory(HttpRequest request) async {
     final body = await _readJsonBody(request);
     final name = _categoryName(body);
-    final directoryKey = _categoryDirectoryKey(body);
+    final sources = await _categorySourceInputs(body);
     final color = _taxonomyColor(body);
     if (name == null ||
         color == _invalidTaxonomyColor ||
         _libraryDatabase.hasCategoryName(name) ||
-        (config.managedCategoryLibrary && directoryKey == null) ||
-        (directoryKey != null &&
-            !await _canBindCategoryDirectory(directoryKey))) {
+        sources == null ||
+        (config.managedCategoryLibrary && sources.isEmpty) ||
+        !await _canBindCategorySources(sources)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final category = _libraryDatabase.createCategory(
       name,
-      mediaRelativePath: directoryKey,
       color: color,
     );
+    if (!_libraryDatabase.replaceCategoryMediaSources(
+      categoryId: category.id,
+      sources: sources,
+    )) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final savedCategory = _libraryDatabase.findCategory(category.id)!;
     final scanJob = _scheduleCategoryScan(category.id);
     await _writeJson(request.response, HttpStatus.created, {
       'data': {
-        ..._categoryPayload(category),
+        ..._categoryPayload(savedCategory),
         if (scanJob != null) 'scanJob': _scanJobPayload(scanJob),
       },
     });
@@ -2659,8 +2800,9 @@ class NasHealthServer {
     final body = await _readJsonBody(request);
     final name = _categoryName(body);
     final categoryId = request.uri.pathSegments.last;
-    final hasDirectoryKey = body?.containsKey('directoryKey') ?? false;
-    final directoryKey = _categoryDirectoryKey(body);
+    final hasSources = body?.containsKey('directoryKey') == true ||
+        body?.containsKey('directoryKeys') == true;
+    final sources = hasSources ? await _categorySourceInputs(body) : null;
     final color = _taxonomyColor(body);
     final previous = _libraryDatabase.findCategory(categoryId);
     if (name == null ||
@@ -2668,34 +2810,41 @@ class NasHealthServer {
         previous == null ||
         _libraryDatabase.hasCategoryName(name, excludingId: categoryId) ||
         (config.managedCategoryLibrary &&
-            previous.mediaRelativePath != null &&
-            (!hasDirectoryKey || directoryKey == null)) ||
-        (hasDirectoryKey &&
-            (directoryKey == null ||
-                !await _canBindCategoryDirectory(
-                  directoryKey,
+            previous.mediaSources.isNotEmpty &&
+            (!hasSources || sources == null || sources.isEmpty)) ||
+        (hasSources &&
+            (sources == null ||
+                !await _canBindCategorySources(
+                  sources,
                   excludingCategoryId: categoryId,
                 )))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final directoryChanged =
-        hasDirectoryKey && previous.mediaRelativePath != directoryKey;
+        hasSources && !_sameCategorySources(previous.mediaSources, sources!);
     final category = _libraryDatabase.updateCategory(
       categoryId,
       name: name,
-      mediaRelativePath: directoryKey,
-      updateMediaRelativePath: directoryChanged,
+      updateMediaRelativePath: false,
       color: color,
       updateColor: body?.containsKey('color') ?? false,
     );
     if (category == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
+    if (directoryChanged &&
+        !_libraryDatabase.replaceCategoryMediaSources(
+          categoryId: categoryId,
+          sources: sources,
+        )) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final savedCategory = _libraryDatabase.findCategory(categoryId)!;
     final scanJob =
         directoryChanged ? _scheduleCategoryScan(category.id) : null;
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {
-        ..._categoryPayload(category),
+        ..._categoryPayload(savedCategory),
         if (scanJob != null) 'scanJob': _scanJobPayload(scanJob),
       },
     });
@@ -3340,6 +3489,166 @@ class NasHealthServer {
     });
   }
 
+  Future<void> _adminMediaFiles(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '20') ?? 0;
+    final query = parameters['q'] ?? '';
+    try {
+      final result = _libraryDatabase.scannedMediaFiles(
+        page: page,
+        pageSize: pageSize,
+        query: query,
+      );
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'items': result.items
+              .map(
+                (item) => {
+                  ..._adminEpisodePayload(item.episode),
+                  'movieId': item.movieId,
+                  'movieTitle': item.movieTitle,
+                  'entryType': item.entryType,
+                  'categoryId': item.categoryId,
+                },
+              )
+              .toList(growable: false),
+        },
+        'page': {
+          'number': result.number,
+          'size': result.size,
+          'total': result.total,
+          'hasMore': result.hasMore,
+        },
+      });
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  Future<void> _createAdminCollection(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final title = body?['title'];
+    final categoryId = body?['categoryId'];
+    if (body == null ||
+        body.keys.any((key) => key != 'title' && key != 'categoryId') ||
+        title is! String ||
+        title.trim().isEmpty ||
+        categoryId is! String ||
+        categoryId.isEmpty ||
+        _libraryDatabase.findCategory(categoryId) == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      final movie = _libraryDatabase.createEmptySeries(
+        title: title,
+        categoryId: categoryId,
+      );
+      await _writeJson(request.response, HttpStatus.created, {
+        'data': await _databaseDetails(movie),
+      });
+    } on ArgumentError {
+      await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  Future<void> _mergeAdminCollectionEpisodes(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final episodeIds = body?['episodeIds'];
+    final metadataSourceMovieId = body?['metadataSourceMovieId'];
+    if (body == null ||
+        body.length != 2 ||
+        episodeIds is! List ||
+        episodeIds.any((item) => item is! String) ||
+        metadataSourceMovieId is! String) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final targetMovieId = request.uri.pathSegments[5];
+    if (!_libraryDatabase.mergeEpisodesIntoSeries(
+      targetMovieId: targetMovieId,
+      episodeIds: episodeIds.cast<String>(),
+      metadataSourceMovieId: metadataSourceMovieId,
+    )) {
+      return _error(request, HttpStatus.conflict, 'collection_merge_conflict');
+    }
+    final movie = _libraryDatabase.findMovieForAdmin(targetMovieId)!;
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': await _databaseDetails(movie),
+    });
+  }
+
+  Future<void> _splitAdminCollectionEpisodes(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final episodeIds = body?['episodeIds'];
+    if (body == null ||
+        body.length != 1 ||
+        episodeIds is! List ||
+        episodeIds.any((item) => item is! String)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movieId = request.uri.pathSegments[5];
+    final movies = _libraryDatabase.splitEpisodesIntoSingles(
+      movieId: movieId,
+      episodeIds: episodeIds.cast<String>(),
+    );
+    if (movies == null) {
+      return _error(request, HttpStatus.conflict, 'collection_split_conflict');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': movies.map(_databaseSummary).toList(growable: false),
+      },
+    });
+  }
+
+  Future<void> _collectionMigrationPreview(HttpRequest request) async {
+    final items = _libraryDatabase.collectionMigrationPreview();
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': items
+            .map(
+              (item) => {
+                'key': item.key,
+                'categoryId': item.categoryId,
+                'title': item.title,
+                'episodeIds': item.episodeIds,
+                'sourceMovieIds': item.sourceMovieIds,
+                'metadataSources': item.sourceMovieIds
+                    .map(_libraryDatabase.findMovieForAdmin)
+                    .whereType<NasLibraryMovie>()
+                    .map((movie) => {'id': movie.id, 'title': movie.title})
+                    .toList(growable: false),
+                'requiresMetadataChoice': item.requiresMetadataChoice,
+              },
+            )
+            .toList(growable: false),
+      },
+    });
+  }
+
+  Future<void> _applyCollectionMigration(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final key = body?['key'];
+    final metadataSourceMovieId = body?['metadataSourceMovieId'];
+    if (body == null ||
+        body.length != 2 ||
+        key is! String ||
+        metadataSourceMovieId is! String) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movie = _libraryDatabase.applyCollectionMigration(
+      key: key,
+      metadataSourceMovieId: metadataSourceMovieId,
+    );
+    if (movie == null) {
+      return _error(
+          request, HttpStatus.conflict, 'collection_migration_conflict');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': await _databaseDetails(movie),
+    });
+  }
+
   Future<void> _renameAdminEpisodeSource(HttpRequest request) async {
     if (!config.allowSourceRename) {
       return _error(request, HttpStatus.conflict, 'source_rename_disabled');
@@ -3356,10 +3665,17 @@ class NasHealthServer {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     NasMediaFile? renamed;
+    final mediaRoot = _libraryDatabase.findMediaRoot(episode.mediaRootId);
+    if (mediaRoot == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
     try {
       renamed = await _mediaService.renameFileInPlace(
         relativePath: episode.relativePath,
         sourceName: sourceName,
+        rootPath: mediaRoot.containerPath == config.mediaDir
+            ? null
+            : mediaRoot.containerPath,
       );
       final stat = await renamed.file.stat();
       final updated = _libraryDatabase.updateEpisodeSourceAfterRename(
@@ -3389,6 +3705,9 @@ class NasHealthServer {
         await _mediaService.restoreRenamedFile(
           renamedFile: renamed,
           originalRelativePath: episode.relativePath,
+          rootPath: mediaRoot.containerPath == config.mediaDir
+              ? null
+              : mediaRoot.containerPath,
         );
       }
       return _error(request, HttpStatus.internalServerError,
@@ -3489,6 +3808,7 @@ class NasHealthServer {
       job.status = 'succeeded';
       job.scannedFiles = result.scannedFiles;
       job.availableEpisodes = result.availableEpisodes;
+      job.conflicts = result.conflicts;
       _logger.event('scan.end', fields: {
         'component': 'nas.scan',
         'sessionId': nasShortId(job.id),
@@ -3520,12 +3840,14 @@ class NasHealthServer {
         'createdAt': root.createdAt,
         'updatedAt': root.updatedAt,
         'lastScannedAt': root.lastScannedAt,
+        'isOnline': root.isOnline,
       };
 
   Map<String, Object?> _devicePayload(NasDeviceToken device) => {
         'deviceId': device.deviceId,
         'scope': device.scope,
         'expiresAt': device.expiresAt.toUtc().toIso8601String(),
+        'platform': device.platform,
       };
 
   Map<String, Object> _backupPayload(NasBackupRecord backup) => backup.toJson();
@@ -3534,8 +3856,25 @@ class NasHealthServer {
         'id': category.id,
         'name': category.name,
         'color': category.color,
-        'directoryKey': category.mediaRelativePath,
-        'directoryName': category.mediaRelativePath?.split('/').last,
+        // 旧字段保留首个来源，正式客户端应使用 sources。
+        'directoryKey': category.mediaSources.isEmpty
+            ? category.mediaRelativePath
+            : _categorySourceDirectoryKey(category.mediaSources.first),
+        'directoryName': category.mediaSources.isEmpty
+            ? category.mediaRelativePath?.split('/').last
+            : category.mediaSources.first.relativePath.split('/').last,
+        'sources': category.mediaSources
+            .map(
+              (source) => {
+                'id': source.id,
+                'directoryKey': _categorySourceDirectoryKey(source),
+                'directoryName': source.relativePath.split('/').last,
+                'sourceName': source.sourceName,
+                'isOnline': source.isOnline,
+                'lastScannedAt': source.lastScannedAt,
+              },
+            )
+            .toList(growable: false),
         'createdAt': category.createdAt,
         'updatedAt': category.updatedAt,
       };
@@ -3630,37 +3969,103 @@ class NasHealthServer {
   String? _categoryName(Map<String, dynamic>? body) {
     return _taxonomyName(
       body,
-      allowed: const {'name', 'directoryKey', 'color'},
+      allowed: const {'name', 'directoryKey', 'directoryKeys', 'color'},
     );
   }
 
-  String? _categoryDirectoryKey(Map<String, dynamic>? body) {
-    if (body == null || !body.containsKey('directoryKey')) return null;
-    final key = body['directoryKey'];
-    if (key is! String) return null;
-    final normalized = key.trim().replaceAll('\\', '/');
-    return normalized.isEmpty ? null : normalized;
+  Future<List<NasCategoryMediaSourceInput>?> _categorySourceInputs(
+    Map<String, dynamic>? body,
+  ) async {
+    if (body == null) return null;
+    final hasSingle = body.containsKey('directoryKey');
+    final hasMany = body.containsKey('directoryKeys');
+    if (hasSingle && hasMany) return null;
+    final raw = hasMany
+        ? body['directoryKeys']
+        : hasSingle
+            ? [body['directoryKey']]
+            : const <Object?>[];
+    if (raw is! List || raw.length > 32 || raw.any((item) => item is! String)) {
+      return null;
+    }
+    final inputs = <NasCategoryMediaSourceInput>[];
+    for (final item in raw.cast<String>()) {
+      final key = item.trim().replaceAll('\\', '/');
+      final input = await _categorySourceInputForDirectoryKey(key);
+      if (input == null) return null;
+      inputs.add(input);
+    }
+    final identities = inputs
+        .map((input) => '${input.mediaRootId}:${input.relativePath}')
+        .toSet();
+    return identities.length == inputs.length ? inputs : null;
   }
 
-  Future<bool> _canBindCategoryDirectory(
-    String directoryKey, {
+  Future<NasCategoryMediaSourceInput?> _categorySourceInputForDirectoryKey(
+    String directoryKey,
+  ) async {
+    if (directoryKey.isEmpty ||
+        await _mediaService.directoryForRelativePath(directoryKey) == null) {
+      return null;
+    }
+    final segments = directoryKey.split('/');
+    final roots = _libraryDatabase.listMediaRoots();
+    for (final root in roots) {
+      if (root.containerPath == config.mediaDir) continue;
+      final rootName = root.containerPath
+          .replaceAll('\\', '/')
+          .split('/')
+          .where((item) => item.isNotEmpty)
+          .last;
+      if (segments.first != rootName || segments.length < 2) continue;
+      return NasCategoryMediaSourceInput(
+        mediaRootId: root.id,
+        relativePath: segments.skip(1).join('/'),
+      );
+    }
+    final defaultRoot = _configuredMediaRoot;
+    if (defaultRoot == null) return null;
+    return NasCategoryMediaSourceInput(
+      mediaRootId: defaultRoot.id,
+      relativePath: directoryKey,
+    );
+  }
+
+  Future<bool> _canBindCategorySources(
+    List<NasCategoryMediaSourceInput> sources, {
     String? excludingCategoryId,
   }) async {
-    final directory =
-        await _mediaService.directoryForRelativePath(directoryKey);
-    if (directory == null) return false;
-    final normalized = directory.relativePath;
+    for (final source in sources) {
+      if (_libraryDatabase.findMediaRoot(source.mediaRootId) == null)
+        return false;
+    }
     for (final category in _libraryDatabase.listCategories()) {
       if (category.id == excludingCategoryId) continue;
-      final other = category.mediaRelativePath;
-      if (other == null) continue;
-      if (normalized == other ||
-          normalized.startsWith('$other/') ||
-          other.startsWith('$normalized/')) {
-        return false;
+      for (final other in category.mediaSources) {
+        for (final source in sources) {
+          if (source.mediaRootId != other.mediaRootId) continue;
+          if (source.relativePath == other.relativePath ||
+              source.relativePath.startsWith('${other.relativePath}/') ||
+              other.relativePath.startsWith('${source.relativePath}/')) {
+            return false;
+          }
+        }
       }
     }
     return true;
+  }
+
+  bool _sameCategorySources(
+    List<NasCategoryMediaSource> current,
+    List<NasCategoryMediaSourceInput> expected,
+  ) {
+    final left = current
+        .map((source) => '${source.mediaRootId}:${source.relativePath}')
+        .toSet();
+    final right = expected
+        .map((source) => '${source.mediaRootId}:${source.relativePath}')
+        .toSet();
+    return left.length == right.length && left.containsAll(right);
   }
 
   Map<String, Object?> _scanJobPayload(_ScanJob job) => {
@@ -3670,6 +4075,7 @@ class NasHealthServer {
         'status': job.status,
         'scannedFiles': job.scannedFiles,
         'availableEpisodes': job.availableEpisodes,
+        'conflicts': job.conflicts,
         'createdAt': job.createdAt.toIso8601String(),
         'startedAt': job.startedAt?.toIso8601String(),
         'finishedAt': job.finishedAt?.toIso8601String(),
@@ -3681,13 +4087,46 @@ class NasHealthServer {
         'movieId': episode.movieId,
         'title': episode.title,
         'sourceName': episode.relativePath.split('/').last,
+        'source': {
+          'name': episode.sourceName,
+          'isOnline': episode.sourceOnline,
+        },
         'durationMs': episode.durationMs,
         'resolutionLabel': episode.resolutionLabel,
         'videoWidth': episode.videoWidth,
         'videoHeight': episode.videoHeight,
         'fileSize': episode.fileSize,
-        'isAvailable': episode.isAvailable,
+        'isAvailable': episode.isAvailable && episode.sourceOnline,
         'updatedAt': episode.updatedAt,
+      };
+
+  String _categorySourceDirectoryKey(NasCategoryMediaSource source) {
+    final root = _libraryDatabase.findMediaRoot(source.mediaRootId);
+    if (root == null || root.containerPath == config.mediaDir) {
+      return source.relativePath;
+    }
+    final rootName = root.containerPath
+        .replaceAll('\\', '/')
+        .split('/')
+        .where((item) => item.isNotEmpty)
+        .last;
+    return '$rootName/${source.relativePath}';
+  }
+
+  Map<String, Object?> _episodePayload(NasLibraryEpisode episode) => {
+        'id': episode.id,
+        'title': episode.title,
+        'sourceName': episode.relativePath.split('/').last,
+        'source': {
+          'name': episode.sourceName,
+          'isOnline': episode.sourceOnline,
+        },
+        'durationMs': episode.durationMs,
+        'resolutionLabel': episode.resolutionLabel,
+        'videoWidth': episode.videoWidth,
+        'videoHeight': episode.videoHeight,
+        'fileSize': episode.fileSize,
+        'isAvailable': episode.isAvailable && episode.sourceOnline,
       };
 
   Future<void> _emptyItems(HttpRequest request) => _writeJson(
@@ -3727,6 +4166,109 @@ class NasHealthServer {
           },
         },
       );
+
+  /// 观影记录的筛选、统计、排序和分页全由 NAS 完成，普通影视用户可只读访问。
+  Future<void> _watchHistory(HttpRequest request) async {
+    final parameters = request.uri.queryParameters;
+    final query = (parameters['q'] ?? '').trim();
+    final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
+    final pageSize = int.tryParse(parameters['pageSize'] ?? '20') ?? 0;
+    final sort = parameters['sort'] ?? 'startedAt';
+    final order = parameters['order'] ?? 'desc';
+    final device = parameters['device'];
+    final fromInput = parameters['from'];
+    final toInput = parameters['to'];
+    final startedOnOrAfter = _watchHistoryDateBoundary(fromInput);
+    final startedBefore = _watchHistoryDateBoundary(toInput, exclusive: true);
+    if (query.length > 240 ||
+        page < 1 ||
+        pageSize < 1 ||
+        pageSize > 50 ||
+        !const {'startedAt', 'watchDurationMs', 'lastReportedAt'}
+            .contains(sort) ||
+        !const {'asc', 'desc'}.contains(order) ||
+        (device != null &&
+            device != 'all' &&
+            !const {'windows', 'android', 'unknown'}.contains(device)) ||
+        (fromInput != null && startedOnOrAfter == null) ||
+        (toInput != null && startedBefore == null) ||
+        (startedOnOrAfter != null &&
+            startedBefore != null &&
+            !DateTime.parse(startedOnOrAfter)
+                .isBefore(DateTime.parse(startedBefore)))) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final result = _libraryDatabase.watchHistoryPage(
+      NasWatchHistoryQuery(
+        query: query,
+        startedOnOrAfter: startedOnOrAfter,
+        startedBefore: startedBefore,
+        devicePlatform: device == 'all' ? null : device,
+        sort: sort,
+        order: order,
+        page: page,
+        pageSize: pageSize,
+      ),
+    );
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'items': result.items
+            .map(_watchHistoryRecordPayload)
+            .toList(growable: false),
+        'continueItems': result.continueItems
+            .map(_watchHistoryRecordPayload)
+            .toList(growable: false),
+        'stats': {
+          'recordCount': result.stats.recordCount,
+          'watchDurationMs': result.stats.watchDurationMs,
+          'continueCount': result.stats.continueCount,
+          'activeDeviceCount': result.stats.activeDeviceCount,
+        },
+        'deviceCounts': result.deviceCounts,
+      },
+      'page': {
+        'number': result.number,
+        'size': result.size,
+        'total': result.total,
+        'hasMore': result.hasMore,
+      },
+    });
+  }
+
+  String? _watchHistoryDateBoundary(String? value, {bool exclusive = false}) {
+    if (value == null || !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(value)) {
+      return null;
+    }
+    final parsed = DateTime.tryParse(value);
+    if (parsed == null) return null;
+    final boundary = DateTime.utc(parsed.year, parsed.month, parsed.day)
+        .add(exclusive ? const Duration(days: 1) : Duration.zero);
+    return boundary.toIso8601String();
+  }
+
+  Map<String, Object?> _watchHistoryRecordPayload(
+          NasWatchHistoryRecord record) =>
+      {
+        'recordId': record.recordId,
+        'movieId': record.movieId,
+        'episodeId': record.episodeId,
+        'title': record.title,
+        'originalTitle': record.originalTitle,
+        'catalogNumber': record.catalogNumber,
+        'episodeTitle': record.episodeTitle,
+        'sourceName': record.sourceName,
+        if (record.posterFileName != null)
+          'posterUrl': '/api/v1/assets/posters/${record.movieId}',
+        'startedAt': record.startedAt,
+        'lastReportedAt': record.lastReportedAt,
+        'endedAt': record.endedAt,
+        'watchDurationMs': record.watchDurationMs,
+        'lastPositionMs': record.lastPositionMs,
+        'durationMs': record.durationMs,
+        'status': record.status,
+        'deviceId': record.deviceId,
+        'devicePlatform': record.devicePlatform,
+      };
 
   Future<void> _poster(HttpRequest request) async {
     final movieId = request.uri.pathSegments.last;
@@ -3913,7 +4455,10 @@ class NasHealthServer {
   }
 
   Future<void> _createPlaybackSession(
-      HttpRequest request, String tokenHash) async {
+    HttpRequest request,
+    String tokenHash,
+    NasDeviceToken device,
+  ) async {
     final body = await _readJsonBody(request);
     final requestedMovieId = body?['contentId'];
     final requestedEpisodeId = body?['episodeId'];
@@ -3940,16 +4485,17 @@ class NasHealthServer {
       if (episode == null || !episode.isAvailable) {
         return _error(request, HttpStatus.notFound, 'resource_not_found');
       }
-      final file =
-          await _mediaService.fileForRelativePath(episode.relativePath);
+      final file = await _fileForEpisode(episode);
       if (file == null) {
         return _error(request, HttpStatus.notFound, 'resource_not_found');
       }
       return _writePlaybackSession(
         request,
         tokenHash: tokenHash,
+        device: device,
         movieId: databaseMovie.id,
         episodeId: episode.id,
+        mediaRootId: episode.mediaRootId,
         relativePath: file.relativePath,
         durationMs: episode.durationMs ?? 600000,
         purpose: purpose,
@@ -3967,8 +4513,10 @@ class NasHealthServer {
     return _writePlaybackSession(
       request,
       tokenHash: tokenHash,
+      device: device,
       movieId: requestedMovieId,
       episodeId: 'fixture-episode-1',
+      mediaRootId: null,
       relativePath: file.relativePath,
       durationMs: _fixturePlaybackState?.durationMs ?? 600000,
       purpose: purpose,
@@ -3978,8 +4526,10 @@ class NasHealthServer {
   Future<void> _writePlaybackSession(
     HttpRequest request, {
     required String tokenHash,
+    required NasDeviceToken device,
     required String movieId,
     required String episodeId,
+    required String? mediaRootId,
     required String relativePath,
     required int durationMs,
     required String purpose,
@@ -3998,10 +4548,14 @@ class NasHealthServer {
     final sessionId = newUuidV4();
     _playbackSessions[sessionId] = _PlaybackSession(
       tokenHash: tokenHash,
+      deviceId: device.deviceId,
+      devicePlatform: device.platform,
       relativePath: relativePath,
       movieId: movieId,
       episodeId: episodeId,
+      mediaRootId: mediaRootId,
       purpose: purpose,
+      durationMs: durationMs,
     );
     _logger.event('playback.session.create', fields: {
       'component': 'nas.playback',
@@ -4033,18 +4587,26 @@ class NasHealthServer {
     final body = await _readJsonBody(request);
     final positionMs = (body?['positionMs'] as num?)?.toInt();
     final durationMs = (body?['durationMs'] as num?)?.toInt();
+    final state = body?['state'] ?? 'playing';
     if (session == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
     if (positionMs == null ||
         durationMs == null ||
         positionMs < 0 ||
-        durationMs < 0) {
+        durationMs < 0 ||
+        state is! String ||
+        !const {'playing', 'paused'}.contains(state)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     if (session.purpose == 'playback' && session.started) {
       session.endPositionMs = positionMs > durationMs ? durationMs : positionMs;
       session.durationMs = durationMs;
+      _reportPlaybackHistory(
+        session,
+        reportedAt: DateTime.now().toUtc(),
+        nextStatus: state,
+      );
       _libraryDatabase.savePlaybackProgress(
         movieId: session.movieId,
         episodeId: session.episodeId,
@@ -4078,11 +4640,18 @@ class NasHealthServer {
       return _error(request, HttpStatus.conflict, 'playback_not_ready');
     }
     if (session.purpose == 'playback' && !session.started) {
+      final startedAt = DateTime.now().toUtc();
       session.started = true;
+      session.lastReportedAt = startedAt;
+      session.playbackStatus = 'playing';
       if (_libraryDatabase.findMovie(session.movieId) != null) {
         session.historyId = _libraryDatabase.recordPlaybackStarted(
           movieId: session.movieId,
           episodeId: session.episodeId,
+          deviceId: session.deviceId,
+          devicePlatform: session.devicePlatform,
+          startedAt: startedAt.toIso8601String(),
+          durationMs: session.durationMs,
         );
       }
       _logger.event('playback.started', fields: {
@@ -4107,10 +4676,18 @@ class NasHealthServer {
     _playbackSessions.remove(sessionId);
     final historyId = session.historyId;
     if (historyId != null) {
+      final reportedAt = DateTime.now().toUtc();
+      _reportPlaybackHistory(
+        session,
+        reportedAt: reportedAt,
+        nextStatus: 'ended',
+      );
       _libraryDatabase.finishPlaybackHistory(
         historyId: historyId,
         endPositionMs: session.endPositionMs,
         durationMs: session.durationMs,
+        lastReportedAt: reportedAt.toIso8601String(),
+        watchDurationMs: session.watchDurationMs,
       );
     }
     _logger.event('playback.session.close', fields: {
@@ -4122,12 +4699,65 @@ class NasHealthServer {
     await request.response.close();
   }
 
+  /// 以会话为边界累积实际播放时长；暂停期间只更新时间，不叠加时长。
+  void _reportPlaybackHistory(
+    _PlaybackSession session, {
+    required DateTime reportedAt,
+    required String nextStatus,
+  }) {
+    final previousReport = session.lastReportedAt ?? reportedAt;
+    if (session.playbackStatus == 'playing') {
+      final elapsed = reportedAt.difference(previousReport).inMilliseconds;
+      if (elapsed > 0) session.watchDurationMs += elapsed;
+    }
+    session.lastReportedAt = reportedAt;
+    session.playbackStatus = nextStatus;
+    final historyId = session.historyId;
+    if (historyId == null) return;
+    _libraryDatabase.reportPlaybackHistory(
+      historyId: historyId,
+      lastReportedAt: reportedAt.toIso8601String(),
+      watchDurationMs: session.watchDurationMs,
+      lastPositionMs: session.endPositionMs ?? 0,
+      durationMs: session.durationMs,
+      playbackStatus: nextStatus,
+    );
+  }
+
+  Future<NasMediaFile?> _fileForEpisode(NasLibraryEpisode episode) async {
+    final root = _libraryDatabase.findMediaRoot(episode.mediaRootId);
+    if (root == null || !root.isOnline) return null;
+    return root.containerPath == config.mediaDir
+        ? _mediaService.fileForRelativePath(episode.relativePath)
+        : _mediaService.fileForRootRelativePath(
+            rootPath: root.containerPath,
+            relativePath: episode.relativePath,
+          );
+  }
+
+  Future<NasMediaFile?> _fileForPlaybackSession(
+    _PlaybackSession session,
+  ) async {
+    final mediaRootId = session.mediaRootId;
+    if (mediaRootId == null) {
+      return _mediaService.fileForRelativePath(session.relativePath);
+    }
+    final root = _libraryDatabase.findMediaRoot(mediaRootId);
+    if (root == null || !root.isOnline) return null;
+    return root.containerPath == config.mediaDir
+        ? _mediaService.fileForRelativePath(session.relativePath)
+        : _mediaService.fileForRootRelativePath(
+            rootPath: root.containerPath,
+            relativePath: session.relativePath,
+          );
+  }
+
   Future<void> _streamPlayback(HttpRequest request, String tokenHash) async {
     final session = _playbackSession(request, tokenHash);
     if (session == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    final file = await _mediaService.fileForRelativePath(session.relativePath);
+    final file = await _fileForPlaybackSession(session);
     if (file == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
@@ -4284,6 +4914,12 @@ class NasHealthServer {
       'source_rename_failed': 'The source file could not be renamed.',
       'source_metadata_update_failed':
           'The source file rename could not be saved to the media database.',
+      'collection_merge_conflict':
+          'The requested files cannot be merged into this collection.',
+      'collection_split_conflict':
+          'The requested episodes cannot be split from this collection.',
+      'collection_migration_conflict':
+          'The migration preview is stale or requires a valid metadata source.',
     };
     return _writeJson(request.response, statusCode, {
       'error': {'code': code, 'message': messages[code] ?? 'Request failed.'},
@@ -4309,31 +4945,46 @@ class NasHealthServer {
 }
 
 class _PairingSession {
-  const _PairingSession({required this.scope, required this.expiresAt});
+  const _PairingSession({
+    required this.scope,
+    required this.platform,
+    required this.expiresAt,
+  });
 
   final String scope;
+  final String platform;
   final DateTime expiresAt;
 }
 
 class _PlaybackSession {
   _PlaybackSession({
     required this.tokenHash,
+    required this.deviceId,
+    required this.devicePlatform,
     required this.relativePath,
     required this.movieId,
     required this.episodeId,
+    required this.mediaRootId,
     required this.purpose,
+    required this.durationMs,
   });
 
   final String tokenHash;
+  final String deviceId;
+  final String devicePlatform;
   final String relativePath;
   final String movieId;
   final String episodeId;
+  final String? mediaRootId;
   final String purpose;
   bool started = false;
   bool streamRequested = false;
   String? historyId;
   int? endPositionMs;
   int? durationMs;
+  DateTime? lastReportedAt;
+  int watchDurationMs = 0;
+  String playbackStatus = 'playing';
 }
 
 class _FixturePlaybackState {
@@ -4375,6 +5026,7 @@ class _ScanJob {
   String status = 'queued';
   int? scannedFiles;
   int? availableEpisodes;
+  List<String> conflicts = const [];
   DateTime? startedAt;
   DateTime? finishedAt;
   String? errorCode;
