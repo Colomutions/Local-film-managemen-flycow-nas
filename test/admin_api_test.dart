@@ -321,6 +321,15 @@ Future<void> main() async {
     );
     _expect(movieUpdate.json['data']['summary'] == '仅写入 NAS SQLite。',
         'movie update returns summary');
+    final favorite = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movie['id']}/favorite',
+      token: adminToken,
+      body: {'isFavorite': true},
+    );
+    _expect(favorite.json['data']['isFavorite'] == true,
+        'admin can persist the movie favorite state');
     final publisherDetails = await _request(
       base,
       'GET',
@@ -364,6 +373,16 @@ Future<void> main() async {
       (seriesActors.json['data']['items'] as List<dynamic>).length == 2,
       'series actors aggregate linked movie actors',
     );
+    final seriesMovies = await _request(
+      base,
+      'GET',
+      '/api/v1/series/$seriesId/movies?isFavorite=true&sort=title&page=1&pageSize=14',
+      token: viewerToken,
+    );
+    _expect(
+      (seriesMovies.json['data']['items'] as List<dynamic>).length == 1,
+      'series movie search filters favorites on NAS',
+    );
     final publisherDelete = await _request(
       base,
       'DELETE',
@@ -385,7 +404,7 @@ Future<void> main() async {
     final actorMovies = await _request(
       base,
       'GET',
-      '/api/v1/actors/$actorOneId/movies?q=管理员&sort=title&page=1&pageSize=14',
+      '/api/v1/actors/$actorOneId/movies?q=管理员&isFavorite=true&sort=title&page=1&pageSize=14',
       token: viewerToken,
     );
     _expect(
@@ -393,7 +412,7 @@ Future<void> main() async {
                   as List<dynamic>)
               .length ==
           1,
-      'actor movie search reads only native movie links',
+      'actor movie search filters favorites on native movie links',
     );
     _expect(!jsonEncode(movieUpdate.json).contains(mediaRoot.path),
         'movie update hides container path');

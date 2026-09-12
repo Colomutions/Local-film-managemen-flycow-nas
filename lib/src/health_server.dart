@@ -297,6 +297,14 @@ class NasHealthServer {
           RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
         return await _updateAdminMovie(request);
       }
+      if (request.method == 'PATCH' &&
+          RegExp(r'^/api/v1/admin/movies/[^/]+/favorite$').hasMatch(path)) {
+        return await _updateAdminMovieFavorite(request);
+      }
+      if (request.method == 'DELETE' &&
+          RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
+        return await _removeAdminMovieFromIndex(request);
+      }
       if (request.method == 'POST' &&
           RegExp(r'^/api/v1/admin/movies/[^/]+/poster$').hasMatch(path)) {
         return await _uploadAdminMoviePoster(request);
@@ -721,6 +729,7 @@ class NasHealthServer {
     final sort = parameters['sort'] ?? 'title';
     final order = parameters['order'] ?? 'asc';
     final categoryId = parameters['categoryId'];
+    final isFavorite = _favoriteFilter(parameters['isFavorite']);
     final tagIds = parameters['tagIds']
         ?.split(',')
         .where((value) => value.isNotEmpty)
@@ -734,11 +743,13 @@ class NasHealthServer {
         pageSize > 100 ||
         !const {'title', 'updatedAt', 'durationMs', 'recent'}.contains(sort) ||
         !const {'asc', 'desc'}.contains(order) ||
+        !_isValidFavoriteFilter(parameters['isFavorite']) ||
         (hasDatabaseLibrary &&
             categoryId != null &&
             _libraryDatabase.findCategory(categoryId) == null) ||
         (!hasDatabaseLibrary &&
             (categoryId != null ||
+                isFavorite != null ||
                 (tagIds?.isNotEmpty ?? false) ||
                 (resolutions?.isNotEmpty ?? false)))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
@@ -764,6 +775,7 @@ class NasHealthServer {
         .where((movie) =>
             (categoryId == null ||
                 _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
+            (isFavorite == null || movie.isFavorite == isFavorite) &&
             (tagIds == null ||
                 tagIds.isEmpty ||
                 _libraryDatabase
@@ -838,6 +850,7 @@ class NasHealthServer {
         config.managedCategoryLibrary || _libraryDatabase.hasScannedMediaRoots;
     if (!hasDatabaseLibrary) {
       if (filter.categoryId != null ||
+          filter.isFavorite != null ||
           filter.resolutions.isNotEmpty ||
           filter.watchStates.isNotEmpty ||
           filter.tagConditions.isNotEmpty) {
@@ -1123,6 +1136,7 @@ class NasHealthServer {
     final sort = parameters['sort'] ?? 'recent';
     final order = parameters['order'] ?? 'desc';
     final categoryId = parameters['categoryId'];
+    final isFavorite = _favoriteFilter(parameters['isFavorite']);
     final resolutions = parameters['resolutions']
         ?.split(',')
         .where((value) => value.isNotEmpty)
@@ -1132,6 +1146,7 @@ class NasHealthServer {
         pageSize > 14 ||
         !const {'recent', 'createdAt', 'title', 'durationMs'}.contains(sort) ||
         !const {'asc', 'desc'}.contains(order) ||
+        !_isValidFavoriteFilter(parameters['isFavorite']) ||
         (categoryId != null &&
             _libraryDatabase.findCategory(categoryId) == null)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
@@ -1141,6 +1156,7 @@ class NasHealthServer {
         .where((movie) =>
             (categoryId == null ||
                 _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
+            (isFavorite == null || movie.isFavorite == isFavorite) &&
             (resolutions == null ||
                 resolutions.isEmpty ||
                 (movie.resolutionLabel != null &&
@@ -1482,6 +1498,7 @@ class NasHealthServer {
     final sort = parameters['sort'] ?? 'recent';
     final order = parameters['order'] ?? 'desc';
     final categoryId = parameters['categoryId'];
+    final isFavorite = _favoriteFilter(parameters['isFavorite']);
     final resolutions = parameters['resolutions']
         ?.split(',')
         .where((value) => value.isNotEmpty)
@@ -1491,6 +1508,7 @@ class NasHealthServer {
         pageSize > 14 ||
         !const {'recent', 'createdAt', 'title', 'durationMs'}.contains(sort) ||
         !const {'asc', 'desc'}.contains(order) ||
+        !_isValidFavoriteFilter(parameters['isFavorite']) ||
         (categoryId != null &&
             _libraryDatabase.findCategory(categoryId) == null)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
@@ -1499,6 +1517,7 @@ class NasHealthServer {
         .where((movie) =>
             (categoryId == null ||
                 _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
+            (isFavorite == null || movie.isFavorite == isFavorite) &&
             (resolutions == null ||
                 resolutions.isEmpty ||
                 (movie.resolutionLabel != null &&
@@ -2300,8 +2319,17 @@ class NasHealthServer {
     return left.compareTo(right);
   }
 
+  bool _isValidFavoriteFilter(String? value) =>
+      value == null || value == 'true' || value == 'false';
+
+  bool? _favoriteFilter(String? value) => switch (value) {
+        'true' => true,
+        'false' => false,
+        _ => null,
+      };
+
   NasMovieSearchFilter? _movieSearchFilter(Map<String, dynamic>? body) {
-    const fields = {
+    const requiredFields = {
       'q',
       'categoryId',
       'resolutions',
@@ -2312,11 +2340,13 @@ class NasHealthServer {
       'pageSize',
       'tagConditions',
     };
+    const fields = {...requiredFields, 'isFavorite'};
     if (body == null ||
         body.keys.any((key) => !fields.contains(key)) ||
-        !body.keys.toSet().containsAll(fields) ||
+        !body.keys.toSet().containsAll(requiredFields) ||
         body['q'] is! String ||
         (body['categoryId'] != null && body['categoryId'] is! String) ||
+        (body['isFavorite'] != null && body['isFavorite'] is! bool) ||
         body['resolutions'] is! List ||
         body['watchStates'] is! List ||
         body['sort'] is! String ||
@@ -2400,6 +2430,7 @@ class NasHealthServer {
     return NasMovieSearchFilter(
       query: query,
       categoryId: categoryId,
+      isFavorite: body['isFavorite'] as bool?,
       resolutions: resolutions.cast<String>().toSet(),
       watchStates: watchStates.cast<String>().toSet(),
       sort: body['sort'] as String,
@@ -2590,7 +2621,7 @@ class NasHealthServer {
         'posterUrl': movie.posterFileName == null
             ? null
             : '/api/v1/assets/posters/${movie.id}',
-        'isFavorite': false,
+        'isFavorite': movie.isFavorite,
         'playCount': movie.playCount,
         'resumePositionMs': 0,
         'updatedAt': movie.updatedAt,
@@ -2627,7 +2658,7 @@ class NasHealthServer {
         'posterUrl': movie.posterFileName == null
             ? null
             : '/api/v1/assets/posters/${movie.id}',
-        'isFavorite': false,
+        'isFavorite': movie.isFavorite,
         'playCount': movie.playCount,
         'resumePositionMs': 0,
         'updatedAt': movie.updatedAt,
@@ -3466,6 +3497,41 @@ class NasHealthServer {
     await _writeJson(request.response, HttpStatus.ok, {
       'data': await _databaseDetails(updatedMovie),
     });
+  }
+
+  Future<void> _updateAdminMovieFavorite(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final isFavorite = body?['isFavorite'];
+    if (body == null || body.keys.length != 1 || isFavorite is! bool) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movie = _libraryDatabase.setMovieFavorite(
+      movieId: request.uri.pathSegments[4],
+      isFavorite: isFavorite,
+    );
+    if (movie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _databaseSummary(movie),
+    });
+  }
+
+  Future<void> _removeAdminMovieFromIndex(HttpRequest request) async {
+    final removed = _libraryDatabase.removeMovieFromIndex(
+      request.uri.pathSegments.last,
+    );
+    if (removed == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (removed.posterFileName != null) {
+      await _artworkService.deletePoster(removed.posterFileName!);
+    }
+    for (final fileName in removed.carouselFileNames) {
+      await _artworkService.deleteCarouselImage(fileName);
+    }
+    request.response.statusCode = HttpStatus.noContent;
+    await request.response.close();
   }
 
   Future<void> _updateAdminEpisode(HttpRequest request) async {

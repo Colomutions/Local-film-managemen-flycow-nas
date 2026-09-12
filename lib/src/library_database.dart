@@ -65,6 +65,7 @@ class NasLibraryMovie {
     required this.durationMs,
     required this.entryType,
     required this.playCount,
+    required this.isFavorite,
     required this.updatedAt,
     this.categoryId,
     this.categoryName,
@@ -90,6 +91,7 @@ class NasLibraryMovie {
   /// `single` 表示普通影片，`series` 表示可包含零到多集的影集。
   final String entryType;
   final int playCount;
+  final bool isFavorite;
   final String updatedAt;
   final String? categoryId;
   final String? categoryName;
@@ -134,6 +136,16 @@ class NasLibraryEpisode {
   final int? videoHeight;
   final String? resolutionLabel;
   final int? mediaModifiedAt;
+}
+
+class NasRemovedMovieIndex {
+  const NasRemovedMovieIndex({
+    this.posterFileName,
+    this.carouselFileNames = const [],
+  });
+
+  final String? posterFileName;
+  final List<String> carouselFileNames;
 }
 
 class NasMediaRoot {
@@ -425,6 +437,7 @@ class NasMovieSearchFilter {
   const NasMovieSearchFilter({
     required this.query,
     required this.categoryId,
+    this.isFavorite,
     required this.resolutions,
     required this.watchStates,
     required this.sort,
@@ -436,6 +449,7 @@ class NasMovieSearchFilter {
 
   final String query;
   final String? categoryId;
+  final bool? isFavorite;
   final Set<String> resolutions;
   final Set<String> watchStates;
   final String sort;
@@ -842,7 +856,7 @@ class NasPlaybackResumeTarget {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 24;
+  static const currentSchemaVersion = 25;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -1465,6 +1479,24 @@ class NasLibraryDatabase {
         [24, _now()],
       );
     }
+    if (current < 25) {
+      final hasMoviesTable = _db
+          .select(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'movies'",
+          )
+          .isNotEmpty;
+      if (hasMoviesTable) {
+        _db.execute('''
+          ALTER TABLE movies ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0;
+          CREATE INDEX movies_favorite_active_idx
+            ON movies(is_favorite, lifecycle_state, updated_at DESC, id);
+        ''');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [25, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -1958,6 +1990,7 @@ class NasLibraryDatabase {
              m.publisher_id, p.display_name AS publisher_name,
              m.series_id, s.display_name AS series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
+             m.is_favorite,
              m.category_id, c.name AS category_name,
              m.updated_at, m.entry_type, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
@@ -1996,6 +2029,7 @@ class NasLibraryDatabase {
               actors: _movieActors(row['id'] as String),
               posterFileName: row['poster_file_name'] as String?,
               playCount: row['play_count'] as int,
+              isFavorite: (row['is_favorite'] as int) == 1,
               episodeCount: row['episode_count'] as int,
               durationMs: (row['duration_ms'] as int?) == 0
                   ? null
@@ -2035,7 +2069,8 @@ class NasLibraryDatabase {
       SELECT m.id, m.title, m.original_title, m.catalog_number,
              m.publisher_id, publisher.display_name AS publisher_name,
              m.series_id, series.display_name AS series_name,
-             m.summary, m.poster_file_name, m.play_count, m.updated_at,
+             m.summary, m.poster_file_name, m.play_count, m.is_favorite,
+             m.updated_at,
              m.entry_type, m.category_id, category.name AS category_name,
              COUNT(e.id) AS episode_count, SUM(COALESCE(e.duration_ms, 0)) AS duration_ms,
              MAX(e.video_width) AS video_width, MAX(e.video_height) AS video_height,
@@ -2236,6 +2271,10 @@ class NasLibraryDatabase {
       clauses.add('m.category_id = ?');
       whereValues.add(filter.categoryId);
     }
+    if (filter.isFavorite != null) {
+      clauses.add('m.is_favorite = ?');
+      whereValues.add(filter.isFavorite! ? 1 : 0);
+    }
     if (filter.resolutions.isNotEmpty) {
       clauses.add('''EXISTS (
         SELECT 1 FROM episodes resolution_episode
@@ -2286,7 +2325,8 @@ class NasLibraryDatabase {
         SELECT m.id, m.title, m.original_title, m.catalog_number,
                m.publisher_id, publisher.display_name AS publisher_name,
                m.series_id, series.display_name AS series_name,
-               m.summary, m.poster_file_name, m.play_count, m.created_at, m.updated_at,
+               m.summary, m.poster_file_name, m.play_count, m.is_favorite,
+               m.created_at, m.updated_at,
                m.entry_type,
                $relevanceSql,
                m.category_id, category.name AS category_name,
@@ -3101,6 +3141,7 @@ class NasLibraryDatabase {
              m.publisher_id, p.display_name AS publisher_name,
              m.series_id, s.display_name AS series_name,
              m.summary, m.actors_json, m.poster_file_name, m.play_count,
+             m.is_favorite,
              m.category_id, c.name AS category_name,
              m.updated_at, m.entry_type, COUNT(e.id) AS episode_count,
              SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
@@ -3113,6 +3154,35 @@ class NasLibraryDatabase {
       GROUP BY m.id
     ''', [movieId]);
     return rows.isEmpty ? null : _withResolution(_mapMovie(rows.single));
+  }
+
+  NasLibraryMovie? setMovieFavorite({
+    required String movieId,
+    required bool isFavorite,
+  }) {
+    if (findMovie(movieId) == null) return null;
+    _db.execute(
+      'UPDATE movies SET is_favorite = ?, updated_at = ? WHERE id = ?',
+      [isFavorite ? 1 : 0, _now(), movieId],
+    );
+    return findMovie(movieId);
+  }
+
+  NasRemovedMovieIndex? removeMovieFromIndex(String movieId) {
+    final movie = findMovie(movieId);
+    if (movie == null) return null;
+    final carouselFileNames = _db
+        .select(
+          'SELECT file_name FROM movie_carousel_images WHERE movie_id = ?',
+          [movieId],
+        )
+        .map((row) => row['file_name'] as String)
+        .toList(growable: false);
+    _db.execute('DELETE FROM movies WHERE id = ?', [movieId]);
+    return NasRemovedMovieIndex(
+      posterFileName: movie.posterFileName,
+      carouselFileNames: carouselFileNames,
+    );
   }
 
   /// 统一替换影片可编辑元数据，供 Windows 手动管理与未来 AI 富化共用。
@@ -5424,6 +5494,7 @@ class NasLibraryDatabase {
         actors: _movieActors(row['id'] as String),
         posterFileName: row['poster_file_name'] as String?,
         playCount: row['play_count'] as int,
+        isFavorite: (row['is_favorite'] as int) == 1,
         episodeCount: row['episode_count'] as int,
         durationMs: (row['duration_ms'] as int?) == 0
             ? null
@@ -5449,6 +5520,7 @@ class NasLibraryDatabase {
         actors: const [],
         posterFileName: row['poster_file_name'] as String?,
         playCount: row['play_count'] as int,
+        isFavorite: (row['is_favorite'] as int) == 1,
         episodeCount: row['episode_count'] as int,
         durationMs: (row['duration_ms'] as int?) == 0
             ? null
@@ -5489,6 +5561,7 @@ class NasLibraryDatabase {
       durationMs: movie.durationMs,
       entryType: movie.entryType,
       playCount: movie.playCount,
+      isFavorite: movie.isFavorite,
       updatedAt: movie.updatedAt,
       categoryId: movie.categoryId,
       categoryName: movie.categoryName,

@@ -96,6 +96,44 @@ Future<void> main() async {
     await _patchMovie(
         base, adminToken, movieIds['beta']!, [second], categoryId);
     await _patchMovie(base, adminToken, movieIds['gamma']!, [rootTwo]);
+    database
+      ..setMovieFavorite(movieId: movieIds['alpha']!, isFavorite: true)
+      ..setMovieFavorite(movieId: movieIds['beta']!, isFavorite: true);
+
+    final favorites = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      isFavorite: true,
+    );
+    _expect(
+      _ids(favorites)
+              .toSet()
+              .containsAll([movieIds['alpha']!, movieIds['beta']!]) &&
+          !_ids(favorites).contains(movieIds['gamma']),
+      '主影视搜索在 NAS 中筛选已收藏影片',
+    );
+    final categoryFavorites = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      categoryId: categoryId,
+      isFavorite: true,
+    );
+    _expect(
+      _ids(categoryFavorites).single == movieIds['beta'],
+      '分类下影视搜索与收藏状态在 NAS 中组合筛选',
+    );
+    final categoryBrowseFavorites = await _request(
+      base,
+      'GET',
+      '/api/v1/movies?categoryId=$categoryId&isFavorite=true',
+      token: viewerToken,
+    );
+    _expect(
+      _ids(categoryBrowseFavorites).single == movieIds['beta'],
+      '分类浏览接口同样支持收藏状态筛选',
+    );
 
     final combined = await _search(base, viewerToken, {
       'all': [
@@ -454,6 +492,7 @@ Future<_Response> _search(
   String? categoryId,
   List<String> resolutions = const [],
   List<String> watchStates = const [],
+  bool? isFavorite,
   String sort = 'title',
   String order = 'asc',
   int page = 1,
@@ -467,6 +506,7 @@ Future<_Response> _search(
       body: {
         'q': q,
         'categoryId': categoryId,
+        if (isFavorite != null) 'isFavorite': isFavorite,
         'resolutions': resolutions,
         'watchStates': watchStates,
         'sort': sort,

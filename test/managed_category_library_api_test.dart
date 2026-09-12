@@ -82,7 +82,8 @@ Future<void> main() async {
       token: adminToken,
       body: {'title': '未分类影集'},
     );
-    _expect(missingCategory.statusCode == HttpStatus.badRequest, '新建空影集必须明确指定分类');
+    _expect(
+        missingCategory.statusCode == HttpStatus.badRequest, '新建空影集必须明确指定分类');
     final sameCategoryCollection = await _request(
       base,
       'POST',
@@ -90,7 +91,8 @@ Future<void> main() async {
       token: adminToken,
       body: {'title': '同类目标影集', 'categoryId': category['id']},
     );
-    _expect(sameCategoryCollection.statusCode == HttpStatus.created, '可创建明确分类的空影集');
+    _expect(
+        sameCategoryCollection.statusCode == HttpStatus.created, '可创建明确分类的空影集');
     final collections = await _request(
       base,
       'GET',
@@ -98,8 +100,8 @@ Future<void> main() async {
       token: viewerToken,
     );
     _expect(collections.statusCode == HttpStatus.ok, '普通影视用户可按页查询同分类影集');
-    final collectionItems = ((collections.json['data'] as Map<String, dynamic>)['items']
-            as List<dynamic>)
+    final collectionItems = ((collections.json['data']
+            as Map<String, dynamic>)['items'] as List<dynamic>)
         .cast<Map<String, dynamic>>();
     _expect(
       collectionItems.single['title'] == '同类目标影集',
@@ -117,8 +119,10 @@ Future<void> main() async {
       token: adminToken,
       body: {'name': '其他分类', 'directoryKey': 'disk1/其他目录'},
     );
-    _expect(otherCategoryResponse.statusCode == HttpStatus.created, '创建第二个分类成功');
-    final otherCategory = otherCategoryResponse.json['data'] as Map<String, dynamic>;
+    _expect(
+        otherCategoryResponse.statusCode == HttpStatus.created, '创建第二个分类成功');
+    final otherCategory =
+        otherCategoryResponse.json['data'] as Map<String, dynamic>;
     final otherJob = otherCategory['scanJob'] as Map<String, dynamic>;
     await _waitForFinishedJob(base, otherJob['id'] as String, adminToken);
     final otherCollection = await _request(
@@ -128,8 +132,8 @@ Future<void> main() async {
       token: adminToken,
       body: {'title': '异类目标影集', 'categoryId': otherCategory['id']},
     );
-    final otherCollectionId =
-        ((otherCollection.json['data'] as Map<String, dynamic>)['id'] as String);
+    final otherCollectionId = ((otherCollection.json['data']
+        as Map<String, dynamic>)['id'] as String);
     final rejectedCrossCategoryMerge = await _request(
       base,
       'POST',
@@ -230,6 +234,93 @@ Future<void> main() async {
       viewerToken,
       const ['new', 'old', '同类目标影集', '异类目标影集'],
     );
+
+    final refreshedMovies = await _request(
+      base,
+      'GET',
+      '/api/v1/movies',
+      token: viewerToken,
+    );
+    final indexedMovie = ((refreshedMovies.json['data']
+            as Map<String, dynamic>)['items'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .singleWhere((item) => item['title'] == 'new');
+    final viewerFavorite = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${indexedMovie['id']}/favorite',
+      token: viewerToken,
+      body: {'isFavorite': true},
+    );
+    _expect(
+        viewerFavorite.statusCode == HttpStatus.forbidden, '普通影视用户不能修改全局收藏');
+    final favorite = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${indexedMovie['id']}/favorite',
+      token: adminToken,
+      body: {'isFavorite': true},
+    );
+    _expect(favorite.statusCode == HttpStatus.ok, '管理员可以修改全局收藏');
+    _expect(
+      (favorite.json['data'] as Map<String, dynamic>)['isFavorite'] == true,
+      '收藏状态由 NAS 持久化返回',
+    );
+    final favoriteDetails = await _request(
+      base,
+      'GET',
+      '/api/v1/movies/${indexedMovie['id']}',
+      token: viewerToken,
+    );
+    _expect(
+      (favoriteDetails.json['data'] as Map<String, dynamic>)['isFavorite'] ==
+          true,
+      '普通影视用户可读取全局收藏状态',
+    );
+    final viewerRemove = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/movies/${indexedMovie['id']}',
+      token: viewerToken,
+    );
+    _expect(viewerRemove.statusCode == HttpStatus.forbidden, '普通影视用户不能移除影视索引');
+    final removed = await _request(
+      base,
+      'DELETE',
+      '/api/v1/admin/movies/${indexedMovie['id']}',
+      token: adminToken,
+    );
+    _expect(removed.statusCode == HttpStatus.noContent, '管理员可移除影视索引');
+    final removedDetails = await _request(
+      base,
+      'GET',
+      '/api/v1/movies/${indexedMovie['id']}',
+      token: viewerToken,
+    );
+    _expect(removedDetails.statusCode == HttpStatus.notFound, '移除后旧索引不再可读');
+    final reindexJob = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/scan-jobs',
+      token: adminToken,
+      body: {'categoryId': category['id']},
+    );
+    _expect(reindexJob.statusCode == HttpStatus.accepted, '可通过重扫重新建立影视索引');
+    final reindexJobId =
+        ((reindexJob.json['data'] as Map<String, dynamic>)['id'] as String);
+    await _waitForFinishedJob(base, reindexJobId, adminToken);
+    final reindexedMovies = await _request(
+      base,
+      'GET',
+      '/api/v1/movies',
+      token: viewerToken,
+    );
+    final reindexedMovie = ((reindexedMovies.json['data']
+            as Map<String, dynamic>)['items'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .singleWhere((item) => item['title'] == 'new');
+    _expect(reindexedMovie['id'] != indexedMovie['id'], '重扫为源文件建立新的索引身份');
+    _expect(reindexedMovie['isFavorite'] == false, '重建索引不会保留旧收藏状态');
 
     final deleted = await _request(
       base,
