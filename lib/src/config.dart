@@ -14,6 +14,8 @@ class NasConfig {
     required this.dataDir,
     required this.mediaDir,
     required this.timezone,
+    this.mdcngDataDir,
+    this.mdcngSourceId = 'default',
     this.logLevel = 'INFO',
     this.diagnosticMode = false,
     this.logMaxBytes = 2 * 1024 * 1024,
@@ -46,10 +48,14 @@ class NasConfig {
       dataDir: _value(environment, 'MUJING_DATA_DIR', '/data'),
       mediaDir: _value(environment, 'MUJING_MEDIA_DIR', '/media'),
       timezone: _value(environment, 'MUJING_TIMEZONE', 'Asia/Shanghai'),
+      mdcngDataDir: _absoluteDirectory(environment, 'MUJING_MDCNG_DATA_DIR'),
+      mdcngSourceId: _value(environment, 'MUJING_MDCNG_SOURCE_ID', 'default'),
       logLevel: _logLevel(environment),
       diagnosticMode: _boolValue(environment, 'MUJING_DIAGNOSTIC_MODE', false),
-      logMaxBytes: _positiveInt(environment, 'MUJING_LOG_MAX_BYTES', 2 * 1024 * 1024),
-      logRetentionFiles: _positiveInt(environment, 'MUJING_LOG_RETENTION_FILES', 3),
+      logMaxBytes:
+          _positiveInt(environment, 'MUJING_LOG_MAX_BYTES', 2 * 1024 * 1024),
+      logRetentionFiles:
+          _positiveInt(environment, 'MUJING_LOG_RETENTION_FILES', 3),
     );
   }
 
@@ -62,12 +68,21 @@ class NasConfig {
   final String mediaRootName;
   final bool scanOnStart;
   final bool managedCategoryLibrary;
+
   /// Source media writes require an explicit deployment opt-in.  The default
   /// media overlay remains read-only even when this flag is present.
   final bool allowSourceRename;
   final String dataDir;
   final String mediaDir;
   final String timezone;
+
+  /// Optional read-only mount of MDCNG's `config/data` directory.  It never
+  /// points at MDCNG's config.json, so credentials remain outside this service.
+  final String? mdcngDataDir;
+
+  /// A stable, administrator-selected identifier for the current MDCNG/Emby
+  /// installation. It scopes imported Emby person ids across installations.
+  final String mdcngSourceId;
   final String logLevel;
   final bool diagnosticMode;
   final int logMaxBytes;
@@ -76,12 +91,14 @@ class NasConfig {
   static String _logLevel(Map<String, String> environment) {
     final value = _value(environment, 'MUJING_LOG_LEVEL', 'INFO').toUpperCase();
     if (!const {'DEBUG', 'INFO', 'WARN', 'ERROR'}.contains(value)) {
-      throw ArgumentError.value(value, 'MUJING_LOG_LEVEL', 'must be DEBUG, INFO, WARN, or ERROR');
+      throw ArgumentError.value(
+          value, 'MUJING_LOG_LEVEL', 'must be DEBUG, INFO, WARN, or ERROR');
     }
     return value;
   }
 
-  static int _positiveInt(Map<String, String> environment, String key, int defaultValue) {
+  static int _positiveInt(
+      Map<String, String> environment, String key, int defaultValue) {
     final value = _optionalValue(environment, key);
     final parsed = value == null ? defaultValue : int.tryParse(value);
     if (parsed == null || parsed < 1) {
@@ -94,7 +111,8 @@ class NasConfig {
     Map<String, String> environment,
     String key,
     String defaultValue,
-  ) => _optionalValue(environment, key) ?? defaultValue;
+  ) =>
+      _optionalValue(environment, key) ?? defaultValue;
 
   static String? _optionalValue(Map<String, String> environment, String key) {
     final value = environment[key]?.trim();
@@ -141,12 +159,14 @@ class NasConfig {
   }
 
   static String? _relativeMediaPath(Map<String, String> environment) {
-    final value = _optionalValue(environment, 'MUJING_FIXTURE_MEDIA_RELATIVE_PATH');
+    final value =
+        _optionalValue(environment, 'MUJING_FIXTURE_MEDIA_RELATIVE_PATH');
     if (value == null) return null;
     final normalized = value.replaceAll('\\', '/');
     if (normalized.startsWith('/') ||
         RegExp(r'^[A-Za-z]:').hasMatch(normalized) ||
-        normalized.split('/').any((segment) => segment.isEmpty || segment == '.' || segment == '..')) {
+        normalized.split('/').any((segment) =>
+            segment.isEmpty || segment == '.' || segment == '..')) {
       throw ArgumentError.value(
         value,
         'MUJING_FIXTURE_MEDIA_RELATIVE_PATH',
@@ -154,6 +174,19 @@ class NasConfig {
       );
     }
     return normalized;
+  }
+
+  static String? _absoluteDirectory(
+    Map<String, String> environment,
+    String key,
+  ) {
+    final value = _optionalValue(environment, key);
+    if (value == null) return null;
+    if (!value.startsWith('/')) {
+      throw ArgumentError.value(
+          value, key, 'must be an absolute container path');
+    }
+    return value;
   }
 
   static bool _boolValue(

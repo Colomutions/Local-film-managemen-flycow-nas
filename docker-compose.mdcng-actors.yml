@@ -1,0 +1,9 @@
+services:
+  mujing-nas:
+    volumes:
+      # Replace the host path with the directory containing MDCNG's data files
+      # (Actress.db, mdc_ng.db, and photos).  The mount is intentionally read-only.
+      - type: bind
+        source: ${MDCNG_DATA_ROOT:?Set MDCNG_DATA_ROOT to MDCNG config/data in .env.}
+        target: /imports/mdcng
+        read_only: true

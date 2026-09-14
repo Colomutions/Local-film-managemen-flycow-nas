@@ -554,15 +554,23 @@ class NasActor {
     this.translatedName,
     required this.aliases,
     this.gender,
+    this.romanizedName,
+    this.birthDate,
     this.birthMonth,
     this.heightCm,
     this.weightKg,
     this.measurements,
     this.bodyType,
     this.country,
+    this.birthplace,
+    this.cup,
+    this.careerPeriod,
     this.debutMonth,
     this.debutDescription,
+    this.accountUrl,
+    this.officialSiteUrl,
     this.photoAssetId,
+    this.backdropAssetId,
     required this.publisherIds,
     required this.movieCount,
     required this.createdAt,
@@ -577,15 +585,23 @@ class NasActor {
   final String? translatedName;
   final List<String> aliases;
   final String? gender;
+  final String? romanizedName;
+  final String? birthDate;
   final String? birthMonth;
   final int? heightCm;
   final int? weightKg;
   final String? measurements;
   final String? bodyType;
   final String? country;
+  final String? birthplace;
+  final String? cup;
+  final String? careerPeriod;
   final String? debutMonth;
   final String? debutDescription;
+  final String? accountUrl;
+  final String? officialSiteUrl;
   final String? photoAssetId;
+  final String? backdropAssetId;
   final List<String> publisherIds;
   final int movieCount;
   final String createdAt;
@@ -882,6 +898,31 @@ class NasMdcngImportRecord {
   final String createdAt;
 }
 
+/// Audit entry for a single confirmed MDCNG actor import.  It stores only
+/// stable ids and field names; no source paths, credentials, or raw database
+/// content are persisted.
+class NasMdcngActorImportRecord {
+  const NasMdcngActorImportRecord({
+    required this.id,
+    required this.actorId,
+    required this.sourceId,
+    required this.taskId,
+    required this.embyId,
+    required this.sourceFingerprint,
+    required this.appliedFields,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String actorId;
+  final String sourceId;
+  final String taskId;
+  final String embyId;
+  final String sourceFingerprint;
+  final List<String> appliedFields;
+  final String createdAt;
+}
+
 /// 某个影片字段最近一次确认的来源。无记录即为旧数据或来源未知。
 class NasMovieMetadataFieldSource {
   const NasMovieMetadataFieldSource({
@@ -932,7 +973,7 @@ class NasMdcngMetadataApply {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 27;
+  static const currentSchemaVersion = 29;
   static const _metadataFieldKeys = {
     'title',
     'originalTitle',
@@ -1639,6 +1680,85 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [27, _now()],
+      );
+    }
+    if (current < 28) {
+      // MDCNG actor imports retain all selected actor fields in the NAS-owned
+      // database.  Source files remain read-only and are never referenced by
+      // stored actor rows after confirmation.
+      _db.execute('PRAGMA foreign_keys = OFF');
+      try {
+        _db.execute('''
+          CREATE TABLE managed_assets_v28 (
+            id TEXT PRIMARY KEY,
+            purpose TEXT NOT NULL CHECK(purpose IN (
+              'actor_photo', 'actor_backdrop', 'movie_poster',
+              'publisher_logo', 'series_poster'
+            )),
+            file_name TEXT NOT NULL UNIQUE,
+            mime_type TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO managed_assets_v28(id, purpose, file_name, mime_type, created_at)
+            SELECT id, purpose, file_name, mime_type, created_at FROM managed_assets;
+          DROP TABLE managed_assets;
+          ALTER TABLE managed_assets_v28 RENAME TO managed_assets;
+
+          ALTER TABLE actors ADD COLUMN romanized_name TEXT;
+          ALTER TABLE actors ADD COLUMN birth_date TEXT;
+          ALTER TABLE actors ADD COLUMN birthplace TEXT;
+          ALTER TABLE actors ADD COLUMN cup TEXT;
+          ALTER TABLE actors ADD COLUMN career_period TEXT;
+          ALTER TABLE actors ADD COLUMN account_url TEXT;
+          ALTER TABLE actors ADD COLUMN official_site_url TEXT;
+          ALTER TABLE actors ADD COLUMN backdrop_asset_id TEXT
+            REFERENCES managed_assets(id) ON DELETE SET NULL;
+
+          CREATE TABLE mdcng_actor_source_links (
+            source_id TEXT NOT NULL,
+            emby_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+            source_name TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(source_id, emby_id)
+          );
+          CREATE INDEX mdcng_actor_source_links_actor_idx
+            ON mdcng_actor_source_links(actor_id);
+
+          CREATE TABLE mdcng_actor_import_records (
+            id TEXT PRIMARY KEY,
+            actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+            source_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            emby_id TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            applied_fields_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_id, task_id, source_fingerprint)
+          );
+          CREATE INDEX mdcng_actor_import_records_actor_created_idx
+            ON mdcng_actor_import_records(actor_id, created_at DESC, id DESC);
+        ''');
+      } finally {
+        _db.execute('PRAGMA foreign_keys = ON');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [28, _now()],
+      );
+    }
+    if (current < 29) {
+      // A profile key is a SHA-256 derived by the NAS from MDCNG's stable
+      // Actress.db href.  It lets a user-confirmed translated/native name
+      // mapping participate in later batch runs without storing source URLs.
+      _db.execute('''
+        ALTER TABLE mdcng_actor_source_links ADD COLUMN profile_key TEXT;
+        CREATE INDEX mdcng_actor_source_links_profile_key_idx
+          ON mdcng_actor_source_links(source_id, profile_key);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [29, _now()],
       );
     }
   }
@@ -2935,9 +3055,11 @@ class NasLibraryDatabase {
   }) {
     final rows = _db.select('''
       SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
-             a.aliases_json, a.gender, a.birth_month, a.height_cm, a.weight_kg,
-             a.measurements, a.body_type, a.country, a.debut_month,
-             a.debut_description, a.photo_asset_id, a.publisher_names_json,
+             a.aliases_json, a.gender, a.romanized_name, a.birth_date, a.birth_month,
+             a.height_cm, a.weight_kg, a.measurements, a.body_type, a.country,
+             a.birthplace, a.cup, a.career_period, a.debut_month, a.debut_description,
+             a.account_url, a.official_site_url, a.photo_asset_id, a.backdrop_asset_id,
+             a.publisher_names_json,
              a.created_at, a.updated_at, a.archived_at,
               COUNT(CASE WHEN linked_movie.lifecycle_state = 'active' THEN l.movie_id END) AS movie_count
        FROM actors a
@@ -2960,9 +3082,11 @@ class NasLibraryDatabase {
   NasActor? findActor(String actorId) {
     final rows = _db.select('''
       SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
-             a.aliases_json, a.gender, a.birth_month, a.height_cm, a.weight_kg,
-             a.measurements, a.body_type, a.country, a.debut_month,
-             a.debut_description, a.photo_asset_id, a.publisher_names_json,
+             a.aliases_json, a.gender, a.romanized_name, a.birth_date, a.birth_month,
+             a.height_cm, a.weight_kg, a.measurements, a.body_type, a.country,
+             a.birthplace, a.cup, a.career_period, a.debut_month, a.debut_description,
+             a.account_url, a.official_site_url, a.photo_asset_id, a.backdrop_asset_id,
+             a.publisher_names_json,
              a.created_at, a.updated_at, a.archived_at,
               COUNT(CASE WHEN linked_movie.lifecycle_state = 'active' THEN l.movie_id END) AS movie_count
        FROM actors a
@@ -3084,15 +3208,23 @@ class NasLibraryDatabase {
     String? translatedName,
     List<String> aliases = const [],
     String? gender,
+    String? romanizedName,
+    String? birthDate,
     String? birthMonth,
     int? heightCm,
     int? weightKg,
     String? measurements,
     String? bodyType,
     String? country,
+    String? birthplace,
+    String? cup,
+    String? careerPeriod,
     String? debutMonth,
     String? debutDescription,
+    String? accountUrl,
+    String? officialSiteUrl,
     String? photoAssetId,
+    String? backdropAssetId,
     List<String> publisherNames = const [],
   }) {
     final timestamp = _now();
@@ -3100,10 +3232,11 @@ class NasLibraryDatabase {
     _db.execute('''
       INSERT INTO actors(
         id, profile_identity, stage_name, original_name, translated_name, aliases_json, gender,
-        birth_month, height_cm, weight_kg, measurements, body_type, country,
-        debut_month, debut_description, photo_asset_id, publisher_names_json,
+        romanized_name, birth_date, birth_month, height_cm, weight_kg, measurements, body_type,
+        country, birthplace, cup, career_period, debut_month, debut_description,
+        account_url, official_site_url, photo_asset_id, backdrop_asset_id, publisher_names_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', [
       id,
       _nullableTrimmed(profileIdentity) ?? newUuidV4(),
@@ -3112,15 +3245,23 @@ class NasLibraryDatabase {
       _nullableTrimmed(translatedName),
       jsonEncode(_cleanTextList(aliases)),
       gender,
+      _nullableTrimmed(romanizedName),
+      _nullableTrimmed(birthDate),
       _nullableTrimmed(birthMonth),
       heightCm,
       weightKg,
       _nullableTrimmed(measurements),
       _nullableTrimmed(bodyType),
       _nullableTrimmed(country),
+      _nullableTrimmed(birthplace),
+      _nullableTrimmed(cup),
+      _nullableTrimmed(careerPeriod),
       _nullableTrimmed(debutMonth),
       _nullableTrimmed(debutDescription),
+      _nullableTrimmed(accountUrl),
+      _nullableTrimmed(officialSiteUrl),
       photoAssetId,
+      backdropAssetId,
       jsonEncode(_cleanTextList(publisherNames)),
       timestamp,
       timestamp,
@@ -3146,6 +3287,99 @@ class NasLibraryDatabase {
       parameters,
     );
     return findActor(actorId);
+  }
+
+  NasMdcngActorImportRecord? findMdcngActorImport({
+    required String sourceId,
+    required String taskId,
+    required String sourceFingerprint,
+  }) {
+    final rows = _db.select('''
+      SELECT id, actor_id, source_id, task_id, emby_id, source_fingerprint,
+             applied_fields_json, created_at
+      FROM mdcng_actor_import_records
+      WHERE source_id = ? AND task_id = ? AND source_fingerprint = ?
+      LIMIT 1
+    ''', [sourceId, taskId, sourceFingerprint]);
+    return rows.isEmpty ? null : _mapMdcngActorImportRecord(rows.single);
+  }
+
+  NasActor? findActorByMdcngSource({
+    required String sourceId,
+    required String embyId,
+  }) {
+    final rows = _db.select('''
+      SELECT actor_id FROM mdcng_actor_source_links
+      WHERE source_id = ? AND emby_id = ?
+      LIMIT 1
+    ''', [sourceId, embyId]);
+    return rows.isEmpty ? null : findActor(rows.single['actor_id'] as String);
+  }
+
+  Map<String, String> mdcngProfileKeysForSource(String sourceId) {
+    final rows = _db.select('''
+      SELECT emby_id, profile_key FROM mdcng_actor_source_links
+      WHERE source_id = ? AND profile_key IS NOT NULL AND profile_key != ''
+    ''', [sourceId]);
+    return {
+      for (final row in rows)
+        row['emby_id'] as String: row['profile_key'] as String,
+    };
+  }
+
+  void linkActorToMdcngSource({
+    required String sourceId,
+    required String embyId,
+    required String actorId,
+    required String sourceName,
+    required String profileKey,
+  }) {
+    _db.execute('''
+      INSERT INTO mdcng_actor_source_links(
+        source_id, emby_id, actor_id, source_name, profile_key, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(source_id, emby_id) DO UPDATE SET
+        actor_id = excluded.actor_id,
+        source_name = excluded.source_name,
+        profile_key = excluded.profile_key,
+        updated_at = excluded.updated_at
+    ''', [sourceId, embyId, actorId, sourceName.trim(), profileKey, _now()]);
+  }
+
+  NasMdcngActorImportRecord addMdcngActorImport({
+    required String actorId,
+    required String sourceId,
+    required String taskId,
+    required String embyId,
+    required String sourceFingerprint,
+    required List<String> appliedFields,
+  }) {
+    final record = NasMdcngActorImportRecord(
+      id: newUuidV4(),
+      actorId: actorId,
+      sourceId: sourceId,
+      taskId: taskId,
+      embyId: embyId,
+      sourceFingerprint: sourceFingerprint,
+      appliedFields: _cleanTextList(appliedFields),
+      createdAt: _now(),
+    );
+    _db.execute('''
+      INSERT INTO mdcng_actor_import_records(
+        id, actor_id, source_id, task_id, emby_id, source_fingerprint,
+        applied_fields_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+      record.id,
+      record.actorId,
+      record.sourceId,
+      record.taskId,
+      record.embyId,
+      record.sourceFingerprint,
+      jsonEncode(record.appliedFields),
+      record.createdAt,
+    ]);
+    return record;
   }
 
   NasActor? archiveActor(String actorId) => updateActor(actorId, {
@@ -5902,20 +6136,40 @@ class NasLibraryDatabase {
         translatedName: row['translated_name'] as String?,
         aliases: _decodeTextList(row['aliases_json'] as String?),
         gender: row['gender'] as String?,
+        romanizedName: row['romanized_name'] as String?,
+        birthDate: row['birth_date'] as String?,
         birthMonth: row['birth_month'] as String?,
         heightCm: row['height_cm'] as int?,
         weightKg: row['weight_kg'] as int?,
         measurements: row['measurements'] as String?,
         bodyType: row['body_type'] as String?,
         country: row['country'] as String?,
+        birthplace: row['birthplace'] as String?,
+        cup: row['cup'] as String?,
+        careerPeriod: row['career_period'] as String?,
         debutMonth: row['debut_month'] as String?,
         debutDescription: row['debut_description'] as String?,
+        accountUrl: row['account_url'] as String?,
+        officialSiteUrl: row['official_site_url'] as String?,
         photoAssetId: row['photo_asset_id'] as String?,
+        backdropAssetId: row['backdrop_asset_id'] as String?,
         publisherIds: publisherIdsForActor(row['id'] as String),
         movieCount: row['movie_count'] as int,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
         archivedAt: row['archived_at'] as String?,
+      );
+
+  NasMdcngActorImportRecord _mapMdcngActorImportRecord(Row row) =>
+      NasMdcngActorImportRecord(
+        id: row['id'] as String,
+        actorId: row['actor_id'] as String,
+        sourceId: row['source_id'] as String,
+        taskId: row['task_id'] as String,
+        embyId: row['emby_id'] as String,
+        sourceFingerprint: row['source_fingerprint'] as String,
+        appliedFields: _decodeTextList(row['applied_fields_json'] as String?),
+        createdAt: row['created_at'] as String,
       );
 
   NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
