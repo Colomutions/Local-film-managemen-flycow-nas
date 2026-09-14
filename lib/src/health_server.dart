@@ -11,6 +11,7 @@ import 'backup_service.dart';
 import 'config.dart';
 import 'diagnostic_log.dart';
 import 'fixture_library.dart';
+import 'library/profile_package.dart';
 import 'library/taxonomy_transfer.dart';
 import 'library_database.dart';
 import 'media_service.dart';
@@ -21,6 +22,20 @@ import 'range.dart';
 String? _nullableTrimmed(String? value) {
   final normalized = value?.trim();
   return normalized == null || normalized.isEmpty ? null : normalized;
+}
+
+List<String> _profileList(String? value) => (value ?? '')
+    .split('|')
+    .map((item) => item.trim())
+    .where((item) => item.isNotEmpty)
+    .toList(growable: false);
+
+String? _firstProfileText(Iterable<String?> values) {
+  for (final value in values) {
+    final normalized = _nullableTrimmed(value);
+    if (normalized != null) return normalized;
+  }
+  return null;
 }
 
 class NasHealthServer {
@@ -363,6 +378,21 @@ class NasHealthServer {
       }
       if (request.method == 'POST' && path == '/api/v1/admin/assets/images') {
         return await _uploadManagedImage(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/admin/profile-packages/(actor|publisher|series)/template$')
+              .hasMatch(path)) {
+        return await _downloadProfilePackageTemplate(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/admin/profile-packages/(actor|publisher|series)/export$')
+              .hasMatch(path)) {
+        return await _exportProfilePackage(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/profile-packages/(actor|publisher|series)/import$')
+              .hasMatch(path)) {
+        return await _importProfilePackage(request);
       }
       if (request.method == 'GET' && path == '/api/v1/admin/ai/settings') {
         return await _aiSettings(request);
@@ -1873,6 +1903,365 @@ class NasHealthServer {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
   }
+
+  Future<void> _downloadProfilePackageTemplate(HttpRequest request) async {
+    final kind = _profilePackageKind(request);
+    if (kind == null) return _error(request, HttpStatus.badRequest, 'invalid_request');
+    await _writeBinary(
+      request.response,
+      NasProfilePackageCodec.template(kind),
+      fileName: 'mujing-${kind.wireValue}-template.zip',
+    );
+  }
+
+  Future<void> _exportProfilePackage(HttpRequest request) async {
+    final kind = _profilePackageKind(request);
+    if (kind == null) return _error(request, HttpStatus.badRequest, 'invalid_request');
+    try {
+      final entries = switch (kind) {
+        NasProfilePackageKind.actor => await _actorProfilePackageEntries(),
+        NasProfilePackageKind.publisher => await _publisherProfilePackageEntries(),
+        NasProfilePackageKind.series => await _seriesProfilePackageEntries(),
+      };
+      await _writeBinary(
+        request.response,
+        NasProfilePackageCodec.encode(kind: kind, entries: entries),
+        fileName: 'mujing-${kind.wireValue}-profiles.zip',
+      );
+    } on Object {
+      await _error(request, HttpStatus.internalServerError, 'profile_package_failed');
+    }
+  }
+
+  Future<void> _importProfilePackage(HttpRequest request) async {
+    final kind = _profilePackageKind(request);
+    final bytes = await _readProfilePackageBytes(request);
+    if (kind == null || bytes == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_profile_package');
+    }
+    final NasProfilePackage package;
+    try {
+      package = NasProfilePackageCodec.decode(expectedKind: kind, bytes: bytes);
+    } on FormatException {
+      return _error(request, HttpStatus.badRequest, 'invalid_profile_package');
+    }
+    final items = <_ProfilePackageImportResult>[];
+    for (final entry in package.entries) {
+      final item = switch (kind) {
+        NasProfilePackageKind.actor => await _importActorProfile(entry),
+        NasProfilePackageKind.publisher => await _importPublisherProfile(entry),
+        NasProfilePackageKind.series => await _importSeriesProfile(entry),
+      };
+      items.add(item);
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'items': items.map((item) => item.toJson()).toList(growable: false)},
+    });
+  }
+
+  Future<List<NasProfilePackageExportEntry>> _actorProfilePackageEntries() async {
+    final entries = <NasProfilePackageExportEntry>[];
+    for (final actor in _libraryDatabase.listActors(includeArchived: true)) {
+      final image = await _profilePackageImage(actor.photoAssetId);
+      final publisherNames = _libraryDatabase
+          .publisherIdsForActor(actor.id)
+          .map(_libraryDatabase.findPublisher)
+          .whereType<NasPublisher>()
+          .map((publisher) => publisher.displayName)
+          .join('|');
+      entries.add(
+        NasProfilePackageExportEntry(
+          directoryName: actor.profileIdentity,
+          fields: {
+            'stageName': actor.stageName ?? '',
+            'originalName': actor.originalName ?? '',
+            'translatedName': actor.translatedName ?? '',
+            'aliases': actor.aliases.join('|'),
+            'gender': actor.gender ?? '',
+            'birthMonth': actor.birthMonth ?? '',
+            'country': actor.country ?? '',
+            'heightCm': actor.heightCm?.toString() ?? '',
+            'weightKg': actor.weightKg?.toString() ?? '',
+            'measurements': actor.measurements ?? '',
+            'bodyType': actor.bodyType ?? '',
+            'debutMonth': actor.debutMonth ?? '',
+            'debutDescription': actor.debutDescription ?? '',
+            'publisherNames': publisherNames,
+          },
+          imageBytes: image.bytes,
+          imageMimeType: image.mimeType,
+        ),
+      );
+    }
+    return entries;
+  }
+
+  Future<List<NasProfilePackageExportEntry>> _publisherProfilePackageEntries() async {
+    final entries = <NasProfilePackageExportEntry>[];
+    for (final publisher in _libraryDatabase.listPublishers(includeArchived: true)) {
+      final image = await _profilePackageImage(publisher.logoAssetId);
+      entries.add(
+        NasProfilePackageExportEntry(
+          directoryName: publisher.profileIdentity,
+          fields: {
+            'displayName': publisher.displayName,
+            'originalName': publisher.originalName ?? '',
+            'countryRegion': publisher.countryRegion ?? '',
+            'foundedDate': publisher.foundedDate ?? '',
+          },
+          imageBytes: image.bytes,
+          imageMimeType: image.mimeType,
+        ),
+      );
+    }
+    return entries;
+  }
+
+  Future<List<NasProfilePackageExportEntry>> _seriesProfilePackageEntries() async {
+    final entries = <NasProfilePackageExportEntry>[];
+    for (final series in _libraryDatabase.listSeries(includeArchived: true)) {
+      final image = await _profilePackageImage(series.posterAssetId);
+      final publisher = series.publisherId == null
+          ? null
+          : _libraryDatabase.findPublisher(series.publisherId!);
+      entries.add(
+        NasProfilePackageExportEntry(
+          directoryName: series.profileIdentity,
+          fields: {
+            'displayName': series.displayName,
+            'originalName': series.originalName ?? '',
+            'translatedName': series.translatedName ?? '',
+            'releaseDate': series.releaseDate ?? '',
+            'publisherName': publisher?.displayName ?? '',
+          },
+          imageBytes: image.bytes,
+          imageMimeType: image.mimeType,
+        ),
+      );
+    }
+    return entries;
+  }
+
+  Future<_ProfilePackageImage> _profilePackageImage(String? assetId) async {
+    if (assetId == null) return const _ProfilePackageImage();
+    final asset = _libraryDatabase.findManagedAsset(assetId);
+    final artwork = asset == null ? null : await _artworkService.managedAsset(asset.fileName);
+    if (artwork == null) return const _ProfilePackageImage();
+    return _ProfilePackageImage(
+      bytes: await artwork.file.readAsBytes(),
+      mimeType: artwork.mimeType,
+    );
+  }
+
+  Future<_ProfilePackageImportResult> _importActorProfile(
+    NasProfilePackageEntry entry,
+  ) async {
+    if (entry.validationError != null) return _profileFailure(entry, entry.validationError!);
+    final fields = entry.fields;
+    final aliases = _profileList(fields['aliases']);
+    final displayName = _firstProfileText([
+      fields['stageName'],
+      fields['originalName'],
+      fields['translatedName'],
+      ...aliases,
+    ]);
+    if (displayName == null) return _profileFailure(entry, '演员缺少可用名称。');
+    if (_libraryDatabase.actorDisplayNameExists(displayName)) {
+      return _profileSkipped(entry, displayName, '同名演员已存在，已跳过。');
+    }
+    final publisherIds = <String>[];
+    for (final publisherName in _profileList(fields['publisherNames'])) {
+      final publisher = _libraryDatabase.findPublisherByDisplayName(publisherName);
+      if (publisher == null || publisher.archivedAt != null) {
+        return _profileFailure(entry, '引用的发行商名称不存在。');
+      }
+      publisherIds.add(publisher.id);
+    }
+    if (publisherIds.length != publisherIds.toSet().length) {
+      return _profileFailure(entry, '发行商名称重复。');
+    }
+    NasManagedAsset? asset;
+    NasActor? actor;
+    try {
+      asset = await _saveManagedImageBytes(
+        purpose: 'actor_photo',
+        bytes: entry.imageBytes,
+        mimeType: entry.imageMimeType,
+      );
+      if (entry.imageBytes != null && asset == null) {
+        return _profileFailure(entry, '演员海报保存失败。');
+      }
+      actor = _libraryDatabase.createActor(
+        stageName: _nullableTrimmed(fields['stageName']),
+        originalName: _nullableTrimmed(fields['originalName']),
+        translatedName: _nullableTrimmed(fields['translatedName']),
+        aliases: aliases,
+        gender: _nullableTrimmed(fields['gender']),
+        birthMonth: _nullableTrimmed(fields['birthMonth']),
+        country: _nullableTrimmed(fields['country']),
+        heightCm: int.tryParse(fields['heightCm'] ?? ''),
+        weightKg: int.tryParse(fields['weightKg'] ?? ''),
+        measurements: _nullableTrimmed(fields['measurements']),
+        bodyType: _nullableTrimmed(fields['bodyType']),
+        debutMonth: _nullableTrimmed(fields['debutMonth']),
+        debutDescription: _nullableTrimmed(fields['debutDescription']),
+        photoAssetId: asset?.id,
+      );
+      if (!_libraryDatabase.setActorPublisherIds(
+        actorId: actor.id,
+        publisherIds: publisherIds,
+      )) {
+        _libraryDatabase.deleteActor(actor.id);
+        await _deleteManagedAsset(asset);
+        return _profileFailure(entry, '演员与发行商关系保存失败。');
+      }
+      return _profileAdded(entry, displayName);
+    } on Object {
+      if (actor != null) _libraryDatabase.deleteActor(actor.id);
+      await _deleteManagedAsset(asset);
+      return _profileFailure(entry, '演员资料写入失败。');
+    }
+  }
+
+  Future<_ProfilePackageImportResult> _importPublisherProfile(
+    NasProfilePackageEntry entry,
+  ) async {
+    if (entry.validationError != null) return _profileFailure(entry, entry.validationError!);
+    final fields = entry.fields;
+    final displayName = fields['displayName']!.trim();
+    if (_libraryDatabase.publisherDisplayNameExists(displayName)) {
+      return _profileSkipped(entry, displayName, '同名发行商已存在，已跳过。');
+    }
+    NasManagedAsset? asset;
+    try {
+      asset = await _saveManagedImageBytes(
+        purpose: 'publisher_logo',
+        bytes: entry.imageBytes,
+        mimeType: entry.imageMimeType,
+      );
+      if (entry.imageBytes != null && asset == null) {
+        return _profileFailure(entry, '发行商 Logo 保存失败。');
+      }
+      _libraryDatabase.createPublisher(
+        displayName: displayName,
+        originalName: _nullableTrimmed(fields['originalName']),
+        countryRegion: _nullableTrimmed(fields['countryRegion']),
+        foundedDate: _nullableTrimmed(fields['foundedDate']),
+        logoAssetId: asset?.id,
+      );
+      return _profileAdded(entry, displayName);
+    } on Object {
+      await _deleteManagedAsset(asset);
+      return _profileFailure(entry, '发行商资料写入失败。');
+    }
+  }
+
+  Future<_ProfilePackageImportResult> _importSeriesProfile(
+    NasProfilePackageEntry entry,
+  ) async {
+    if (entry.validationError != null) return _profileFailure(entry, entry.validationError!);
+    final fields = entry.fields;
+    final displayName = fields['displayName']!.trim();
+    if (_libraryDatabase.seriesDisplayNameExists(displayName)) {
+      return _profileSkipped(entry, displayName, '同名系列已存在，已跳过。');
+    }
+    final publisherName = _nullableTrimmed(fields['publisherName']);
+    final publisher = publisherName == null
+        ? null
+        : _libraryDatabase.findPublisherByDisplayName(publisherName);
+    if (publisherName != null && (publisher == null || publisher.archivedAt != null)) {
+      return _profileFailure(entry, '引用的发行商名称不存在。');
+    }
+    NasManagedAsset? asset;
+    try {
+      asset = await _saveManagedImageBytes(
+        purpose: 'series_poster',
+        bytes: entry.imageBytes,
+        mimeType: entry.imageMimeType,
+      );
+      if (entry.imageBytes != null && asset == null) {
+        return _profileFailure(entry, '系列海报保存失败。');
+      }
+      _libraryDatabase.createSeries(
+        displayName: displayName,
+        originalName: _nullableTrimmed(fields['originalName']),
+        translatedName: _nullableTrimmed(fields['translatedName']),
+        releaseDate: _nullableTrimmed(fields['releaseDate']),
+        publisherId: publisher?.id,
+        posterAssetId: asset?.id,
+      );
+      return _profileAdded(entry, displayName);
+    } on Object {
+      await _deleteManagedAsset(asset);
+      return _profileFailure(entry, '系列资料写入失败。');
+    }
+  }
+
+  Future<NasManagedAsset?> _saveManagedImageBytes({
+    required String purpose,
+    required List<int>? bytes,
+    required String? mimeType,
+  }) async {
+    if (bytes == null || mimeType == null) return null;
+    final assetId = newUuidV4();
+    String? fileName;
+    try {
+      fileName = await _artworkService.saveManagedAsset(
+        assetId: assetId,
+        mimeType: mimeType,
+        bytes: bytes,
+      );
+      return _libraryDatabase.addManagedAsset(
+        id: assetId,
+        purpose: purpose,
+        fileName: fileName,
+        mimeType: mimeType,
+      );
+    } on ArgumentError {
+      if (fileName != null) await _artworkService.deleteManagedAsset(fileName);
+      return null;
+    }
+  }
+
+  NasProfilePackageKind? _profilePackageKind(HttpRequest request) =>
+      request.uri.pathSegments.length > 4
+          ? NasProfilePackageKind.tryParse(request.uri.pathSegments[4])
+          : null;
+
+  Future<List<int>?> _readProfilePackageBytes(HttpRequest request) async {
+    if (request.headers.contentType?.mimeType != 'application/zip' ||
+        request.headers.contentLength > NasProfilePackageCodec.maxPackageBytes) {
+      await request.drain<void>();
+      return null;
+    }
+    final bytes = <int>[];
+    var oversized = false;
+    await for (final chunk in request) {
+      if (oversized) continue;
+      if (bytes.length + chunk.length > NasProfilePackageCodec.maxPackageBytes) {
+        oversized = true;
+      } else {
+        bytes.addAll(chunk);
+      }
+    }
+    return oversized ? null : bytes;
+  }
+
+  _ProfilePackageImportResult _profileAdded(
+    NasProfilePackageEntry entry,
+    String name,
+  ) => _ProfilePackageImportResult(entry.directoryName, name, 'added', '已新增。');
+
+  _ProfilePackageImportResult _profileSkipped(
+    NasProfilePackageEntry entry,
+    String name,
+    String reason,
+  ) => _ProfilePackageImportResult(entry.directoryName, name, 'skipped', reason);
+
+  _ProfilePackageImportResult _profileFailure(
+    NasProfilePackageEntry entry,
+    String reason,
+  ) => _ProfilePackageImportResult(entry.directoryName, entry.directoryName, 'failed', reason);
 
   Future<void> _aiSettings(HttpRequest request) => _writeJson(
         request.response,
@@ -4962,6 +5351,8 @@ class NasHealthServer {
       'insufficient_scope': 'This device does not have the required scope.',
       'invalid_request': 'The request is invalid.',
       'invalid_taxonomy': 'The taxonomy definition file is invalid.',
+      'invalid_profile_package': '资料包格式或内容不合法。',
+      'profile_package_failed': '资料包生成失败。',
       'ai_not_configured': 'AI settings have not been configured on this NAS.',
       'ai_task_not_ready':
           'The AI task does not have an applicable result yet.',
@@ -5008,6 +5399,51 @@ class NasHealthServer {
     }
     await response.close();
   }
+
+  Future<void> _writeBinary(
+    HttpResponse response,
+    List<int> bytes, {
+    required String fileName,
+  }) async {
+    response.statusCode = HttpStatus.ok;
+    response.headers.contentType = ContentType('application', 'zip');
+    response.headers.contentLength = bytes.length;
+    response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
+    response.headers.set(
+      'content-disposition',
+      'attachment; filename="$fileName"',
+    );
+    response.add(bytes);
+    await response.close();
+  }
+}
+
+class _ProfilePackageImage {
+  const _ProfilePackageImage({this.bytes, this.mimeType});
+
+  final List<int>? bytes;
+  final String? mimeType;
+}
+
+class _ProfilePackageImportResult {
+  const _ProfilePackageImportResult(
+    this.directoryName,
+    this.name,
+    this.status,
+    this.reason,
+  );
+
+  final String directoryName;
+  final String name;
+  final String status;
+  final String reason;
+
+  Map<String, Object?> toJson() => {
+        'directoryName': directoryName,
+        'name': name,
+        'status': status,
+        'reason': reason,
+      };
 }
 
 class _PairingSession {

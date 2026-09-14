@@ -7,4 +7,5 @@ environment:
   sdk: '>=3.3.0 <4.0.0'
 
 dependencies:
+  archive: ^3.6.1
   sqlite3: ^2.4.5

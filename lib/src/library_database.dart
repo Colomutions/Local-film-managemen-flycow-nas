@@ -548,6 +548,7 @@ class NasCarouselImage {
 class NasActor {
   const NasActor({
     required this.id,
+    required this.profileIdentity,
     required this.stageName,
     this.originalName,
     this.translatedName,
@@ -570,6 +571,7 @@ class NasActor {
   });
 
   final String id;
+  final String profileIdentity;
   final String? stageName;
   final String? originalName;
   final String? translatedName;
@@ -620,6 +622,7 @@ class NasActorCoactor {
 class NasPublisher {
   const NasPublisher({
     required this.id,
+    required this.profileIdentity,
     required this.displayName,
     this.originalName,
     this.countryRegion,
@@ -634,6 +637,7 @@ class NasPublisher {
   });
 
   final String id;
+  final String profileIdentity;
   final String displayName;
   final String? originalName;
   final String? countryRegion;
@@ -651,6 +655,7 @@ class NasPublisher {
 class NasSeries {
   const NasSeries({
     required this.id,
+    required this.profileIdentity,
     required this.displayName,
     this.originalName,
     this.translatedName,
@@ -666,6 +671,7 @@ class NasSeries {
   });
 
   final String id;
+  final String profileIdentity;
   final String displayName;
   final String? originalName;
   final String? translatedName;
@@ -856,7 +862,7 @@ class NasPlaybackResumeTarget {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 25;
+  static const currentSchemaVersion = 26;
 
   NasLibraryDatabase(this.dataDir);
 
@@ -1495,6 +1501,26 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [25, _now()],
+      );
+    }
+    if (current < 26) {
+      _db.execute('''
+        ALTER TABLE actors ADD COLUMN profile_identity TEXT;
+        ALTER TABLE publishers ADD COLUMN profile_identity TEXT;
+        ALTER TABLE series ADD COLUMN profile_identity TEXT;
+        UPDATE actors SET profile_identity = id WHERE profile_identity IS NULL;
+        UPDATE publishers SET profile_identity = id WHERE profile_identity IS NULL;
+        UPDATE series SET profile_identity = id WHERE profile_identity IS NULL;
+        CREATE UNIQUE INDEX actors_profile_identity_idx
+          ON actors(profile_identity);
+        CREATE UNIQUE INDEX publishers_profile_identity_idx
+          ON publishers(profile_identity);
+        CREATE UNIQUE INDEX series_profile_identity_idx
+          ON series(profile_identity);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [26, _now()],
       );
     }
   }
@@ -2390,7 +2416,7 @@ class NasLibraryDatabase {
   }) {
     final queryLike = '%${query.trim()}%';
     final rows = _db.select('''
-      SELECT p.id, p.display_name, p.original_name, p.country_region,
+      SELECT p.id, p.profile_identity, p.display_name, p.original_name, p.country_region,
              p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
              p.archived_at,
               (SELECT COUNT(*) FROM movies m
@@ -2411,7 +2437,7 @@ class NasLibraryDatabase {
 
   NasPublisher? findPublisher(String publisherId) {
     final rows = _db.select('''
-      SELECT p.id, p.display_name, p.original_name, p.country_region,
+      SELECT p.id, p.profile_identity, p.display_name, p.original_name, p.country_region,
              p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
              p.archived_at,
               (SELECT COUNT(*) FROM movies m
@@ -2426,8 +2452,30 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _mapPublisher(rows.single);
   }
 
+  NasPublisher? findPublisherByProfileIdentity(String profileIdentity) {
+    final rows = _db.select(
+      'SELECT id FROM publishers WHERE profile_identity = ?',
+      [profileIdentity],
+    );
+    return rows.isEmpty ? null : findPublisher(rows.single['id'] as String);
+  }
+
+  bool publisherDisplayNameExists(String displayName) => _db.select(
+        'SELECT 1 FROM publishers WHERE lower(display_name) = lower(?) LIMIT 1',
+        [displayName.trim()],
+      ).isNotEmpty;
+
+  NasPublisher? findPublisherByDisplayName(String displayName) {
+    final rows = _db.select(
+      'SELECT id FROM publishers WHERE lower(display_name) = lower(?) LIMIT 1',
+      [displayName.trim()],
+    );
+    return rows.isEmpty ? null : findPublisher(rows.single['id'] as String);
+  }
+
   NasPublisher createPublisher({
     required String displayName,
+    String? profileIdentity,
     String? originalName,
     String? countryRegion,
     String? foundedDate,
@@ -2437,11 +2485,12 @@ class NasLibraryDatabase {
     final timestamp = _now();
     _db.execute('''
       INSERT INTO publishers(
-        id, display_name, original_name, country_region, founded_date,
+        id, profile_identity, display_name, original_name, country_region, founded_date,
         logo_asset_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', [
       id,
+      _nullableTrimmed(profileIdentity) ?? newUuidV4(),
       displayName.trim(),
       _nullableTrimmed(originalName),
       _nullableTrimmed(countryRegion),
@@ -2503,7 +2552,7 @@ class NasLibraryDatabase {
   }) {
     final queryLike = '%${query.trim()}%';
     final rows = _db.select('''
-      SELECT s.id, s.display_name, s.original_name, s.translated_name,
+      SELECT s.id, s.profile_identity, s.display_name, s.original_name, s.translated_name,
              s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
              s.updated_at, s.archived_at,
               (SELECT COUNT(*) FROM movies m
@@ -2536,7 +2585,7 @@ class NasLibraryDatabase {
 
   NasSeries? findSeries(String seriesId) {
     final rows = _db.select('''
-      SELECT s.id, s.display_name, s.original_name, s.translated_name,
+      SELECT s.id, s.profile_identity, s.display_name, s.original_name, s.translated_name,
              s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
              s.updated_at, s.archived_at,
               (SELECT COUNT(*) FROM movies m
@@ -2553,8 +2602,22 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _mapSeries(rows.single);
   }
 
+  NasSeries? findSeriesByProfileIdentity(String profileIdentity) {
+    final rows = _db.select(
+      'SELECT id FROM series WHERE profile_identity = ?',
+      [profileIdentity],
+    );
+    return rows.isEmpty ? null : findSeries(rows.single['id'] as String);
+  }
+
+  bool seriesDisplayNameExists(String displayName) => _db.select(
+        'SELECT 1 FROM series WHERE lower(display_name) = lower(?) LIMIT 1',
+        [displayName.trim()],
+      ).isNotEmpty;
+
   NasSeries createSeries({
     required String displayName,
+    String? profileIdentity,
     String? publisherId,
     String? originalName,
     String? translatedName,
@@ -2565,11 +2628,12 @@ class NasLibraryDatabase {
     final timestamp = _now();
     _db.execute('''
       INSERT INTO series(
-        id, display_name, original_name, translated_name, publisher_id,
+        id, profile_identity, display_name, original_name, translated_name, publisher_id,
         release_date, poster_asset_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', [
       id,
+      _nullableTrimmed(profileIdentity) ?? newUuidV4(),
       displayName.trim(),
       _nullableTrimmed(originalName),
       _nullableTrimmed(translatedName),
@@ -2752,7 +2816,7 @@ class NasLibraryDatabase {
     bool includeArchived = false,
   }) {
     final rows = _db.select('''
-      SELECT a.id, a.stage_name, a.original_name, a.translated_name,
+      SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
              a.aliases_json, a.gender, a.birth_month, a.height_cm, a.weight_kg,
              a.measurements, a.body_type, a.country, a.debut_month,
              a.debut_description, a.photo_asset_id, a.publisher_names_json,
@@ -2777,7 +2841,7 @@ class NasLibraryDatabase {
 
   NasActor? findActor(String actorId) {
     final rows = _db.select('''
-      SELECT a.id, a.stage_name, a.original_name, a.translated_name,
+      SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
              a.aliases_json, a.gender, a.birth_month, a.height_cm, a.weight_kg,
              a.measurements, a.body_type, a.country, a.debut_month,
              a.debut_description, a.photo_asset_id, a.publisher_names_json,
@@ -2791,6 +2855,21 @@ class NasLibraryDatabase {
     ''', [actorId]);
     return rows.isEmpty ? null : _mapActor(rows.single);
   }
+
+  NasActor? findActorByProfileIdentity(String profileIdentity) {
+    final rows = _db.select(
+      'SELECT id FROM actors WHERE profile_identity = ?',
+      [profileIdentity],
+    );
+    return rows.isEmpty ? null : findActor(rows.single['id'] as String);
+  }
+
+  bool actorDisplayNameExists(String displayName) => _db.select('''
+    SELECT 1 FROM actors
+    WHERE lower(COALESCE(NULLIF(stage_name, ''), NULLIF(original_name, ''),
+      NULLIF(translated_name, ''))) = lower(?)
+    LIMIT 1
+  ''', [displayName.trim()]).isNotEmpty;
 
   List<NasActor> actorsForMovie(String movieId) {
     final ids = _db.select('''
@@ -2864,6 +2943,7 @@ class NasLibraryDatabase {
   }
 
   NasActor createActor({
+    String? profileIdentity,
     String? stageName,
     String? originalName,
     String? translatedName,
@@ -2884,13 +2964,14 @@ class NasLibraryDatabase {
     final id = newUuidV4();
     _db.execute('''
       INSERT INTO actors(
-        id, stage_name, original_name, translated_name, aliases_json, gender,
+        id, profile_identity, stage_name, original_name, translated_name, aliases_json, gender,
         birth_month, height_cm, weight_kg, measurements, body_type, country,
         debut_month, debut_description, photo_asset_id, publisher_names_json,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', [
       id,
+      _nullableTrimmed(profileIdentity) ?? newUuidV4(),
       _nullableTrimmed(stageName),
       _nullableTrimmed(originalName),
       _nullableTrimmed(translatedName),
@@ -5425,6 +5506,7 @@ class NasLibraryDatabase {
 
   NasPublisher _mapPublisher(Row row) => NasPublisher(
         id: row['id'] as String,
+        profileIdentity: row['profile_identity'] as String,
         displayName: row['display_name'] as String,
         originalName: row['original_name'] as String?,
         countryRegion: row['country_region'] as String?,
@@ -5442,6 +5524,7 @@ class NasLibraryDatabase {
 
   NasSeries _mapSeries(Row row) => NasSeries(
         id: row['id'] as String,
+        profileIdentity: row['profile_identity'] as String,
         displayName: row['display_name'] as String,
         originalName: row['original_name'] as String?,
         translatedName: row['translated_name'] as String?,
@@ -5460,6 +5543,7 @@ class NasLibraryDatabase {
 
   NasActor _mapActor(Row row) => NasActor(
         id: row['id'] as String,
+        profileIdentity: row['profile_identity'] as String,
         stageName: row['stage_name'] as String?,
         originalName: row['original_name'] as String?,
         translatedName: row['translated_name'] as String?,
