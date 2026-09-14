@@ -9,3 +9,4 @@ environment:
 dependencies:
   archive: ^3.6.1
   sqlite3: ^2.4.5
+  xml: ^6.5.0

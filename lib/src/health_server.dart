@@ -11,6 +11,8 @@ import 'backup_service.dart';
 import 'config.dart';
 import 'diagnostic_log.dart';
 import 'fixture_library.dart';
+import 'library/mdcng_nfo.dart';
+import 'library/mdcng_sidecar.dart';
 import 'library/profile_package.dart';
 import 'library/taxonomy_transfer.dart';
 import 'library_database.dart';
@@ -345,6 +347,14 @@ class NasHealthServer {
       }
       if (request.method == 'GET' && path == '/api/v1/admin/media-files') {
         return await _adminMediaFiles(request);
+      }
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/mdcng-imports/preview') {
+        return await _previewMdcngImport(request);
+      }
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/mdcng-imports/apply') {
+        return await _applyMdcngImport(request);
       }
       if (request.method == 'POST' && path == '/api/v1/admin/collections') {
         return await _createAdminCollection(request);
@@ -1906,7 +1916,8 @@ class NasHealthServer {
 
   Future<void> _downloadProfilePackageTemplate(HttpRequest request) async {
     final kind = _profilePackageKind(request);
-    if (kind == null) return _error(request, HttpStatus.badRequest, 'invalid_request');
+    if (kind == null)
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
     await _writeBinary(
       request.response,
       NasProfilePackageCodec.template(kind),
@@ -1916,11 +1927,13 @@ class NasHealthServer {
 
   Future<void> _exportProfilePackage(HttpRequest request) async {
     final kind = _profilePackageKind(request);
-    if (kind == null) return _error(request, HttpStatus.badRequest, 'invalid_request');
+    if (kind == null)
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
     try {
       final entries = switch (kind) {
         NasProfilePackageKind.actor => await _actorProfilePackageEntries(),
-        NasProfilePackageKind.publisher => await _publisherProfilePackageEntries(),
+        NasProfilePackageKind.publisher =>
+          await _publisherProfilePackageEntries(),
         NasProfilePackageKind.series => await _seriesProfilePackageEntries(),
       };
       await _writeBinary(
@@ -1929,7 +1942,8 @@ class NasHealthServer {
         fileName: 'mujing-${kind.wireValue}-profiles.zip',
       );
     } on Object {
-      await _error(request, HttpStatus.internalServerError, 'profile_package_failed');
+      await _error(
+          request, HttpStatus.internalServerError, 'profile_package_failed');
     }
   }
 
@@ -1955,11 +1969,14 @@ class NasHealthServer {
       items.add(item);
     }
     await _writeJson(request.response, HttpStatus.ok, {
-      'data': {'items': items.map((item) => item.toJson()).toList(growable: false)},
+      'data': {
+        'items': items.map((item) => item.toJson()).toList(growable: false)
+      },
     });
   }
 
-  Future<List<NasProfilePackageExportEntry>> _actorProfilePackageEntries() async {
+  Future<List<NasProfilePackageExportEntry>>
+      _actorProfilePackageEntries() async {
     final entries = <NasProfilePackageExportEntry>[];
     for (final actor in _libraryDatabase.listActors(includeArchived: true)) {
       final image = await _profilePackageImage(actor.photoAssetId);
@@ -1996,9 +2013,11 @@ class NasHealthServer {
     return entries;
   }
 
-  Future<List<NasProfilePackageExportEntry>> _publisherProfilePackageEntries() async {
+  Future<List<NasProfilePackageExportEntry>>
+      _publisherProfilePackageEntries() async {
     final entries = <NasProfilePackageExportEntry>[];
-    for (final publisher in _libraryDatabase.listPublishers(includeArchived: true)) {
+    for (final publisher
+        in _libraryDatabase.listPublishers(includeArchived: true)) {
       final image = await _profilePackageImage(publisher.logoAssetId);
       entries.add(
         NasProfilePackageExportEntry(
@@ -2017,7 +2036,8 @@ class NasHealthServer {
     return entries;
   }
 
-  Future<List<NasProfilePackageExportEntry>> _seriesProfilePackageEntries() async {
+  Future<List<NasProfilePackageExportEntry>>
+      _seriesProfilePackageEntries() async {
     final entries = <NasProfilePackageExportEntry>[];
     for (final series in _libraryDatabase.listSeries(includeArchived: true)) {
       final image = await _profilePackageImage(series.posterAssetId);
@@ -2045,7 +2065,9 @@ class NasHealthServer {
   Future<_ProfilePackageImage> _profilePackageImage(String? assetId) async {
     if (assetId == null) return const _ProfilePackageImage();
     final asset = _libraryDatabase.findManagedAsset(assetId);
-    final artwork = asset == null ? null : await _artworkService.managedAsset(asset.fileName);
+    final artwork = asset == null
+        ? null
+        : await _artworkService.managedAsset(asset.fileName);
     if (artwork == null) return const _ProfilePackageImage();
     return _ProfilePackageImage(
       bytes: await artwork.file.readAsBytes(),
@@ -2056,7 +2078,8 @@ class NasHealthServer {
   Future<_ProfilePackageImportResult> _importActorProfile(
     NasProfilePackageEntry entry,
   ) async {
-    if (entry.validationError != null) return _profileFailure(entry, entry.validationError!);
+    if (entry.validationError != null)
+      return _profileFailure(entry, entry.validationError!);
     final fields = entry.fields;
     final aliases = _profileList(fields['aliases']);
     final displayName = _firstProfileText([
@@ -2071,7 +2094,8 @@ class NasHealthServer {
     }
     final publisherIds = <String>[];
     for (final publisherName in _profileList(fields['publisherNames'])) {
-      final publisher = _libraryDatabase.findPublisherByDisplayName(publisherName);
+      final publisher =
+          _libraryDatabase.findPublisherByDisplayName(publisherName);
       if (publisher == null || publisher.archivedAt != null) {
         return _profileFailure(entry, '引用的发行商名称不存在。');
       }
@@ -2126,7 +2150,8 @@ class NasHealthServer {
   Future<_ProfilePackageImportResult> _importPublisherProfile(
     NasProfilePackageEntry entry,
   ) async {
-    if (entry.validationError != null) return _profileFailure(entry, entry.validationError!);
+    if (entry.validationError != null)
+      return _profileFailure(entry, entry.validationError!);
     final fields = entry.fields;
     final displayName = fields['displayName']!.trim();
     if (_libraryDatabase.publisherDisplayNameExists(displayName)) {
@@ -2159,7 +2184,8 @@ class NasHealthServer {
   Future<_ProfilePackageImportResult> _importSeriesProfile(
     NasProfilePackageEntry entry,
   ) async {
-    if (entry.validationError != null) return _profileFailure(entry, entry.validationError!);
+    if (entry.validationError != null)
+      return _profileFailure(entry, entry.validationError!);
     final fields = entry.fields;
     final displayName = fields['displayName']!.trim();
     if (_libraryDatabase.seriesDisplayNameExists(displayName)) {
@@ -2169,7 +2195,8 @@ class NasHealthServer {
     final publisher = publisherName == null
         ? null
         : _libraryDatabase.findPublisherByDisplayName(publisherName);
-    if (publisherName != null && (publisher == null || publisher.archivedAt != null)) {
+    if (publisherName != null &&
+        (publisher == null || publisher.archivedAt != null)) {
       return _profileFailure(entry, '引用的发行商名称不存在。');
     }
     NasManagedAsset? asset;
@@ -2230,7 +2257,8 @@ class NasHealthServer {
 
   Future<List<int>?> _readProfilePackageBytes(HttpRequest request) async {
     if (request.headers.contentType?.mimeType != 'application/zip' ||
-        request.headers.contentLength > NasProfilePackageCodec.maxPackageBytes) {
+        request.headers.contentLength >
+            NasProfilePackageCodec.maxPackageBytes) {
       await request.drain<void>();
       return null;
     }
@@ -2238,7 +2266,8 @@ class NasHealthServer {
     var oversized = false;
     await for (final chunk in request) {
       if (oversized) continue;
-      if (bytes.length + chunk.length > NasProfilePackageCodec.maxPackageBytes) {
+      if (bytes.length + chunk.length >
+          NasProfilePackageCodec.maxPackageBytes) {
         oversized = true;
       } else {
         bytes.addAll(chunk);
@@ -2250,18 +2279,22 @@ class NasHealthServer {
   _ProfilePackageImportResult _profileAdded(
     NasProfilePackageEntry entry,
     String name,
-  ) => _ProfilePackageImportResult(entry.directoryName, name, 'added', '已新增。');
+  ) =>
+      _ProfilePackageImportResult(entry.directoryName, name, 'added', '已新增。');
 
   _ProfilePackageImportResult _profileSkipped(
     NasProfilePackageEntry entry,
     String name,
     String reason,
-  ) => _ProfilePackageImportResult(entry.directoryName, name, 'skipped', reason);
+  ) =>
+      _ProfilePackageImportResult(entry.directoryName, name, 'skipped', reason);
 
   _ProfilePackageImportResult _profileFailure(
     NasProfilePackageEntry entry,
     String reason,
-  ) => _ProfilePackageImportResult(entry.directoryName, entry.directoryName, 'failed', reason);
+  ) =>
+      _ProfilePackageImportResult(
+          entry.directoryName, entry.directoryName, 'failed', reason);
 
   Future<void> _aiSettings(HttpRequest request) => _writeJson(
         request.response,
@@ -3882,6 +3915,20 @@ class NasHealthServer {
       updateTagIds: hasTagIds,
       tagIds: tagIds.cast<String>(),
     );
+    _libraryDatabase.markMovieMetadataFieldsManual(
+      movieId: movie.id,
+      fieldKeys: [
+        if (rawTitle != null) 'title',
+        if (hasOriginalTitle) 'originalTitle',
+        if (hasCatalogNumber) 'catalogNumber',
+        if (rawSummary != null) 'summary',
+        if (hasActorIds) 'actors',
+        if (hasTagIds) 'tags',
+        if (hasPublisherId) 'publisher',
+        if (hasSeriesId) 'series',
+        if (hasCategoryId) 'category',
+      ],
+    );
     final updatedMovie = _libraryDatabase.findMovieForAdmin(movie.id)!;
     await _writeJson(request.response, HttpStatus.ok, {
       'data': await _databaseDetails(updatedMovie),
@@ -3978,6 +4025,471 @@ class NasHealthServer {
       });
     } on ArgumentError {
       await _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+  }
+
+  /// 只读取 MDCNG 放在视频同目录的 NFO 和本地图片，绝不写库或触及源文件。
+  Future<void> _previewMdcngImport(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final movieId = body?['movieId'];
+    if (body == null ||
+        body.length != 1 ||
+        movieId is! String ||
+        movieId.isEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movie = _libraryDatabase.findMovieForAdmin(movieId);
+    if (movie == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final episodes = _libraryDatabase.episodesForMovie(movie.id);
+    if (episodes.length != 1) {
+      return _error(
+        request,
+        HttpStatus.conflict,
+        'mdcng_import_requires_single_episode',
+      );
+    }
+    final episode = episodes.single;
+    if (!episode.isAvailable) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final video = await _fileForEpisode(episode);
+    if (video == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+
+    final MdcngNfoSidecar sidecar;
+    try {
+      sidecar = await const MdcngNfoSidecarReader().readForVideo(video);
+    } on MdcngNfoSidecarException catch (error) {
+      return _error(
+        request,
+        error.code == 'sidecar_not_found'
+            ? HttpStatus.notFound
+            : HttpStatus.badRequest,
+        error.code == 'sidecar_not_found'
+            ? 'mdcng_sidecar_not_found'
+            : 'invalid_mdcng_sidecar',
+      );
+    }
+    final summary = sidecar.movie.plot ?? sidecar.movie.outline;
+    final originalTitle = _mdcngOriginalTitle(sidecar.movie);
+    final proposedActorNames = sidecar.movie.actors
+        .map((actor) => actor.name)
+        .toSet()
+        .toList(growable: false);
+    final proposedTags = sidecar.movie.tagsAndGenres;
+    final fieldSources =
+        _libraryDatabase.metadataFieldSourcesForMovie(movie.id);
+    final actorResolutions = proposedActorNames.map(
+      (name) {
+        final actor = _libraryDatabase.findActiveActorByExactName(name);
+        return {
+          'name': name,
+          'status': actor == null ? 'unresolved' : 'matched',
+          if (actor != null) 'actorId': actor.id,
+        };
+      },
+    ).toList(growable: false);
+    final tagResolutions = proposedTags.map(
+      (name) {
+        final tag = _libraryDatabase.findActiveTagByName(name);
+        return {
+          'name': name,
+          'status': tag == null ? 'unresolved' : 'matched',
+          if (tag != null) 'tagId': tag.id,
+        };
+      },
+    ).toList(growable: false);
+
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'schemaVersion': 1,
+        'mode': 'preview_only',
+        'movie': {
+          'id': movie.id,
+          'episodeId': episode.id,
+          'sourceFileName': _sourceFileName(episode.relativePath),
+          'nfoFileName': sidecar.nfoFileName,
+          'nfoContentHash': sidecar.nfoContentHash,
+        },
+        'current': {
+          'title': movie.title,
+          'originalTitle': movie.originalTitle,
+          'catalogNumber': movie.catalogNumber,
+          'summary': movie.summary,
+          'actors': movie.actors.map((actor) => actor.name).toList(),
+          'tags': _libraryDatabase
+              .tagsForMovie(movie.id)
+              .map((tag) => tag.name)
+              .toList(growable: false),
+        },
+        'proposed': {
+          'title': sidecar.movie.title,
+          'originalTitle': originalTitle,
+          'catalogNumber': sidecar.movie.catalogNumber,
+          'summary': summary,
+          'actors': proposedActorNames,
+          'tags': proposedTags,
+          'actorResolutions': actorResolutions,
+          'tagResolutions': tagResolutions,
+          'setName': sidecar.movie.setName,
+          'series': sidecar.movie.series,
+          'publisherCandidates': {
+            'studio': sidecar.movie.studio,
+            'maker': sidecar.movie.maker,
+            'publisher': sidecar.movie.publisher,
+            'label': sidecar.movie.label,
+          },
+          'artwork': sidecar.artwork
+              .map(
+                (image) => {
+                  'kind': image.kind.wireName,
+                  'fileName': image.fileName,
+                  'mimeType': image.mimeType,
+                  'byteLength': image.byteLength,
+                },
+              )
+              .toList(growable: false),
+        },
+        'fieldDiffs': [
+          _mdcngScalarFieldDiff(
+            key: 'title',
+            currentValue: movie.title,
+            proposedValue: sidecar.movie.title,
+            source: fieldSources['title'],
+          ),
+          _mdcngScalarFieldDiff(
+            key: 'originalTitle',
+            currentValue: movie.originalTitle,
+            proposedValue: originalTitle,
+            source: fieldSources['originalTitle'],
+          ),
+          _mdcngScalarFieldDiff(
+            key: 'catalogNumber',
+            currentValue: movie.catalogNumber,
+            proposedValue: sidecar.movie.catalogNumber,
+            source: fieldSources['catalogNumber'],
+          ),
+          _mdcngScalarFieldDiff(
+            key: 'summary',
+            currentValue: movie.summary,
+            proposedValue: summary,
+            source: fieldSources['summary'],
+          ),
+        ],
+        'notImported': {
+          'externalCoverUrlPresent': sidecar.movie.coverUrl != null,
+          'externalWebsitePresent': sidecar.movie.website != null,
+          'runtimeMinutes': sidecar.movie.runtimeMinutes,
+          'releaseDate': sidecar.movie.releaseDate ??
+              sidecar.movie.premiered ??
+              sidecar.movie.release,
+        },
+        'issues': sidecar.issues
+            .map((issue) => {'code': issue.code, 'field': issue.field})
+            .toList(growable: false),
+      },
+    });
+  }
+
+  /// 写入前重新读取 sidecar；客户端必须提交预览返回的内容摘要和字段选择。
+  Future<void> _applyMdcngImport(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final movieId = body?['movieId'];
+    final episodeId = body?['episodeId'];
+    final nfoContentHash = body?['nfoContentHash'];
+    final rawFieldKeys = body?['fieldKeys'];
+    final rawOverwriteFieldKeys = body?['overwriteFieldKeys'];
+    const allowedFields = {
+      'title',
+      'originalTitle',
+      'catalogNumber',
+      'summary',
+      'actors',
+      'tags',
+      'poster',
+      'fanart',
+    };
+    if (body == null ||
+        body.keys.any((key) =>
+            key != 'movieId' &&
+            key != 'episodeId' &&
+            key != 'nfoContentHash' &&
+            key != 'fieldKeys' &&
+            key != 'overwriteFieldKeys') ||
+        movieId is! String ||
+        movieId.isEmpty ||
+        episodeId is! String ||
+        episodeId.isEmpty ||
+        nfoContentHash is! String ||
+        !RegExp(r'^[a-f0-9]{64}$').hasMatch(nfoContentHash) ||
+        rawFieldKeys is! List ||
+        rawOverwriteFieldKeys is! List ||
+        rawFieldKeys.isEmpty ||
+        rawFieldKeys.length > allowedFields.length ||
+        rawFieldKeys.any((field) => field is! String) ||
+        rawOverwriteFieldKeys.any((field) => field is! String)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final fieldKeys = rawFieldKeys.cast<String>();
+    final overwriteFieldKeys = rawOverwriteFieldKeys.cast<String>();
+    final fields = fieldKeys.toSet();
+    final overwriteFields = overwriteFieldKeys.toSet();
+    if (fields.length != fieldKeys.length ||
+        overwriteFields.length != overwriteFieldKeys.length ||
+        fields.any((field) => !allowedFields.contains(field)) ||
+        overwriteFields.any((field) => !fields.contains(field))) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+
+    final movie = _libraryDatabase.findMovieForAdmin(movieId);
+    final episode = _libraryDatabase.findEpisode(episodeId);
+    if (movie == null ||
+        episode == null ||
+        episode.movieId != movie.id ||
+        !episode.isAvailable) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final episodes = _libraryDatabase.episodesForMovie(movie.id);
+    if (episodes.length != 1) {
+      return _error(
+        request,
+        HttpStatus.conflict,
+        'mdcng_import_requires_single_episode',
+      );
+    }
+    final video = await _fileForEpisode(episode);
+    if (video == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final MdcngNfoSidecar sidecar;
+    try {
+      sidecar = await const MdcngNfoSidecarReader().readForVideo(video);
+    } on MdcngNfoSidecarException {
+      return _error(request, HttpStatus.badRequest, 'invalid_mdcng_sidecar');
+    }
+    if (sidecar.nfoContentHash != nfoContentHash) {
+      return _error(request, HttpStatus.conflict, 'mdcng_preview_stale');
+    }
+
+    final sources = _libraryDatabase.metadataFieldSourcesForMovie(movie.id);
+    final effectiveFieldKeys = fieldKeys.where((field) {
+      final source = sources[field];
+      return source?.sourceKind != 'mdcng' ||
+          source?.sourceContentHash != sidecar.nfoContentHash;
+    }).toList(growable: false);
+    if (effectiveFieldKeys.isEmpty) {
+      return _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'status': 'no_changes',
+          'appliedFields': const <String>[],
+          'skippedAlreadyImported': fieldKeys,
+        },
+      });
+    }
+    final effectiveFields = effectiveFieldKeys.toSet();
+    final title = _nullableTrimmed(sidecar.movie.title);
+    final originalTitle = _mdcngOriginalTitle(sidecar.movie);
+    final catalogNumber = _nullableTrimmed(sidecar.movie.catalogNumber);
+    final summary = _nullableTrimmed(sidecar.movie.plot) ??
+        _nullableTrimmed(sidecar.movie.outline);
+    if ((effectiveFields.contains('title') && title == null) ||
+        (effectiveFields.contains('originalTitle') && originalTitle == null) ||
+        (effectiveFields.contains('catalogNumber') && catalogNumber == null) ||
+        (effectiveFields.contains('summary') && summary == null)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_mdcng_selection');
+    }
+    final scalarValues = <String, String?>{
+      'title': title,
+      'originalTitle': originalTitle,
+      'catalogNumber': catalogNumber,
+      'summary': summary,
+    };
+    final currentValues = <String, String?>{
+      'title': movie.title,
+      'originalTitle': movie.originalTitle,
+      'catalogNumber': movie.catalogNumber,
+      'summary': movie.summary,
+    };
+    for (final field in scalarValues.keys) {
+      if (!effectiveFields.contains(field)) continue;
+      final current = _nullableTrimmed(currentValues[field]);
+      final proposed = scalarValues[field];
+      if (current != null &&
+          current != proposed &&
+          !overwriteFields.contains(field)) {
+        return _error(
+          request,
+          HttpStatus.conflict,
+          'mdcng_overwrite_confirmation_required',
+        );
+      }
+    }
+
+    List<String>? actorIds;
+    if (effectiveFields.contains('actors')) {
+      final resolved = <String>[];
+      for (final candidate
+          in sidecar.movie.actors.map((actor) => actor.name).toSet()) {
+        final actor = _libraryDatabase.findActiveActorByExactName(candidate);
+        if (actor == null) {
+          return _error(
+            request,
+            HttpStatus.conflict,
+            'mdcng_actor_resolution_required',
+          );
+        }
+        resolved.add(actor.id);
+      }
+      actorIds = [
+        ..._libraryDatabase.actorsForMovie(movie.id).map((actor) => actor.id),
+        ...resolved,
+      ].toSet().toList(growable: false);
+    }
+
+    List<String>? tagIds;
+    if (effectiveFields.contains('tags')) {
+      final resolved = <String>[];
+      for (final candidate in sidecar.movie.tagsAndGenres) {
+        final tag = _libraryDatabase.findActiveTagByName(candidate);
+        if (tag == null) {
+          return _error(
+            request,
+            HttpStatus.conflict,
+            'mdcng_tag_resolution_required',
+          );
+        }
+        resolved.add(tag.id);
+      }
+      tagIds = [
+        ..._libraryDatabase.tagsForMovie(movie.id).map((tag) => tag.id),
+        ...resolved,
+      ].toSet().toList(growable: false);
+    }
+
+    MdcngNfoArtwork? poster;
+    MdcngNfoArtwork? fanart;
+    for (final artwork in sidecar.artwork) {
+      if (artwork.kind == MdcngNfoArtworkKind.poster) poster = artwork;
+      if (artwork.kind == MdcngNfoArtworkKind.fanart) fanart = artwork;
+    }
+    if (effectiveFields.contains('poster') &&
+        (poster == null || movie.posterFileName != null)) {
+      return _error(
+        request,
+        HttpStatus.conflict,
+        'mdcng_poster_overwrite_not_supported',
+      );
+    }
+    if (effectiveFields.contains('fanart') && fanart == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_mdcng_selection');
+    }
+
+    String? posterFileName;
+    String? fanartFileName;
+    var committed = false;
+    try {
+      const reader = MdcngNfoSidecarReader();
+      if (poster != null && effectiveFields.contains('poster')) {
+        final bytes = await reader.readArtworkBytes(
+          video: video,
+          artwork: poster,
+        );
+        posterFileName = await _artworkService.savePoster(
+          movieId: movie.id,
+          mimeType: poster.mimeType,
+          bytes: bytes,
+        );
+      }
+      if (fanart != null && effectiveFields.contains('fanart')) {
+        final bytes = await reader.readArtworkBytes(
+          video: video,
+          artwork: fanart,
+        );
+        fanartFileName = await _artworkService.saveCarouselImage(
+          movieId: movie.id,
+          mimeType: fanart.mimeType,
+          bytes: bytes,
+        );
+      }
+      final record = _libraryDatabase.applyMdcngMetadata(
+        NasMdcngMetadataApply(
+          movieId: movie.id,
+          episodeId: episode.id,
+          nfoFileName: sidecar.nfoFileName,
+          nfoContentHash: sidecar.nfoContentHash,
+          fieldKeys: effectiveFieldKeys,
+          title: effectiveFields.contains('title') ? title : null,
+          originalTitle:
+              effectiveFields.contains('originalTitle') ? originalTitle : null,
+          catalogNumber:
+              effectiveFields.contains('catalogNumber') ? catalogNumber : null,
+          summary: effectiveFields.contains('summary') ? summary : null,
+          actorIds: effectiveFields.contains('actors') ? actorIds : null,
+          tagIds: effectiveFields.contains('tags') ? tagIds : null,
+          posterFileName:
+              effectiveFields.contains('poster') ? posterFileName : null,
+          fanartFileName:
+              effectiveFields.contains('fanart') ? fanartFileName : null,
+        ),
+      );
+      committed = true;
+      final updatedMovie = _libraryDatabase.findMovieForAdmin(movie.id)!;
+      await _writeJson(request.response, HttpStatus.ok, {
+        'data': {
+          'status': 'applied',
+          'appliedFields': effectiveFieldKeys,
+          'skippedAlreadyImported': fieldKeys
+              .where((field) => !effectiveFields.contains(field))
+              .toList(growable: false),
+          'importRecord': {
+            'id': record.id,
+            'nfoFileName': record.nfoFileName,
+            'nfoContentHash': record.nfoContentHash,
+            'createdAt': record.createdAt,
+          },
+          'movie': await _databaseDetails(updatedMovie),
+        },
+      });
+    } on MdcngNfoSidecarException {
+      if (!committed) {
+        await _deleteMdcngImportedArtwork(
+          posterFileName: posterFileName,
+          fanartFileName: fanartFileName,
+        );
+      }
+      return _error(request, HttpStatus.badRequest, 'invalid_mdcng_sidecar');
+    } on ArgumentError {
+      if (!committed) {
+        await _deleteMdcngImportedArtwork(
+          posterFileName: posterFileName,
+          fanartFileName: fanartFileName,
+        );
+      }
+      return _error(request, HttpStatus.badRequest, 'invalid_mdcng_selection');
+    } on Object {
+      if (!committed) {
+        await _deleteMdcngImportedArtwork(
+          posterFileName: posterFileName,
+          fanartFileName: fanartFileName,
+        );
+      }
+      return _error(
+          request, HttpStatus.internalServerError, 'mdcng_import_failed');
+    }
+  }
+
+  Future<void> _deleteMdcngImportedArtwork({
+    String? posterFileName,
+    String? fanartFileName,
+  }) async {
+    if (posterFileName != null) {
+      await _artworkService.deletePoster(posterFileName);
+    }
+    if (fanartFileName != null) {
+      await _artworkService.deleteCarouselImage(fanartFileName);
     }
   }
 
@@ -4173,6 +4685,40 @@ class NasHealthServer {
   static String _sourceTitle(String sourceName) {
     final dot = sourceName.lastIndexOf('.');
     return dot <= 0 ? sourceName : sourceName.substring(0, dot);
+  }
+
+  static String _sourceFileName(String relativePath) =>
+      relativePath.split('/').where((segment) => segment.isNotEmpty).last;
+
+  static String? _mdcngOriginalTitle(MdcngNfoMovie movie) {
+    final original = _nullableTrimmed(movie.originalTitle);
+    return original == _nullableTrimmed(movie.title) ? null : original;
+  }
+
+  static Map<String, Object?> _mdcngScalarFieldDiff({
+    required String key,
+    required String? currentValue,
+    required String? proposedValue,
+    required NasMovieMetadataFieldSource? source,
+  }) {
+    final current = _nullableTrimmed(currentValue);
+    final proposed = _nullableTrimmed(proposedValue);
+    final status = proposed == null
+        ? 'unavailable'
+        : current == proposed
+            ? 'unchanged'
+            : current == null
+                ? 'fill'
+                : source?.sourceKind == 'mdcng'
+                    ? 'replace_mdcng_owned'
+                    : 'replace_requires_confirmation';
+    return {
+      'key': key,
+      'status': status,
+      'currentSource': source?.sourceKind ?? 'unknown',
+      'requiresExplicitOverwrite':
+          current != null && proposed != null && current != proposed,
+    };
   }
 
   Future<void> _createScanJob(HttpRequest request) async {
@@ -4805,6 +5351,10 @@ class NasHealthServer {
     if (movie.posterFileName != null && movie.posterFileName != fileName) {
       await _artworkService.deletePoster(movie.posterFileName);
     }
+    _libraryDatabase.markMovieMetadataFieldsManual(
+      movieId: movieId,
+      fieldKeys: const ['poster'],
+    );
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {'posterUrl': '/api/v1/assets/posters/$movieId'},
     });
@@ -5377,6 +5927,26 @@ class NasHealthServer {
           'The requested episodes cannot be split from this collection.',
       'collection_migration_conflict':
           'The migration preview is stale or requires a valid metadata source.',
+      'mdcng_import_requires_single_episode':
+          'MDCNG import preview currently requires a movie with exactly one episode.',
+      'mdcng_sidecar_not_found':
+          'No MDCNG NFO matching the video file name was found next to the video.',
+      'invalid_mdcng_sidecar':
+          'The MDCNG NFO sidecar or its local artwork references are invalid.',
+      'invalid_mdcng_selection':
+          'The requested MDCNG fields are unavailable or invalid for this preview.',
+      'mdcng_preview_stale':
+          'The MDCNG NFO changed after preview; request a new preview before applying.',
+      'mdcng_overwrite_confirmation_required':
+          'Replacing an existing metadata value requires explicit confirmation.',
+      'mdcng_actor_resolution_required':
+          'One or more MDCNG actors require an existing exact actor match.',
+      'mdcng_tag_resolution_required':
+          'One or more MDCNG tags require an existing exact taxonomy tag match.',
+      'mdcng_poster_overwrite_not_supported':
+          'Replacing an existing poster is not supported by the first MDCNG apply flow.',
+      'mdcng_import_failed':
+          'The confirmed MDCNG metadata could not be applied.',
     };
     return _writeJson(request.response, statusCode, {
       'error': {'code': code, 'message': messages[code] ?? 'Request failed.'},

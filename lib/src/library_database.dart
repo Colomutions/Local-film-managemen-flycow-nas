@@ -861,8 +861,91 @@ class NasPlaybackResumeTarget {
   final int positionMs;
 }
 
+/// 单次 MDCNG 确认导入的审计记录；不保存 NFO 原文或外部 URL。
+class NasMdcngImportRecord {
+  const NasMdcngImportRecord({
+    required this.id,
+    required this.movieId,
+    required this.episodeId,
+    required this.nfoFileName,
+    required this.nfoContentHash,
+    required this.appliedFieldKeys,
+    required this.createdAt,
+  });
+
+  final String id;
+  final String movieId;
+  final String episodeId;
+  final String nfoFileName;
+  final String nfoContentHash;
+  final List<String> appliedFieldKeys;
+  final String createdAt;
+}
+
+/// 某个影片字段最近一次确认的来源。无记录即为旧数据或来源未知。
+class NasMovieMetadataFieldSource {
+  const NasMovieMetadataFieldSource({
+    required this.fieldKey,
+    required this.sourceKind,
+    this.importRecordId,
+    this.sourceContentHash,
+    required this.updatedAt,
+  });
+
+  final String fieldKey;
+  final String sourceKind;
+  final String? importRecordId;
+  final String? sourceContentHash;
+  final String updatedAt;
+}
+
+class NasMdcngMetadataApply {
+  const NasMdcngMetadataApply({
+    required this.movieId,
+    required this.episodeId,
+    required this.nfoFileName,
+    required this.nfoContentHash,
+    required this.fieldKeys,
+    this.title,
+    this.originalTitle,
+    this.catalogNumber,
+    this.summary,
+    this.actorIds,
+    this.tagIds,
+    this.posterFileName,
+    this.fanartFileName,
+  });
+
+  final String movieId;
+  final String episodeId;
+  final String nfoFileName;
+  final String nfoContentHash;
+  final List<String> fieldKeys;
+  final String? title;
+  final String? originalTitle;
+  final String? catalogNumber;
+  final String? summary;
+  final List<String>? actorIds;
+  final List<String>? tagIds;
+  final String? posterFileName;
+  final String? fanartFileName;
+}
+
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 26;
+  static const currentSchemaVersion = 27;
+  static const _metadataFieldKeys = {
+    'title',
+    'originalTitle',
+    'catalogNumber',
+    'summary',
+    'actors',
+    'tags',
+    'poster',
+    'fanart',
+    'publisher',
+    'series',
+    'category',
+  };
 
   NasLibraryDatabase(this.dataDir);
 
@@ -1521,6 +1604,41 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [26, _now()],
+      );
+    }
+    if (current < 27) {
+      // 只存导入审计与字段来源，不保存 NFO 原文、原始文件路径或外部链接。
+      _db.execute('''
+        CREATE TABLE mdcng_import_records (
+          id TEXT PRIMARY KEY,
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE RESTRICT,
+          nfo_file_name TEXT NOT NULL,
+          nfo_content_hash TEXT NOT NULL,
+          applied_fields_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX mdcng_import_records_movie_created_idx
+          ON mdcng_import_records(movie_id, created_at DESC, id DESC);
+        CREATE INDEX mdcng_import_records_episode_hash_idx
+          ON mdcng_import_records(episode_id, nfo_content_hash);
+
+        CREATE TABLE movie_metadata_field_sources (
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          field_key TEXT NOT NULL,
+          source_kind TEXT NOT NULL CHECK(source_kind IN ('manual', 'mdcng')),
+          import_record_id TEXT REFERENCES mdcng_import_records(id)
+            ON DELETE SET NULL,
+          source_content_hash TEXT,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(movie_id, field_key)
+        );
+        CREATE INDEX movie_metadata_field_sources_record_idx
+          ON movie_metadata_field_sources(import_record_id);
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [27, _now()],
       );
     }
   }
@@ -2871,6 +2989,23 @@ class NasLibraryDatabase {
     LIMIT 1
   ''', [displayName.trim()]).isNotEmpty;
 
+  /// 仅接受与任一已保存演员名称完全相等的活动演员，模糊候选必须人工处理。
+  NasActor? findActiveActorByExactName(String name) {
+    final normalized = name.trim().toLowerCase();
+    if (normalized.isEmpty) return null;
+    final matches = listActors().where((actor) {
+      final names = <String?>[
+        actor.stageName,
+        actor.originalName,
+        actor.translatedName,
+        ...actor.aliases,
+      ];
+      return names
+          .any((candidate) => candidate?.trim().toLowerCase() == normalized);
+    }).toList(growable: false);
+    return matches.length == 1 ? matches.single : null;
+  }
+
   List<NasActor> actorsForMovie(String movieId) {
     final ids = _db.select('''
       SELECT actor_id FROM movie_actor_links
@@ -4134,6 +4269,16 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _mapTag(rows.single);
   }
 
+  NasLibraryTag? findActiveTagByName(String name) {
+    final normalized = normalizeTaxonomyName(name);
+    if (normalized.isEmpty) return null;
+    final rows = _db.select('''
+      SELECT id, name, level, description, color, created_at, updated_at, archived_at
+      FROM tags WHERE normalized_name = ? AND archived_at IS NULL
+    ''', [normalized]);
+    return rows.length == 1 ? _mapTag(rows.single) : null;
+  }
+
   bool hasTagName(String name, {String? excludingId}) {
     final rows = _db.select(
       'SELECT id FROM tags WHERE normalized_name = ?',
@@ -5075,6 +5220,214 @@ class NasLibraryDatabase {
       }
     }
     return true;
+  }
+
+  Map<String, NasMovieMetadataFieldSource> metadataFieldSourcesForMovie(
+    String movieId,
+  ) {
+    final rows = _db.select('''
+      SELECT field_key, source_kind, import_record_id, source_content_hash,
+             updated_at
+      FROM movie_metadata_field_sources
+      WHERE movie_id = ?
+    ''', [movieId]);
+    return {
+      for (final row in rows)
+        row['field_key'] as String: NasMovieMetadataFieldSource(
+          fieldKey: row['field_key'] as String,
+          sourceKind: row['source_kind'] as String,
+          importRecordId: row['import_record_id'] as String?,
+          sourceContentHash: row['source_content_hash'] as String?,
+          updatedAt: row['updated_at'] as String,
+        ),
+    };
+  }
+
+  /// 由常规管理接口调用，以便后续 MDCNG 预览识别人工已确认的字段。
+  bool markMovieMetadataFieldsManual({
+    required String movieId,
+    required Iterable<String> fieldKeys,
+  }) {
+    if (findMovieForAdmin(movieId) == null) return false;
+    final normalized = fieldKeys.toSet();
+    if (normalized.isEmpty) return true;
+    if (normalized.any((field) => !_metadataFieldKeys.contains(field))) {
+      throw ArgumentError('Unsupported metadata field source.');
+    }
+    final timestamp = _now();
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      for (final fieldKey in normalized) {
+        _db.execute('''
+          INSERT INTO movie_metadata_field_sources(
+            movie_id, field_key, source_kind, import_record_id,
+            source_content_hash, updated_at
+          ) VALUES (?, ?, 'manual', NULL, NULL, ?)
+          ON CONFLICT(movie_id, field_key) DO UPDATE SET
+            source_kind = 'manual',
+            import_record_id = NULL,
+            source_content_hash = NULL,
+            updated_at = excluded.updated_at
+        ''', [movieId, fieldKey, timestamp]);
+      }
+      _db.execute('COMMIT');
+      return true;
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
+  /// 原子写入已经由管理员确认的 MDCNG 字段，并保存可追溯的来源摘要。
+  NasMdcngImportRecord applyMdcngMetadata(NasMdcngMetadataApply input) {
+    final movie = findMovieForAdmin(input.movieId);
+    final episode = findEpisode(input.episodeId);
+    final fields = input.fieldKeys.toSet();
+    if (movie == null ||
+        episode == null ||
+        episode.movieId != input.movieId ||
+        fields.isEmpty ||
+        fields.length != input.fieldKeys.length ||
+        fields.any((field) => !_metadataFieldKeys.contains(field))) {
+      throw ArgumentError('Invalid MDCNG metadata import.');
+    }
+    if ((fields.contains('title') && input.title == null) ||
+        (fields.contains('originalTitle') && input.originalTitle == null) ||
+        (fields.contains('catalogNumber') && input.catalogNumber == null) ||
+        (fields.contains('summary') && input.summary == null) ||
+        (fields.contains('actors') && input.actorIds == null) ||
+        (fields.contains('tags') && input.tagIds == null) ||
+        (fields.contains('poster') && input.posterFileName == null) ||
+        (fields.contains('fanart') && input.fanartFileName == null)) {
+      throw ArgumentError('Missing selected MDCNG metadata field.');
+    }
+    final actorIds = input.actorIds;
+    if (actorIds != null &&
+        (actorIds.toSet().length != actorIds.length ||
+            actorIds.any((id) {
+              final actor = findActor(id);
+              return actor == null || actor.archivedAt != null;
+            }))) {
+      throw ArgumentError('Invalid MDCNG actors.');
+    }
+    final tagIds = input.tagIds;
+    if (tagIds != null &&
+        (tagIds.toSet().length != tagIds.length ||
+            tagIds.any((id) {
+              final tag = findTag(id);
+              return tag == null || tag.archivedAt != null;
+            }))) {
+      throw ArgumentError('Invalid MDCNG tags.');
+    }
+
+    final timestamp = _now();
+    final record = NasMdcngImportRecord(
+      id: newUuidV4(),
+      movieId: input.movieId,
+      episodeId: input.episodeId,
+      nfoFileName: input.nfoFileName,
+      nfoContentHash: input.nfoContentHash,
+      appliedFieldKeys: input.fieldKeys,
+      createdAt: timestamp,
+    );
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      final assignments = <String>[];
+      final values = <Object?>[];
+      if (fields.contains('title')) {
+        assignments.add('title = ?');
+        values.add(input.title);
+      }
+      if (fields.contains('originalTitle')) {
+        assignments.add('original_title = ?');
+        values.add(input.originalTitle);
+      }
+      if (fields.contains('catalogNumber')) {
+        assignments.add('catalog_number = ?');
+        values.add(input.catalogNumber);
+      }
+      if (fields.contains('summary')) {
+        assignments.add('summary = ?');
+        values.add(input.summary);
+      }
+      if (fields.contains('poster')) {
+        assignments.add('poster_file_name = ?');
+        values.add(input.posterFileName);
+      }
+      assignments.add('updated_at = ?');
+      values.add(timestamp);
+      values.add(input.movieId);
+      _db.execute(
+        'UPDATE movies SET ${assignments.join(', ')} WHERE id = ?',
+        values,
+      );
+
+      if (actorIds != null) {
+        _db.execute('DELETE FROM movie_actor_links WHERE movie_id = ?',
+            [input.movieId]);
+        for (final actorId in actorIds) {
+          _db.execute(
+            'INSERT INTO movie_actor_links(movie_id, actor_id) VALUES (?, ?)',
+            [input.movieId, actorId],
+          );
+        }
+      }
+      if (tagIds != null) {
+        _db.execute(
+            'DELETE FROM movie_tag_links WHERE movie_id = ?', [input.movieId]);
+        for (final tagId in tagIds) {
+          _db.execute(
+            'INSERT INTO movie_tag_links(movie_id, tag_id) VALUES (?, ?)',
+            [input.movieId, tagId],
+          );
+        }
+      }
+
+      _db.execute('''
+        INSERT INTO mdcng_import_records(
+          id, movie_id, episode_id, nfo_file_name, nfo_content_hash,
+          applied_fields_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ''', [
+        record.id,
+        record.movieId,
+        record.episodeId,
+        record.nfoFileName,
+        record.nfoContentHash,
+        jsonEncode(record.appliedFieldKeys),
+        record.createdAt,
+      ]);
+      if (input.fanartFileName != null) {
+        _db.execute('''
+          INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at)
+          VALUES (?, ?, ?, ?)
+        ''', [newUuidV4(), input.movieId, input.fanartFileName, timestamp]);
+      }
+      for (final fieldKey in fields) {
+        _db.execute('''
+          INSERT INTO movie_metadata_field_sources(
+            movie_id, field_key, source_kind, import_record_id,
+            source_content_hash, updated_at
+          ) VALUES (?, ?, 'mdcng', ?, ?, ?)
+          ON CONFLICT(movie_id, field_key) DO UPDATE SET
+            source_kind = 'mdcng',
+            import_record_id = excluded.import_record_id,
+            source_content_hash = excluded.source_content_hash,
+            updated_at = excluded.updated_at
+        ''', [
+          input.movieId,
+          fieldKey,
+          record.id,
+          input.nfoContentHash,
+          timestamp,
+        ]);
+      }
+      _db.execute('COMMIT');
+      return record;
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
   }
 
   NasLibraryMovie? updateMoviePosterFileName({
