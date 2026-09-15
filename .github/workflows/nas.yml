@@ -1,0 +1,51 @@
+name: NAS quality gate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.2
+
+      - run: dart pub get
+      - run: dart analyze bin lib test tool
+
+      - name: Run self-contained service tests
+        shell: bash
+        run: |
+          for test_file in test/*_test.dart; do
+            dart "$test_file"
+          done
+
+      - name: Validate standard Compose configurations
+        shell: bash
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          MEDIA_ROOT_DISK1=/tmp/media-disk1 MEDIA_ROOT_DISK2=/tmp/media-disk2 \
+            docker compose -f docker-compose.yml -f docker-compose.media.dual.yml config --quiet
+          MEDIA_ROOT_DISK1=/tmp/media-disk1 MEDIA_ROOT_DISK2=/tmp/media-disk2 MDCNG_DATA_ROOT=/tmp/mdcng-config-data \
+            docker compose -f docker-compose.yml -f docker-compose.media.dual.mdcng-actors.yml config --quiet
+
+      - name: Validate fixed deployment launcher
+        shell: bash
+        run: |
+          cp .env.example .ci.env
+          printf '\nMUJING_DEPLOYMENT_MODE=dual\nMEDIA_ROOT_DISK1=/tmp/media-disk1\nMEDIA_ROOT_DISK2=/tmp/media-disk2\n' >> .ci.env
+          MUJING_ENV_FILE=.ci.env sh bin/mujing-compose config --quiet
+          printf '\nMUJING_DEPLOYMENT_MODE=dual-mdcng\nMDCNG_DATA_ROOT=/tmp/mdcng-config-data\n' >> .ci.env
+          MUJING_ENV_FILE=.ci.env sh bin/mujing-compose config --quiet
+          printf '\nMUJING_DEPLOYMENT_MODE=single-writable\nMEDIA_ROOT=/tmp/media\nMUJING_ALLOW_SOURCE_RENAME=true\n' >> .ci.env
+          MUJING_ENV_FILE=.ci.env sh bin/mujing-compose config --quiet
+
+      - name: Build NAS image
+        run: docker build --tag mujing-nas:ci .

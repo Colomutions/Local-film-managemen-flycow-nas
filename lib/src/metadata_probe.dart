@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -10,9 +11,8 @@ typedef NasProcessRunner = Future<ProcessResult> Function(
 
 class NasMediaMetadata {
   NasMediaMetadata({this.durationMs, this.width, this.height})
-    : resolutionLabel = width == null || height == null
-          ? null
-          : _label(width, height);
+      : resolutionLabel =
+            width == null || height == null ? null : _label(width, height);
 
   final int? durationMs;
   final int? width;
@@ -35,7 +35,7 @@ class NasMediaMetadata {
 class NasMediaMetadataProbe {
   const NasMediaMetadataProbe({
     this.executable = 'ffprobe',
-    this.timeout = const Duration(seconds: 20),
+    this.timeout = const Duration(seconds: 5),
     this.runner,
   });
 
@@ -46,15 +46,26 @@ class NasMediaMetadataProbe {
   Future<NasMediaMetadata?> probe(NasMediaFile media) async {
     try {
       final arguments = [
-          '-v', 'error',
-          '-select_streams', 'v:0',
-          '-show_entries', 'stream=width,height:format=duration',
-          '-of', 'json',
-          media.file.path,
-        ];
-      final result = await (runner?.call(executable, arguments) ??
-              Process.run(executable, arguments, runInShell: false))
-          .timeout(timeout);
+        '-v',
+        'error',
+        // NAS 扫描只需要首个视频流的基本信息。限制探测预算，避免损坏、
+        // 网络盘或尾部索引异常的文件让一次扫描长期阻塞。
+        '-probesize',
+        '1048576',
+        '-analyzeduration',
+        '1000000',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=width,height:format=duration',
+        '-of',
+        'json',
+        media.file.path,
+      ];
+      final result = runner == null
+          ? await _runBounded(arguments)
+          : await runner!(executable, arguments).timeout(timeout);
+      if (result == null) return null;
       if (result.exitCode != 0) return null;
       final json = jsonDecode(result.stdout as String) as Map<String, dynamic>;
       final streams = json['streams'] as List<dynamic>? ?? const [];
@@ -78,6 +89,31 @@ class NasMediaMetadataProbe {
         height: height != null && height > 0 ? height : null,
       );
     } catch (_) {
+      return null;
+    }
+  }
+
+  /// Unlike [Process.run], actively terminates ffprobe when the deadline is
+  /// reached. A timed-out probe must not remain in the background and compete
+  /// with the rest of a NAS scan for disk I/O.
+  Future<ProcessResult?> _runBounded(List<String> arguments) async {
+    final process =
+        await Process.start(executable, arguments, runInShell: false);
+    final output = Future.wait<dynamic>([
+      process.exitCode,
+      process.stdout.transform(utf8.decoder).join(),
+      process.stderr.transform(utf8.decoder).join(),
+    ]);
+    try {
+      final values = await output.timeout(timeout);
+      return ProcessResult(
+        process.pid,
+        values[0] as int,
+        values[1] as String,
+        values[2] as String,
+      );
+    } on TimeoutException {
+      process.kill();
       return null;
     }
   }

@@ -36,7 +36,13 @@ Future<void> main() async {
     _expect(info.statusCode == HttpStatus.ok, 'server-info is 200');
     _expect(serverId.isNotEmpty, 'server-info has a serverId');
     _expect(infoData['apiVersion'] == '1.0', 'server-info is Android 1.x compatible');
+    _expect(infoData['minimumClientVersion'] == '1.0.0', 'server-info declares a Windows minimum client version');
     _expect(infoData['capabilities']['movies'] == true, 'server-info declares movie capability');
+    _expect(infoData['capabilities']['playback'] == true, 'server-info declares playback capability');
+    _expect(infoData['capabilities']['watchHistory'] == true, 'server-info declares history capability');
+    _expect(infoData['capabilities']['management'] == true, 'server-info declares management capability');
+    _expect(infoData['capabilities']['mdcngActors'] == false, 'server-info hides unconfigured MDCNG actors');
+    _expect(infoData['capabilityStatus']['mdcngActors'] == 'mdcng_actor_source_not_configured', 'server-info gives MDCNG actor readiness reason');
     _expect(infoData['connection']['endpoint'] == config.advertiseUrl, 'endpoint uses explicit advertiseUrl');
     _expect(!jsonEncode(info.json).contains(dataDirectory.path), 'server-info hides paths');
 

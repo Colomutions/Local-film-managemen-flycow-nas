@@ -57,12 +57,12 @@ Future<void> main() async {
     _expect(items.length == 2, 'each paired device is listed once');
     _expect(
       items.every((item) =>
-          item.keys
-              .toSet()
-              .containsAll(const {'deviceId', 'scope', 'expiresAt'}) &&
-          item.keys.length == 3 &&
+          item.keys.toSet().containsAll(
+              const {'deviceId', 'scope', 'expiresAt', 'platform'}) &&
+          item.keys.length == 4 &&
           item['deviceId'] is String &&
           item['scope'] is String &&
+          const {'windows', 'android', 'unknown'}.contains(item['platform']) &&
           DateTime.tryParse(item['expiresAt'] as String? ?? '') != null),
       'device list contains only parseable, non-sensitive metadata',
     );

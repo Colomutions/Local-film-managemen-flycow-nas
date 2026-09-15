@@ -22,21 +22,48 @@ DeepSeek 影片资料识别仅在 Windows 本机影片编辑流程中运行。NA
 2. 复制 `.env.example` 为 `.env`，并设置 `PUID`、`PGID` 和端口。`PUID:PGID` 必须对 `./data` 有写权限；它表示容器内进程访问 NAS 文件时采用的 Linux 用户/组编号。
 3. 主编排文件只挂载 `./data:/data`。服务身份与设备令牌哈希保存在 `/data/state/server.json`；原始令牌和配对码不会写入该文件。
 
-真实媒体目录尚未确定，因此最小服务默认不挂载。启用真实媒体时，**双媒体盘是默认部署方式**：在 `.env` 设置两个已经存在的 NAS 目录：
+真实媒体目录尚未确定，因此最小服务默认不挂载。所有日常启动、构建、重启都使用唯一入口：
+
+```text
+sh bin/mujing-compose <compose 子命令>
+```
+
+它读取 `.env` 中的 `MUJING_DEPLOYMENT_MODE`，每次都携带唯一正确的基础文件和媒体/MDCNG 组合覆盖文件；不会再因为少写一个 `-f` 而丢失媒体或 MDCNG 挂载。可选模式为 `minimal`、`mdcng`、`single`、`single-mdcng`、`single-writable`、`single-writable-mdcng`、`dual`、`dual-mdcng`、`dual-writable`、`dual-writable-mdcng`。默认值为 `dual`。
+
+启用真实媒体时，**双媒体盘是默认部署方式**：在 `.env` 设置两个已经存在的 NAS 目录：
 
 ```dotenv
 MEDIA_ROOT_DISK1=/你的/NAS/媒体目录一
 MEDIA_ROOT_DISK2=/你的/NAS/媒体目录二
 MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/相对测试文件.mp4
+MUJING_DEPLOYMENT_MODE=dual
 ```
 
-然后使用双盘只读媒体覆盖文件启动：
+然后使用固定入口启动：
 
 ```text
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml up -d --build
+sh bin/mujing-compose up -d --build
 ```
 
 该覆盖文件把两个媒体目录以**只读**方式挂到容器 `/media/disk1`、`/media/disk2`。扫描只读取该目录；默认不会修改源媒体。
+
+### 默认双盘 + MDCNG 演员审核
+
+如果还要在 Windows 端使用“审核 MDCNG 演员”，请在 `.env` 取消以下三项的注释，并将 `MDCNG_DATA_ROOT` 指向 **MDCNG 的 `config/data`**（该目录必须含有 `mdc_ng.db` 与 `Actress.db`，不要指向 `config.json`）：
+
+```dotenv
+MUJING_MDCNG_SOURCE_ID=你的MDCNG或Emby实例标识
+MDCNG_DATA_ROOT=/你的/NAS/MDCNG/config/data
+MUJING_DEPLOYMENT_MODE=dual-mdcng
+```
+
+默认双盘加演员审核同样由一个部署模式固定；以后构建、重建和重启都使用**同一条命令**：
+
+```text
+sh bin/mujing-compose up -d --build
+```
+
+它会将媒体只读挂到 `/media/disk1`、`/media/disk2`，并把 MDCNG `config/data` 只读挂到 `/imports/mdcng`。缺少其中任一环境变量时，Compose 会在创建容器前拒绝启动，而不是让 Windows 端稍后出现无法播放或无法读取演员资料的错误。
 
 ### 单媒体盘（仅在明确选择时）
 
@@ -45,11 +72,12 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dua
 ```dotenv
 MEDIA_ROOT=/vol2/1000/movies
 MUJING_FIXTURE_MEDIA_RELATIVE_PATH=动漫/样片.mp4
+MUJING_DEPLOYMENT_MODE=single
 ```
 
 ```text
-sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml build --pull=false
-sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.yml up -d --force-recreate
+sudo -H sh bin/mujing-compose build --pull=false
+sudo -H sh bin/mujing-compose up -d --force-recreate
 ```
 
 单盘目录只读挂载为 `/media`。Windows 管理端创建或绑定影片类别时，选择相对于 `/media` 的子目录。双盘与单盘覆盖文件、环境变量不得混用；若明确开启 `MUJING_ALLOW_SOURCE_RENAME=true`，才可改用相应的可写覆盖文件。
@@ -58,21 +86,21 @@ sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.m
 
 ### 受控源文件改名（默认关闭）
 
-只有需要从 Windows 管理员页面执行“同目录改名”时，用户才可在 `.env` 显式设置 `MUJING_ALLOW_SOURCE_RENAME=true`，并改用 `docker-compose.media-writable.yml`，而不是只读覆盖文件：
+只有需要从 Windows 管理员页面执行“同目录改名”时，用户才可在 `.env` 显式设置 `MUJING_ALLOW_SOURCE_RENAME=true`，并将 `MUJING_DEPLOYMENT_MODE` 改为 `single-writable` 或 `dual-writable`：
 
 ```text
-sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media-writable.yml build
-sudo -H docker compose --env-file .env -f docker-compose.yml -f docker-compose.media-writable.yml up -d
+sudo -H sh bin/mujing-compose build
+sudo -H sh bin/mujing-compose up -d
 ```
 
 这是对 NAS 源媒体写入的明确风险开关：服务仍只接受当前已扫描分集的相对路径，只能同目录改名、必须保留扩展名、拒绝路径逃逸和文件名冲突；不会移动或删除文件。成功后服务在一个 SQLite 事务内更新分集路径、标题和文件元数据；数据库更新失败时会尽力回滚文件名。未启用可写覆盖或开关时，专用 API 会明确拒绝请求。不要同时使用只读和可写媒体覆盖文件。
 
 ## 启动与验证
 
-无媒体挂载的最小启动：
+无媒体挂载的最小启动：先在 `.env` 将 `MUJING_DEPLOYMENT_MODE` 改为 `minimal`，然后执行：
 
 ```text
-docker compose --env-file .env up -d --build
+sh bin/mujing-compose up -d --build
 ```
 
 健康检查：
@@ -90,7 +118,7 @@ curl http://<NAS 局域网地址>:48291/health
 以下 `dart` 命令只适用于安装了 Dart SDK 的开发机；飞牛 NAS 宿主机默认不安装 Dart，出现 `dart: command not found` 属于预期。NAS 上应使用 Docker 构建验证，Dockerfile 会在构建阶段执行 `dart pub get` 与 `dart compile exe`：
 
 ```text
-docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dual.yml build --pull=false
+sh bin/mujing-compose build --pull=false
 ```
 
 在开发机上可不依赖 Docker 运行最小测试：
@@ -99,7 +127,7 @@ docker compose --env-file .env -f docker-compose.yml -f docker-compose.media.dua
 dart test/health_server_test.dart
 ```
 
-`MUJING_ADVERTISE_URL` 可以为空。为空时已配对客户端仍可使用其手动保存的 NAS 地址，但服务不会提供连接/二维码 endpoint。确定 NAS 宿主机地址后，显式设置如 `http://192.168.1.20:48291` 并重新执行 `docker compose up -d`；服务不会从容器网卡推导地址，并会拒绝 Docker `172.16.0.0/12` 地址。
+`MUJING_ADVERTISE_URL` 可以为空。为空时已配对客户端仍可使用其手动保存的 NAS 地址，但服务不会提供连接/二维码 endpoint。确定 NAS 宿主机地址后，显式设置如 `http://192.168.1.20:48291` 并重新执行 `sh bin/mujing-compose up -d`；服务不会从容器网卡推导地址，并会拒绝 Docker `172.16.0.0/12` 地址。
 
 ## 升级、回退与异常启动
 
@@ -127,6 +155,8 @@ dart run test/startup_integrity_test.dart
 
 `viewer` 用于 Android 浏览、播放和观看状态 API；`admin` 由 Windows 管理端显式请求。所有 `/api/v1/admin/*` 路由都会拒绝 viewer 为 `403 insufficient_scope`，不会把 Android 默认升级为 admin。
 
+`capabilities` 是 NAS 端实际功能清单，而不是 token 权限的替代品。当前包含 `movies`、`playback`、`watchHistory`、`management`、`categories`、`actors`、`publishers`、`series`、`tags`、`mdcngNfo`、`mdcngActors`、`profilePackages`、`sourceRename` 和 `transcoding`。Windows 会先按此清单启用页面和操作，再按 viewer/admin scope 授权；旧档案重新连接一次即可获得清单。`capabilityStatus.mdcngActors` 只返回不含路径的状态码，用于区分未配置、目录不可达、数据库缺失或不可读。
+
 浏览 API 由 NAS SQLite 和扫描结果提供：
 
 - `GET /api/v1/movies`：返回影片摘要并支持查询译名、原名、番号、演员、简介、分类和标签；演员响应为 `{ "name": "姓名", "gender": "male|female|unknown" }` 对象数组，番号查询忽略大小写、空白、短横线和下划线。
@@ -152,7 +182,7 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/相对于媒体目录的/test.mp4
 - `DELETE /api/v1/playback/sessions/{id}`：关闭会话。
 - `GET` / `HEAD /api/v1/playback/sessions/{id}/stream`：支持无 Range 的 `200`、单 Range 的 `206` 和非法 Range 的 `416`，不把整文件读入内存。
 
-服务使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。生产环境把容器 `/media` 作为只读边界，启动时不自动扫描；在 Windows NAS 管理页创建类别并绑定其子目录后，才会显式扫描该类别中的 `mp4`、`m4v`、`mkv`、`mov` 与 `webm` 文件。类别目录不得相同、互为父子或经符号链接越出媒体根；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。`MUJING_SCAN_ON_START` 仅保留给隔离的旧测试构造，环境配置中不再启用它。
+服务使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。生产环境把容器 `/media` 作为只读边界，启动时不自动扫描；在 Windows NAS 管理页创建类别并绑定其子目录后，才会显式扫描该类别中的 `mp4`、`m4v`、`mkv`、`mov`、`webm`、`avi`、`wmv`、`flv`、`ts`、`m2ts` 与 `rmvb` 文件。类别目录不得相同、互为父子或经符号链接越出媒体根；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。`MUJING_SCAN_ON_START` 仅保留给隔离的旧测试构造，环境配置中不再启用它。
 
 扫描会通过有界 `ffprobe` 进程读取白名单媒体字段；探测失败时仍可保留影片，时长和分辨率允许为空。服务已经提供管理员 API，以及默认关闭的分集源文件同目录改名；不提供任意移动或删除源媒体的能力。生产配置始终以 SQLite 影片库为准。
 
@@ -197,7 +227,7 @@ dart run test/backups_api_test.dart
 
 ## 设备与备份
 
-- `GET /api/v1/admin/devices` 与 `DELETE /api/v1/admin/devices/{deviceId}`：仅 admin 可查看脱敏的设备 ID、scope 和过期时间，或撤销指定设备。撤销后该设备的原令牌立即失效；响应不返回令牌、令牌哈希或配对码。
+- `GET /api/v1/admin/devices` 与 `DELETE /api/v1/admin/devices/{deviceId}`：仅 admin 可查看脱敏的设备 ID、scope、受限平台值（`windows`、`android` 或 `unknown`）和过期时间，或撤销指定设备。撤销后该设备的原令牌立即失效；响应不返回令牌、令牌哈希或配对码。
 - `POST /api/v1/admin/backups`：仅 admin 可创建备份，成功返回服务生成的备份 ID、创建时间与数据大小。备份使用 SQLite `VACUUM INTO` 生成一致性快照，并复制 `/data` 内的服务身份状态、可选配置和海报资产。
 - `GET /api/v1/admin/backups` 与 `GET /api/v1/admin/backups/{id}`：仅返回备份元数据，不提供文件系统路径、备份内容下载或恢复操作。
 
@@ -210,8 +240,13 @@ bin/                  进程入口
 lib/src/              配置和健康服务
 test/                 不依赖第三方包的本地测试
 docker-compose.yml    最小服务与持久数据卷
-docker-compose.media.dual.yml  默认双盘只读媒体卷
-docker-compose.media.dual-writable.yml  两块盘的显式可写媒体卷
-docker-compose.media.yml  明确选择单盘时的只读媒体卷
-docker-compose.media-writable.yml  明确选择单盘时的可写媒体卷
+bin/mujing-compose    唯一部署入口；由 .env 选择一个完整布局
+docker-compose.media.dual.yml  双盘只读媒体卷
+docker-compose.media.dual.mdcng-actors.yml  双盘 + MDCNG 演员审核一体化只读媒体卷
+docker-compose.media.dual-writable.yml  双盘可写媒体卷
+docker-compose.media.dual-writable.mdcng-actors.yml  双盘可写 + MDCNG 演员审核卷
+docker-compose.media.yml  单盘只读媒体卷
+docker-compose.media.mdcng-actors.yml  单盘只读 + MDCNG 演员审核卷
+docker-compose.media-writable.yml  单盘可写媒体卷
+docker-compose.media-writable.mdcng-actors.yml  单盘可写 + MDCNG 演员审核卷
 ```

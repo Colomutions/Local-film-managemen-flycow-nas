@@ -293,6 +293,17 @@ void _createVersion19TaxonomyDatabase(String path) {
         end_position_ms INTEGER,
         duration_ms INTEGER
       );
+      -- v19 已包含资料实体表；此夹具只保留后续 migration 所需的列。
+      CREATE TABLE managed_assets (
+        id TEXT PRIMARY KEY,
+        purpose TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE actors (id TEXT PRIMARY KEY);
+      CREATE TABLE publishers (id TEXT PRIMARY KEY);
+      CREATE TABLE series (id TEXT PRIMARY KEY);
       CREATE TABLE tags (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,

@@ -14,6 +14,35 @@ class NasMdcngActorSource {
 
   final String dataDir;
 
+  /// A cheap readiness probe for server-info. It deliberately exposes only a
+  /// stable reason code, never the administrator's source path or file names.
+  Future<NasMdcngActorSourceAvailability> checkAvailability() async {
+    final root = Directory(dataDir);
+    if (!await root.exists()) {
+      return const NasMdcngActorSourceAvailability.unavailable(
+        'mdcng_actor_directory_unavailable',
+      );
+    }
+    final taskFile = File(_path('mdc_ng.db'));
+    final actressFile = File(_path('Actress.db'));
+    if (!await taskFile.exists() || !await actressFile.exists()) {
+      return const NasMdcngActorSourceAvailability.unavailable(
+        'mdcng_actor_database_files_missing',
+      );
+    }
+    try {
+      final taskHandle = await taskFile.open(mode: FileMode.read);
+      await taskHandle.close();
+      final actressHandle = await actressFile.open(mode: FileMode.read);
+      await actressHandle.close();
+    } on FileSystemException {
+      return const NasMdcngActorSourceAvailability.unavailable(
+        'mdcng_actor_database_files_unreadable',
+      );
+    }
+    return const NasMdcngActorSourceAvailability.available();
+  }
+
   Future<List<NasMdcngActorSourceRecord>> readCompletedActors({
     Map<String, String> selectedProfileKeys = const {},
   }) async {
@@ -326,6 +355,19 @@ class NasMdcngActorSource {
     }
     return result;
   }
+}
+
+class NasMdcngActorSourceAvailability {
+  const NasMdcngActorSourceAvailability._(this.isAvailable, this.reason);
+
+  const NasMdcngActorSourceAvailability.available()
+      : this._(true, 'available');
+
+  const NasMdcngActorSourceAvailability.unavailable(String reason)
+      : this._(false, reason);
+
+  final bool isAvailable;
+  final String reason;
 }
 
 class NasMdcngActorSourceException implements Exception {

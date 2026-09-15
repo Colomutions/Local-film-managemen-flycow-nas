@@ -1,0 +1,110 @@
+#!/bin/sh
+# A deliberately small deployment selector. It never evaluates .env, so a
+# deployment value cannot become shell input. Exactly one layout is selected.
+set -eu
+
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+env_file=${MUJING_ENV_FILE:-"$project_dir/.env"}
+
+if [ ! -f "$env_file" ]; then
+  echo "未找到部署配置：$env_file。请先复制 .env.example 为 .env。" >&2
+  exit 2
+fi
+
+read_value() {
+  awk -F= -v wanted="$1" '
+    $1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" { value = $2 }
+    END {
+      gsub(/\r/, "", value)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      print value
+    }
+  ' "$env_file"
+}
+
+deployment_mode=$(read_value MUJING_DEPLOYMENT_MODE)
+deployment_mode=${deployment_mode:-dual}
+
+require_value() {
+  value=$(read_value "$1")
+  if [ -z "$value" ]; then
+    echo "部署模式 $deployment_mode 需要在 .env 设置 $1。" >&2
+    exit 2
+  fi
+}
+
+allow_source_rename=$(read_value MUJING_ALLOW_SOURCE_RENAME)
+overlay=
+case "$deployment_mode" in
+  minimal)
+    ;;
+  mdcng)
+    require_value MDCNG_DATA_ROOT
+    overlay=docker-compose.mdcng-actors.yml
+    ;;
+  single)
+    require_value MEDIA_ROOT
+    overlay=docker-compose.media.yml
+    ;;
+  single-mdcng)
+    require_value MEDIA_ROOT
+    require_value MDCNG_DATA_ROOT
+    overlay=docker-compose.media.mdcng-actors.yml
+    ;;
+  single-writable)
+    require_value MEDIA_ROOT
+    overlay=docker-compose.media-writable.yml
+    ;;
+  single-writable-mdcng)
+    require_value MEDIA_ROOT
+    require_value MDCNG_DATA_ROOT
+    overlay=docker-compose.media-writable.mdcng-actors.yml
+    ;;
+  dual)
+    require_value MEDIA_ROOT_DISK1
+    require_value MEDIA_ROOT_DISK2
+    overlay=docker-compose.media.dual.yml
+    ;;
+  dual-mdcng)
+    require_value MEDIA_ROOT_DISK1
+    require_value MEDIA_ROOT_DISK2
+    require_value MDCNG_DATA_ROOT
+    overlay=docker-compose.media.dual.mdcng-actors.yml
+    ;;
+  dual-writable)
+    require_value MEDIA_ROOT_DISK1
+    require_value MEDIA_ROOT_DISK2
+    overlay=docker-compose.media.dual-writable.yml
+    ;;
+  dual-writable-mdcng)
+    require_value MEDIA_ROOT_DISK1
+    require_value MEDIA_ROOT_DISK2
+    require_value MDCNG_DATA_ROOT
+    overlay=docker-compose.media.dual-writable.mdcng-actors.yml
+    ;;
+  *)
+    echo "未知的 MUJING_DEPLOYMENT_MODE：$deployment_mode" >&2
+    echo "可选值：minimal、mdcng、single、single-mdcng、single-writable、single-writable-mdcng、dual、dual-mdcng、dual-writable、dual-writable-mdcng。" >&2
+    exit 2
+    ;;
+esac
+
+case "$deployment_mode" in
+  *-writable)
+    if [ "$allow_source_rename" != "true" ]; then
+      echo "可写媒体模式必须同时设置 MUJING_ALLOW_SOURCE_RENAME=true。" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    if [ "$allow_source_rename" = "true" ]; then
+      echo "MUJING_ALLOW_SOURCE_RENAME=true 只能与 *-writable 部署模式一起使用。" >&2
+      exit 2
+    fi
+    ;;
+esac
+
+if [ -n "$overlay" ]; then
+  exec docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yml" -f "$project_dir/$overlay" "$@"
+fi
+exec docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yml" "$@"

@@ -6,8 +6,12 @@ class ByteRange {
 }
 
 class ParsedByteRange {
-  const ParsedByteRange.none() : requested = false, range = null;
-  const ParsedByteRange.invalid() : requested = true, range = null;
+  const ParsedByteRange.none()
+      : requested = false,
+        range = null;
+  const ParsedByteRange.invalid()
+      : requested = true,
+        range = null;
   const ParsedByteRange.valid(this.range) : requested = true;
 
   final bool requested;
@@ -33,7 +37,9 @@ ParsedByteRange parseSingleByteRange(String? header, int length) {
   }
   final start = int.tryParse(first);
   final requestedEnd = last.isEmpty ? null : int.tryParse(last);
-  if (start == null || start < 0 || start >= length ||
+  if (start == null ||
+      start < 0 ||
+      start >= length ||
       (last.isNotEmpty && requestedEnd == null)) {
     return const ParsedByteRange.invalid();
   }
@@ -49,5 +55,10 @@ String mimeTypeForMediaPath(String path) {
   if (lower.endsWith('.mp4') || lower.endsWith('.m4v')) return 'video/mp4';
   if (lower.endsWith('.webm')) return 'video/webm';
   if (lower.endsWith('.mov')) return 'video/quicktime';
+  if (lower.endsWith('.avi')) return 'video/x-msvideo';
+  if (lower.endsWith('.wmv')) return 'video/x-ms-wmv';
+  if (lower.endsWith('.flv')) return 'video/x-flv';
+  if (lower.endsWith('.ts') || lower.endsWith('.m2ts')) return 'video/mp2t';
+  if (lower.endsWith('.rmvb')) return 'application/vnd.rn-realmedia-vbr';
   return 'video/x-matroska';
 }

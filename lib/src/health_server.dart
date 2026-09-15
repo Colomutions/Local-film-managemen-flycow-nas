@@ -724,6 +724,11 @@ class NasHealthServer {
   }
 
   Future<void> _serverInfo(HttpRequest request) async {
+    final mdcngActorAvailability = _mdcngActorSource == null
+        ? const NasMdcngActorSourceAvailability.unavailable(
+            'mdcng_actor_source_not_configured',
+          )
+        : await _mdcngActorSource.checkAvailability();
     final data = <String, Object>{
       'serverId': _state!.serverId,
       'serverName': config.serverName,
@@ -732,8 +737,22 @@ class NasHealthServer {
       'pairingRequired': true,
       'capabilities': {
         'movies': true,
+        'playback': true,
+        'watchHistory': true,
         'transcoding': false,
         'management': true,
+        'categories': true,
+        'actors': true,
+        'publishers': true,
+        'series': true,
+        'tags': true,
+        'mdcngNfo': true,
+        'mdcngActors': mdcngActorAvailability.isAvailable,
+        'profilePackages': true,
+        'sourceRename': config.allowSourceRename,
+      },
+      'capabilityStatus': {
+        'mdcngActors': mdcngActorAvailability.reason,
       },
       'pairingScopes': const ['viewer', 'admin'],
     };
@@ -6597,17 +6616,22 @@ class NasHealthServer {
     required int durationMs,
     required String purpose,
   }) async {
-    final databaseResumePositionMs = purpose == 'preview'
-        ? 0
-        : _libraryDatabase.resumePositionMsForEpisode(
+    final persistedProgress = purpose == 'preview'
+        ? null
+        : _libraryDatabase.playbackProgressForEpisode(
             movieId: movieId,
             episodeId: episodeId,
           );
-    final resumePositionMs = databaseResumePositionMs > 0
-        ? databaseResumePositionMs
+    final resumePositionMs = (persistedProgress?.positionMs ?? 0) > 0
+        ? persistedProgress!.positionMs
         : purpose == 'playback'
             ? _fixturePlaybackState?.positionMs ?? 0
             : 0;
+    final persistedDurationMs = persistedProgress?.durationMs;
+    final sessionDurationMs =
+        persistedDurationMs != null && persistedDurationMs > 0
+            ? persistedDurationMs
+            : durationMs;
     final sessionId = newUuidV4();
     _playbackSessions[sessionId] = _PlaybackSession(
       tokenHash: tokenHash,
@@ -6618,7 +6642,7 @@ class NasHealthServer {
       episodeId: episodeId,
       mediaRootId: mediaRootId,
       purpose: purpose,
-      durationMs: durationMs,
+      durationMs: sessionDurationMs,
     );
     _logger.event('playback.session.create', fields: {
       'component': 'nas.playback',
@@ -6632,7 +6656,7 @@ class NasHealthServer {
         'sessionId': sessionId,
         'episodeId': episodeId,
         'resumePositionMs': resumePositionMs,
-        'durationMs': durationMs,
+        'durationMs': sessionDurationMs,
         'playbackVariants': [
           {
             'type': 'direct',

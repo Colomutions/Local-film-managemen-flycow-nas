@@ -26,6 +26,9 @@ mujing-nas/
 ├─ .env.example
 ├─ docker-compose.yml
 ├─ docker-compose.media.yml
+├─ docker-compose.media.dual.yml
+├─ docker-compose.media.dual.mdcng-actors.yml
+├─ bin/mujing-compose
 ├─ Dockerfile
 ├─ pubspec.yaml
 └─ pubspec.lock
@@ -102,6 +105,7 @@ MUJING_MEDIA_ROOT_NAME=媒体库
 MUJING_SCAN_ON_START=false
 MUJING_TIMEZONE=Asia/Shanghai
 
+MUJING_DEPLOYMENT_MODE=dual
 MEDIA_ROOT_DISK1=/NAS内部真实媒体目录一
 MEDIA_ROOT_DISK2=/NAS内部真实媒体目录二
 # MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
@@ -113,6 +117,7 @@ MEDIA_ROOT_DISK2=/NAS内部真实媒体目录二
 - `MUJING_ADVERTISE_URL` 必须是纯 URL，不要填写 `[地址](地址)`。
 - 配对码只能保存在 `.env`，不要写进文档、截图、聊天或 Git。
 - 默认双盘的 `MEDIA_ROOT_DISK1`、`MEDIA_ROOT_DISK2` 是 NAS 内部绝对路径，不能写 Windows 的 `\\NAS\共享目录`。
+- `MUJING_DEPLOYMENT_MODE` 是唯一的部署选择。以后每次启动、重建、更新都通过 `sh bin/mujing-compose` 读取它，不能再手写或混搭 Compose 覆盖文件。
 - fixture 必须相对于容器 `/media`，双盘时以 `disk1/` 或 `disk2/` 开头，不能再次填写完整绝对路径。
 
 例如：
@@ -148,13 +153,19 @@ sudo docker tag registry.example.com/mirror/debian:bookworm-slim debian:bookworm
 
 第一次不要启用媒体覆盖，先确认容器、端口、SQLite 和 `/data` 正常：
 
+先在 `.env` 把部署模式临时改为：
+
+```dotenv
+MUJING_DEPLOYMENT_MODE=minimal
+```
+
 ```bash
 cd /vol2/1000/docker/mujing-nas
 
-sudo docker compose --env-file .env config
-sudo docker compose --env-file .env build --pull=false
-sudo docker compose --env-file .env up -d
-sudo docker compose ps
+sudo sh bin/mujing-compose config
+sudo sh bin/mujing-compose build --pull=false
+sudo sh bin/mujing-compose up -d
+sudo sh bin/mujing-compose ps
 ```
 
 刚启动时可能显示 `health: starting`，约 30 秒后应变为 `healthy`。
@@ -180,7 +191,7 @@ http://NAS局域网地址:48291/health
 容器不停重启时查看：
 
 ```bash
-sudo docker compose ps
+sudo sh bin/mujing-compose ps
 sudo docker logs --tail=100 mujing-nas
 ```
 
@@ -202,7 +213,7 @@ http://NAS局域网地址:48291/api/v1/server-info
 重建后再次查询，`serverId` 必须保持：
 
 ```bash
-sudo docker compose --env-file .env up -d --force-recreate
+sudo sh bin/mujing-compose up -d --force-recreate
 ```
 
 稳定身份保存在 `./data`，不要删除这个目录。
@@ -223,6 +234,7 @@ ls -l "/NAS内部真实媒体目录一/相对测试文件"
 MEDIA_ROOT_DISK1=/vol2/1000/first movies
 MEDIA_ROOT_DISK2=/vol1/1000/second movies
 MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
+MUJING_DEPLOYMENT_MODE=dual
 ```
 
 设置后，默认使用双盘 Compose 覆盖文件：
@@ -230,15 +242,8 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/动漫/样片.mp4
 ```bash
 cd /vol2/1000/docker/mujing-nas
 
-sudo docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
-  config
-
-sudo docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
-  up -d --force-recreate
+sudo sh bin/mujing-compose config
+sudo sh bin/mujing-compose up -d --force-recreate
 ```
 
 检查挂载：
@@ -258,7 +263,25 @@ sudo docker inspect mujing-nas \
 
 `RW=false` 表示媒体只读。
 
-重要：启用媒体后，以后每次构建、创建、重建或重启容器都必须同时带上 `docker-compose.media.dual.yml`。如果只执行基础 `docker compose up`，新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
+重要：启用媒体后，`MUJING_DEPLOYMENT_MODE=dual` 会被固定入口保留在每次构建、创建、重建或重启中。不要绕过 `sh bin/mujing-compose` 直接执行基础 `docker compose up`，否则新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
+
+### 默认双盘 + MDCNG 演员审核
+
+若要使用 Windows 端的“审核 MDCNG 演员”，在 `.env` 设置：
+
+```dotenv
+MUJING_MDCNG_SOURCE_ID=你的MDCNG或Emby实例标识
+MDCNG_DATA_ROOT=/volX/用户ID/docker/mdcng/config/data
+MUJING_DEPLOYMENT_MODE=dual-mdcng
+```
+
+`MDCNG_DATA_ROOT` 必须是实际含有 `mdc_ng.db` 和 `Actress.db` 的 `config/data` 目录；不要填 MDCNG 工程根目录，也不要挂载包含账户配置的 `config.json`。启用后只要把模式设为 `dual-mdcng`：
+
+```bash
+sudo sh bin/mujing-compose up -d --force-recreate
+```
+
+之后每次更新、重建或重启都使用这一条入口。模式需要的环境变量遗漏时，启动会在创建容器前失败；不要用基础 `docker compose up` 替代。
 
 ### 单媒体盘（仅在明确选择时）
 
@@ -267,27 +290,21 @@ sudo docker inspect mujing-nas \
 ```dotenv
 MEDIA_ROOT=/vol2/1000/movies
 MUJING_FIXTURE_MEDIA_RELATIVE_PATH=动漫/样片.mp4
+MUJING_DEPLOYMENT_MODE=single
 ```
 
 使用单盘只读覆盖文件：
 
 ```bash
-sudo -H docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.yml \
-  config
-
-sudo -H docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.yml \
-  up -d --build --force-recreate
+sudo -H sh bin/mujing-compose config
+sudo -H sh bin/mujing-compose up -d --build --force-recreate
 ```
 
-单盘在容器内固定为 `/media`。Windows 端绑定类别时，填写相对于 `/media` 的子目录；后续每次重建也必须继续带上同一个单盘覆盖文件。若启用源文件改名，改用 `docker-compose.media-writable.yml`，同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`，且不能与只读单盘文件混用。
+单盘在容器内固定为 `/media`。Windows 端绑定类别时，填写相对于 `/media` 的子目录；后续每次重建仍使用固定入口。若启用源文件改名，把模式改为 `single-writable`，同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`；入口会拒绝只读模式与该开关的错误组合。
 
 从单盘切换到默认双盘后，已有数据库路径不会自动补上 `disk1/` 或 `disk2/`。不要删除 `data`；在 Windows 管理端将原分类重新绑定到对应 `disk1/子目录` 或 `disk2/子目录` 并重新扫描即可。
 
-普通部署应保持上述只读模式。如果确实需要在 Windows 管理端同步修改分集源文件名，仓库另有 `docker-compose.media-writable.yml`，且必须同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`。这是独立的高风险选择，不能与只读覆盖混用；启用前先备份，并完整阅读根目录 README 的“受控源文件改名”说明。
+普通部署应保持上述只读模式。如果确实需要在 Windows 管理端同步修改分集源文件名，把模式改为 `single-writable` 或 `dual-writable`，且必须同时设置 `MUJING_ALLOW_SOURCE_RENAME=true`。这是独立的高风险选择；启用前先备份，并完整阅读根目录 README 的“受控源文件改名”说明。
 
 ## 9. 首次建立影片类别并扫描
 
@@ -330,10 +347,7 @@ permission denied while trying to connect to /var/run/docker.sock
 不要修改 Docker socket 权限，也不要把普通用户加入 Docker 用户组。使用管理员身份构建：
 
 ```bash
-sudo -H docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
-  build --pull=false
+sudo -H sh bin/mujing-compose build --pull=false
 ```
 
 ### Docker CLI 无法创建用户 Home 目录
@@ -348,10 +362,7 @@ mkdir /home/<用户>: permission denied
 mkdir -p /tmp/mujing-docker-config
 
 HOME=/tmp DOCKER_CONFIG=/tmp/mujing-docker-config \
-docker compose --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
-  build --pull=false
+sh bin/mujing-compose build --pull=false
 ```
 
 `/tmp/mujing-docker-config` 是本项目唯一建议创建的临时目录；正式部署前可由管理员删除该**精确目录**，不要删除整个 `/tmp`。它不包含项目数据、媒体、SQLite、海报、轮播图或 `.env`。
@@ -362,7 +373,7 @@ docker compose --env-file .env \
 dart: command not found
 ```
 
-这是预期行为。Dart SDK 只存在于 Dockerfile 的构建阶段；用上面的 `docker compose ... build --pull=false` 编译验证，不在 NAS 宿主机运行 `dart format`、`dart analyze` 或 `dart run test`。
+这是预期行为。Dart SDK 只存在于 Dockerfile 的构建阶段；用上面的 `sh bin/mujing-compose build --pull=false` 编译验证，不在 NAS 宿主机运行 `dart format`、`dart analyze` 或 `dart run test`。
 
 ### `sqlite3` Dart 包找不到
 
@@ -385,7 +396,7 @@ Failed to load dynamic library 'libsqlite3.so'
 依次检查：
 
 1. fixture 是否为相对路径；
-2. 是否使用了 `docker-compose.media.dual.yml`；
+2. `.env` 是否为正确的 `MUJING_DEPLOYMENT_MODE`（默认双盘是 `dual`）；
 3. `/media/disk1`、`/media/disk2` 是否存在且为 `RW=false`；
 4. 容器用户是否能读取测试文件；
 5. 修改 `.env` 后是否重新创建容器。
@@ -399,7 +410,7 @@ Failed to load dynamic library 'libsqlite3.so'
 先停止 Android 播放重试，再检查：
 
 ```bash
-sudo docker compose ps
+sudo sh bin/mujing-compose ps
 sudo docker stats --no-stream mujing-nas
 sudo docker logs --tail=100 mujing-nas
 ```
@@ -407,11 +418,7 @@ sudo docker logs --tail=100 mujing-nas
 必要时重启容器，`restart` 不会删除 `data`：
 
 ```bash
-sudo docker compose \
-  --env-file .env \
-  -f docker-compose.yml \
-  -f docker-compose.media.dual.yml \
-  restart
+sudo sh bin/mujing-compose restart
 ```
 
 ## 12. 升级和备份

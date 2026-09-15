@@ -4,8 +4,30 @@ import 'dart:io';
 import '../lib/mujing_nas.dart';
 
 Future<void> main() async {
-  final directory = await Directory.systemTemp.createTemp('mujing-nas-range-test-');
-  final mediaRoot = Directory('${directory.path}${Platform.pathSeparator}media');
+  const mediaTypes = <String, String>{
+    'sample.mp4': 'video/mp4',
+    'sample.m4v': 'video/mp4',
+    'sample.mkv': 'video/x-matroska',
+    'sample.mov': 'video/quicktime',
+    'sample.webm': 'video/webm',
+    'sample.avi': 'video/x-msvideo',
+    'sample.wmv': 'video/x-ms-wmv',
+    'sample.flv': 'video/x-flv',
+    'sample.ts': 'video/mp2t',
+    'sample.m2ts': 'video/mp2t',
+    'sample.rmvb': 'application/vnd.rn-realmedia-vbr',
+  };
+  for (final entry in mediaTypes.entries) {
+    _expect(
+      mimeTypeForMediaPath(entry.key) == entry.value,
+      'media type is correct for ${entry.key}',
+    );
+  }
+
+  final directory =
+      await Directory.systemTemp.createTemp('mujing-nas-range-test-');
+  final mediaRoot =
+      Directory('${directory.path}${Platform.pathSeparator}media');
   final mediaFile = File(
     '${mediaRoot.path}${Platform.pathSeparator}fixture${Platform.pathSeparator}sample.mp4',
   );
@@ -54,12 +76,16 @@ Future<void> main() async {
       '/api/v1/movies/$movieId',
       token: token,
     );
-    final episode = ((details.json['data'] as Map<String, dynamic>)['episodes'] as List<dynamic>).single
-        as Map<String, dynamic>;
-    _expect(episode['isAvailable'] == true, 'configured media file is available');
+    final episode = ((details.json['data'] as Map<String, dynamic>)['episodes']
+            as List<dynamic>)
+        .single as Map<String, dynamic>;
+    _expect(
+        episode['isAvailable'] == true, 'configured media file is available');
 
-    final noTokenSession = await _request(baseUrl, 'POST', '/api/v1/playback/sessions');
-    _expectError(noTokenSession, HttpStatus.unauthorized, 'authentication_required');
+    final noTokenSession =
+        await _request(baseUrl, 'POST', '/api/v1/playback/sessions');
+    _expectError(
+        noTokenSession, HttpStatus.unauthorized, 'authentication_required');
     final playback = await _request(
       baseUrl,
       'POST',
@@ -67,7 +93,8 @@ Future<void> main() async {
       token: token,
       body: {'contentId': movieId, 'preferredPlayback': 'direct'},
     );
-    _expect(playback.statusCode == HttpStatus.ok, 'viewer creates playback session');
+    _expect(playback.statusCode == HttpStatus.ok,
+        'viewer creates playback session');
     final playbackData = playback.json['data'] as Map<String, dynamic>;
     final sessionId = playbackData['sessionId'] as String;
     _expect(
@@ -83,8 +110,10 @@ Future<void> main() async {
       token: token,
     );
     _expect(full.statusCode == HttpStatus.ok, 'full GET returns 200');
-    _expect(full.headers[HttpHeaders.acceptRangesHeader] == 'bytes', 'full GET advertises ranges');
-    _expect(full.bytes.toString() == expectedBytes.toString(), 'full GET streams file bytes');
+    _expect(full.headers[HttpHeaders.acceptRangesHeader] == 'bytes',
+        'full GET advertises ranges');
+    _expect(full.bytes.toString() == expectedBytes.toString(),
+        'full GET streams file bytes');
 
     final started = await _request(
       baseUrl,
@@ -92,15 +121,18 @@ Future<void> main() async {
       '/api/v1/playback/sessions/$sessionId/started',
       token: token,
     );
-    _expect(started.statusCode == HttpStatus.ok, 'formal playback start is accepted');
+    _expect(started.statusCode == HttpStatus.ok,
+        'formal playback start is accepted');
     final repeatedStarted = await _request(
       baseUrl,
       'POST',
       '/api/v1/playback/sessions/$sessionId/started',
       token: token,
     );
-    _expect(repeatedStarted.statusCode == HttpStatus.ok, 'repeated start is idempotent');
-    final afterStart = await _request(baseUrl, 'GET', '/api/v1/movies', token: token);
+    _expect(repeatedStarted.statusCode == HttpStatus.ok,
+        'repeated start is idempotent');
+    final afterStart =
+        await _request(baseUrl, 'GET', '/api/v1/movies', token: token);
     _expect(
       ((afterStart.json['data'] as Map<String, dynamic>)['items'].single
               as Map<String, dynamic>)['playCount'] ==
@@ -115,10 +147,14 @@ Future<void> main() async {
       token: token,
       range: 'bytes=10-19',
     );
-    _expect(headRange.statusCode == HttpStatus.partialContent, 'HEAD range returns 206');
+    _expect(headRange.statusCode == HttpStatus.partialContent,
+        'HEAD range returns 206');
     _expect(headRange.bytes.isEmpty, 'HEAD range has no body');
-    _expect(headRange.headers[HttpHeaders.contentRangeHeader] == 'bytes 10-19/64', 'HEAD has Content-Range');
-    _expect(headRange.headers[HttpHeaders.contentLengthHeader] == '10', 'HEAD has ranged Content-Length');
+    _expect(
+        headRange.headers[HttpHeaders.contentRangeHeader] == 'bytes 10-19/64',
+        'HEAD has Content-Range');
+    _expect(headRange.headers[HttpHeaders.contentLengthHeader] == '10',
+        'HEAD has ranged Content-Length');
 
     final suffixRange = await _request(
       baseUrl,
@@ -127,8 +163,10 @@ Future<void> main() async {
       token: token,
       range: 'bytes=-3',
     );
-    _expect(suffixRange.statusCode == HttpStatus.partialContent, 'suffix range returns 206');
-    _expect(suffixRange.bytes.toString() == [61, 62, 63].toString(), 'suffix range streams final bytes');
+    _expect(suffixRange.statusCode == HttpStatus.partialContent,
+        'suffix range returns 206');
+    _expect(suffixRange.bytes.toString() == [61, 62, 63].toString(),
+        'suffix range streams final bytes');
 
     final invalidRange = await _request(
       baseUrl,
@@ -137,8 +175,11 @@ Future<void> main() async {
       token: token,
       range: 'bytes=64-65',
     );
-    _expect(invalidRange.statusCode == HttpStatus.requestedRangeNotSatisfiable, 'invalid range returns 416');
-    _expect(invalidRange.headers[HttpHeaders.contentRangeHeader] == 'bytes */64', '416 includes file length');
+    _expect(invalidRange.statusCode == HttpStatus.requestedRangeNotSatisfiable,
+        'invalid range returns 416');
+    _expect(
+        invalidRange.headers[HttpHeaders.contentRangeHeader] == 'bytes */64',
+        '416 includes file length');
 
     final progress = await _request(
       baseUrl,
@@ -155,8 +196,10 @@ Future<void> main() async {
       token: token,
       body: {'contentId': movieId},
     );
-    _expect(resumed.json['data']['resumePositionMs'] == 45000, 'next session resumes saved position');
-    _expect(resumed.json['data']['durationMs'] == 100000, 'next session keeps saved duration');
+    _expect(resumed.json['data']['resumePositionMs'] == 45000,
+        'next session resumes saved position');
+    _expect(resumed.json['data']['durationMs'] == 100000,
+        'next session keeps saved duration');
 
     final preview = await _request(
       baseUrl,
@@ -169,9 +212,11 @@ Future<void> main() async {
         'purpose': 'preview',
       },
     );
-    _expect(preview.statusCode == HttpStatus.ok, 'preview creates an isolated NAS stream session');
+    _expect(preview.statusCode == HttpStatus.ok,
+        'preview creates an isolated NAS stream session');
     final previewData = preview.json['data'] as Map<String, dynamic>;
-    _expect(previewData['resumePositionMs'] == 0, 'preview never resumes formal playback state');
+    _expect(previewData['resumePositionMs'] == 0,
+        'preview never resumes formal playback state');
     final previewStream = await _request(
       baseUrl,
       'GET',
@@ -179,7 +224,8 @@ Future<void> main() async {
       token: token,
       range: 'bytes=0-9',
     );
-    _expect(previewStream.statusCode == HttpStatus.partialContent, 'preview uses the NAS Range stream');
+    _expect(previewStream.statusCode == HttpStatus.partialContent,
+        'preview uses the NAS Range stream');
     final previewProgress = await _request(
       baseUrl,
       'PATCH',
@@ -187,14 +233,16 @@ Future<void> main() async {
       token: token,
       body: {'positionMs': 8, 'durationMs': 100000, 'state': 'playing'},
     );
-    _expect(previewProgress.statusCode == HttpStatus.ok, 'preview progress is ignored without failing playback');
+    _expect(previewProgress.statusCode == HttpStatus.ok,
+        'preview progress is ignored without failing playback');
     await _request(
       baseUrl,
       'DELETE',
       '/api/v1/playback/sessions/${previewData['sessionId']}',
       token: token,
     );
-    final afterPreview = await _request(baseUrl, 'GET', '/api/v1/movies', token: token);
+    final afterPreview =
+        await _request(baseUrl, 'GET', '/api/v1/movies', token: token);
     _expect(
       ((afterPreview.json['data'] as Map<String, dynamic>)['items'].single
               as Map<String, dynamic>)['playCount'] ==
@@ -219,7 +267,8 @@ Future<void> main() async {
 
     var pathRejected = false;
     try {
-      NasConfig.fromEnvironment({'MUJING_FIXTURE_MEDIA_RELATIVE_PATH': '../outside.mp4'});
+      NasConfig.fromEnvironment(
+          {'MUJING_FIXTURE_MEDIA_RELATIVE_PATH': '../outside.mp4'});
     } on ArgumentError {
       pathRejected = true;
     }
@@ -237,13 +286,24 @@ Future<void> main() async {
       token: adminToken,
       body: {'sourceName': 'renamed.mp4'},
     );
-    _expect(sourceRename.statusCode == HttpStatus.ok, 'admin can rename a source file in place');
-    _expect(sourceRename.json['data']['title'] == 'renamed', 'source rename updates NAS episode title');
-    _expect(await File('${mediaFile.parent.path}${Platform.pathSeparator}renamed.mp4').exists(), 'source file is renamed in the same directory');
-    _expect(!await mediaFile.exists(), 'original source file name is removed by rename');
-    final renamedDetails = await _request(baseUrl, 'GET', '/api/v1/movies/$movieId', token: token);
+    _expect(sourceRename.statusCode == HttpStatus.ok,
+        'admin can rename a source file in place');
+    _expect(sourceRename.json['data']['title'] == 'renamed',
+        'source rename updates NAS episode title');
     _expect(
-      ((renamedDetails.json['data'] as Map<String, dynamic>)['episodes'] as List).single['title'] == 'renamed',
+        await File(
+                '${mediaFile.parent.path}${Platform.pathSeparator}renamed.mp4')
+            .exists(),
+        'source file is renamed in the same directory');
+    _expect(!await mediaFile.exists(),
+        'original source file name is removed by rename');
+    final renamedDetails =
+        await _request(baseUrl, 'GET', '/api/v1/movies/$movieId', token: token);
+    _expect(
+      ((renamedDetails.json['data'] as Map<String, dynamic>)['episodes']
+                  as List)
+              .single['title'] ==
+          'renamed',
       'rename persists updated NAS SQLite episode metadata',
     );
     final extensionRejected = await _request(
@@ -253,7 +313,8 @@ Future<void> main() async {
       token: adminToken,
       body: {'sourceName': 'renamed.mkv'},
     );
-    _expectError(extensionRejected, HttpStatus.badRequest, 'invalid_source_name');
+    _expectError(
+        extensionRejected, HttpStatus.badRequest, 'invalid_source_name');
   } finally {
     await server.stop();
     await directory.delete(recursive: true);
@@ -262,14 +323,16 @@ Future<void> main() async {
   stdout.writeln('range_api_test: PASS');
 }
 
-Future<String> _pairViewer(Uri baseUrl, String serverId, String pairingCode) async {
+Future<String> _pairViewer(
+    Uri baseUrl, String serverId, String pairingCode) async {
   final session = await _request(
     baseUrl,
     'POST',
     '/api/v1/pairing/sessions',
     body: {'serverId': serverId},
   );
-  final sessionId = (session.json['data'] as Map<String, dynamic>)['pairingSessionId'] as String;
+  final sessionId = (session.json['data']
+      as Map<String, dynamic>)['pairingSessionId'] as String;
   final confirmed = await _request(
     baseUrl,
     'POST',
@@ -279,14 +342,16 @@ Future<String> _pairViewer(Uri baseUrl, String serverId, String pairingCode) asy
   return confirmed.json['data']['accessToken'] as String;
 }
 
-Future<String> _pairAdmin(Uri baseUrl, String serverId, String pairingCode) async {
+Future<String> _pairAdmin(
+    Uri baseUrl, String serverId, String pairingCode) async {
   final session = await _request(
     baseUrl,
     'POST',
     '/api/v1/pairing/sessions',
     body: {'serverId': serverId, 'requestedScope': 'admin'},
   );
-  final sessionId = (session.json['data'] as Map<String, dynamic>)['pairingSessionId'] as String;
+  final sessionId = (session.json['data']
+      as Map<String, dynamic>)['pairingSessionId'] as String;
   final confirmed = await _request(
     baseUrl,
     'POST',
@@ -307,14 +372,16 @@ Future<_Response> _request(
   final client = HttpClient();
   try {
     final request = await client.openUrl(method, baseUrl.resolve(path));
-    if (token != null) request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+    if (token != null)
+      request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
     if (range != null) request.headers.set(HttpHeaders.rangeHeader, range);
     if (body != null) {
       request.headers.contentType = ContentType.json;
       request.write(jsonEncode(body));
     }
     final response = await request.close();
-    final bytes = await response.fold<List<int>>(<int>[], (all, chunk) => all..addAll(chunk));
+    final bytes = await response
+        .fold<List<int>>(<int>[], (all, chunk) => all..addAll(chunk));
     final contentType = response.headers.contentType?.mimeType;
     final json = contentType == 'application/json' && bytes.isNotEmpty
         ? jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>

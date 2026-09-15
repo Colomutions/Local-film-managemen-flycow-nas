@@ -37,6 +37,17 @@ Future<void> main() async {
         'legacy-record', 'legacy-movie', 'legacy-episode',
         '2026-09-01T10:00:00.000Z', '2026-09-01T10:02:00.000Z', 120000, 300000
       );
+      -- v23 已包含资料实体与资产表；保留 migration 26/28 所需结构。
+      CREATE TABLE managed_assets (
+        id TEXT PRIMARY KEY,
+        purpose TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE actors (id TEXT PRIMARY KEY);
+      CREATE TABLE publishers (id TEXT PRIMARY KEY);
+      CREATE TABLE series (id TEXT PRIMARY KEY);
     ''');
   } finally {
     legacy.dispose();

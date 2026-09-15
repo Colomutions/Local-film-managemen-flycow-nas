@@ -12,6 +12,21 @@ Future<void> main() async {
       '${mediaRoot.path}${Platform.pathSeparator}真人${Platform.pathSeparator}sample.mp4');
   await video.parent.create(recursive: true);
   await video.writeAsBytes(List<int>.generate(8, (index) => index));
+  for (final extension in const [
+    'm4v',
+    'mkv',
+    'mov',
+    'webm',
+    'avi',
+    'wmv',
+    'flv',
+    'ts',
+    'm2ts',
+    'rmvb',
+  ]) {
+    await File('${video.parent.path}${Platform.pathSeparator}sample.$extension')
+        .writeAsBytes(List<int>.generate(8, (index) => index));
+  }
   final config = NasConfig(
     bindHost: '127.0.0.1',
     port: 0,
@@ -33,9 +48,15 @@ Future<void> main() async {
     final token = await _pair(base,
         (info.json['data'] as Map<String, dynamic>)['serverId'] as String);
     final movies = await _request(base, 'GET', '/api/v1/movies', token: token);
-    final item = ((movies.json['data'] as Map<String, dynamic>)['items']
+    final items = ((movies.json['data'] as Map<String, dynamic>)['items']
             as List<dynamic>)
-        .single as Map<String, dynamic>;
+        .cast<Map<String, dynamic>>();
+    _expect(
+        items.length == 11, 'scanner indexes every supported video container');
+    final item = items.firstWhere(
+      (item) => item['title'] == 'sample',
+      orElse: () => throw StateError('mp4 sample was not indexed'),
+    );
     _expect(item['title'] == 'sample',
         'API reads scanned SQLite movie, not memory fixture');
     _expect(!jsonEncode(item).contains(mediaRoot.path),

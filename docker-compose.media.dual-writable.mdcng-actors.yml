@@ -1,0 +1,17 @@
+services:
+  mujing-nas:
+    environment:
+      MUJING_MDCNG_DATA_DIR: /imports/mdcng
+    volumes:
+      - type: bind
+        source: ${MEDIA_ROOT_DISK1:?Set MEDIA_ROOT_DISK1 in .env before enabling the dual writable-media MDCNG overlay.}
+        target: /media/disk1
+        read_only: false
+      - type: bind
+        source: ${MEDIA_ROOT_DISK2:?Set MEDIA_ROOT_DISK2 in .env before enabling the dual writable-media MDCNG overlay.}
+        target: /media/disk2
+        read_only: false
+      - type: bind
+        source: ${MDCNG_DATA_ROOT:?Set MDCNG_DATA_ROOT to MDCNG config/data in .env.}
+        target: /imports/mdcng
+        read_only: true

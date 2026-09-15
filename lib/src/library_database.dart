@@ -877,6 +877,18 @@ class NasPlaybackResumeTarget {
   final int positionMs;
 }
 
+/// 单个分集持久化的续播进度；位置和总时长必须成对读取，避免续播会话
+/// 使用了旧的媒体探测时长。
+class NasEpisodePlaybackProgress {
+  const NasEpisodePlaybackProgress({
+    required this.positionMs,
+    required this.durationMs,
+  });
+
+  final int positionMs;
+  final int durationMs;
+}
+
 /// 单次 MDCNG 确认导入的审计记录；不保存 NFO 原文或外部 URL。
 class NasMdcngImportRecord {
   const NasMdcngImportRecord({
@@ -973,7 +985,7 @@ class NasMdcngMetadataApply {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 29;
+  static const currentSchemaVersion = 30;
   static const _metadataFieldKeys = {
     'title',
     'originalTitle',
@@ -1761,6 +1773,29 @@ class NasLibraryDatabase {
         [29, _now()],
       );
     }
+    if (current < 30) {
+      // A failed ffprobe is still a completed attempt. Without this marker an
+      // unsupported or damaged file would be probed on every later scan.
+      final hasEpisodesTable = _db
+          .select(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'episodes'",
+          )
+          .isNotEmpty;
+      if (hasEpisodesTable) {
+        _db.execute('''
+          ALTER TABLE episodes ADD COLUMN metadata_probed_at TEXT;
+          UPDATE episodes
+          SET metadata_probed_at = updated_at
+          WHERE duration_ms IS NOT NULL
+             OR video_width IS NOT NULL
+             OR video_height IS NOT NULL;
+        ''');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [30, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -1870,36 +1905,37 @@ class NasLibraryDatabase {
         WHERE movie_id IN (SELECT id FROM movies WHERE category_id = ?)
       ''', [_now(), categoryId]);
     }
-    final canonicalRoot = await root.resolveSymbolicLinks();
-    final prefix = canonicalRoot.endsWith(Platform.pathSeparator)
-        ? canonicalRoot
-        : '$canonicalRoot${Platform.pathSeparator}';
+    // `followLinks: false` guarantees that a listed [File] is not a symbolic
+    // link. Deriving the relative path from this already-enumerated directory
+    // avoids resolving the media root and every file again, which is very
+    // expensive on a mounted NAS volume.
+    final listedRoot = root.absolute.path;
+    final prefix = listedRoot.endsWith(Platform.pathSeparator)
+        ? listedRoot
+        : '$listedRoot${Platform.pathSeparator}';
     var scannedFiles = 0;
     await for (final entity in root.list(recursive: true, followLinks: false)) {
       if (entity is! File || !_isVideo(entity.path)) continue;
-      final canonicalFile = await entity.resolveSymbolicLinks();
-      if (!canonicalFile.startsWith(prefix)) continue;
-      final scannedRelativePath = canonicalFile
+      final listedFile = entity.absolute.path;
+      if (!listedFile.startsWith(prefix)) continue;
+      final scannedRelativePath = listedFile
           .substring(prefix.length)
           .replaceAll(Platform.pathSeparator, '/');
       final relativePath = directoryRelativePath == null
           ? scannedRelativePath
           : '$directoryRelativePath/$scannedRelativePath';
-      final checkedFile = await mediaService.fileForRelativePath(relativePath);
-      if (checkedFile == null) continue;
+      final checkedFile = NasMediaFile(File(listedFile), relativePath);
       final stat = await checkedFile.file.stat();
       final mediaModifiedAt = stat.modified.microsecondsSinceEpoch;
       final existing = _db.select(
-        'SELECT file_size, media_modified_at, duration_ms, video_width, video_height, resolution_label FROM episodes WHERE media_root_id = ? AND relative_path = ?',
+        'SELECT file_size, media_modified_at, duration_ms, video_width, video_height, resolution_label, metadata_probed_at FROM episodes WHERE media_root_id = ? AND relative_path = ?',
         [rootId, relativePath],
       );
-      final fileSize = await checkedFile.length();
+      final fileSize = stat.size;
       final unchanged = existing.isNotEmpty &&
           existing.first['file_size'] == fileSize &&
           existing.first['media_modified_at'] == mediaModifiedAt &&
-          (existing.first['duration_ms'] != null ||
-              existing.first['video_width'] != null ||
-              existing.first['video_height'] != null);
+          existing.first['metadata_probed_at'] != null;
       NasMediaMetadata? metadata;
       if (!unchanged) {
         metadata = await metadataProbe.probe(checkedFile);
@@ -1926,13 +1962,14 @@ class NasLibraryDatabase {
             : [movieId, title, categoryId, timestamp, timestamp],
       );
       _db.execute('''
-        INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, duration_ms, video_width, video_height, resolution_label, media_modified_at, file_size, is_available, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, duration_ms, video_width, video_height, resolution_label, metadata_probed_at, media_modified_at, file_size, is_available, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
           duration_ms = excluded.duration_ms,
           video_width = excluded.video_width,
           video_height = excluded.video_height,
           resolution_label = excluded.resolution_label,
+          metadata_probed_at = excluded.metadata_probed_at,
           media_modified_at = excluded.media_modified_at,
           file_size = excluded.file_size, is_available = 1, updated_at = excluded.updated_at
       ''', [
@@ -1947,6 +1984,7 @@ class NasLibraryDatabase {
         unchanged
             ? existing.first['resolution_label']
             : metadata?.resolutionLabel,
+        unchanged ? existing.first['metadata_probed_at'] : timestamp,
         mediaModifiedAt,
         fileSize,
         timestamp,
@@ -2049,23 +2087,18 @@ class NasLibraryDatabase {
       _markRootOffline(mediaRoot.id);
       return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
     }
-    final canonicalDirectory = await directory.directory.resolveSymbolicLinks();
-    final prefix = canonicalDirectory.endsWith(Platform.pathSeparator)
-        ? canonicalDirectory
-        : '$canonicalDirectory${Platform.pathSeparator}';
+    final listedDirectory = directory.directory.absolute.path;
+    final prefix = listedDirectory.endsWith(Platform.pathSeparator)
+        ? listedDirectory
+        : '$listedDirectory${Platform.pathSeparator}';
     // 成功穷举后才标记不可用，避免挂载中断导致“离线即删除”。
     _markUnavailableEpisodesForSource(categoryId, source);
     var scannedFiles = 0;
     final conflicts = <String>[];
     for (final entity in files) {
-      String canonicalFile;
-      try {
-        canonicalFile = await entity.resolveSymbolicLinks();
-      } on FileSystemException {
-        continue;
-      }
-      if (!canonicalFile.startsWith(prefix)) continue;
-      final inCategoryPath = canonicalFile
+      final listedFile = entity.absolute.path;
+      if (!listedFile.startsWith(prefix)) continue;
+      final inCategoryPath = listedFile
           .substring(prefix.length)
           .replaceAll(Platform.pathSeparator, '/');
       final grouping = _episodeGrouping(inCategoryPath);
@@ -2075,17 +2108,12 @@ class NasLibraryDatabase {
         continue;
       }
       final relativePath = '${source.relativePath}/$inCategoryPath';
-      final checked = mediaRoot.containerPath == mediaService.mediaDir
-          ? await mediaService.fileForRelativePath(relativePath)
-          : await mediaService.fileForRootRelativePath(
-              rootPath: mediaRoot.containerPath,
-              relativePath: relativePath,
-            );
-      if (checked == null) continue;
+      final checked = NasMediaFile(File(listedFile), relativePath);
       final stat = await checked.file.stat();
       final existing = _db.select('''
         SELECT e.id, e.movie_id, e.file_size, e.media_modified_at,
                e.duration_ms, e.video_width, e.video_height, e.resolution_label,
+               e.metadata_probed_at,
                m.collection_key
         FROM episodes e JOIN movies m ON m.id = e.movie_id
         WHERE e.media_root_id = ? AND e.relative_path = ?
@@ -2109,9 +2137,7 @@ class NasLibraryDatabase {
       final unchanged = existing.isNotEmpty &&
           existing.single['file_size'] == fileSize &&
           existing.single['media_modified_at'] == modifiedAt &&
-          (existing.single['duration_ms'] != null ||
-              existing.single['video_width'] != null ||
-              existing.single['video_height'] != null);
+          existing.single['metadata_probed_at'] != null;
       final metadata = unchanged ? null : await metadataProbe.probe(checked);
       final movieId = existing.isNotEmpty
           ? existing.single['movie_id'] as String
@@ -2124,14 +2150,15 @@ class NasLibraryDatabase {
       _db.execute('''
         INSERT INTO episodes(
           id, movie_id, media_root_id, title, relative_path, duration_ms,
-          video_width, video_height, resolution_label, media_modified_at,
-          file_size, is_available, natural_sort_key, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          video_width, video_height, resolution_label, metadata_probed_at,
+          media_modified_at, file_size, is_available, natural_sort_key, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
           duration_ms = excluded.duration_ms,
           video_width = excluded.video_width,
           video_height = excluded.video_height,
           resolution_label = excluded.resolution_label,
+          metadata_probed_at = excluded.metadata_probed_at,
           media_modified_at = excluded.media_modified_at,
           file_size = excluded.file_size,
           is_available = 1,
@@ -2149,6 +2176,7 @@ class NasLibraryDatabase {
         unchanged
             ? existing.single['resolution_label']
             : metadata?.resolutionLabel,
+        unchanged ? existing.single['metadata_probed_at'] : timestamp,
         modifiedAt,
         fileSize,
         _naturalSortKey(inCategoryPath),
@@ -5709,16 +5737,29 @@ class NasLibraryDatabase {
     return findEpisode(episodeId);
   }
 
-  int resumePositionMsForEpisode({
+  NasEpisodePlaybackProgress? playbackProgressForEpisode({
     required String movieId,
     required String episodeId,
   }) {
     final rows = _db.select('''
-      SELECT position_ms FROM episode_playback_progress
+      SELECT position_ms, duration_ms FROM episode_playback_progress
       WHERE movie_id = ? AND episode_id = ?
     ''', [movieId, episodeId]);
-    return rows.isEmpty ? 0 : rows.single['position_ms'] as int;
+    if (rows.isEmpty) return null;
+    final row = rows.single;
+    return NasEpisodePlaybackProgress(
+      positionMs: row['position_ms'] as int,
+      durationMs: row['duration_ms'] as int,
+    );
   }
+
+  int resumePositionMsForEpisode({
+    required String movieId,
+    required String episodeId,
+  }) =>
+      playbackProgressForEpisode(movieId: movieId, episodeId: episodeId)
+          ?.positionMs ??
+      0;
 
   NasPlaybackResumeTarget? resumeTargetForMovie(String movieId) {
     final progressed = _db.select('''
@@ -6392,8 +6433,10 @@ class NasLibraryDatabase {
     );
   }
 
-  static bool _isVideo(String path) =>
-      RegExp(r'\.(mp4|m4v|mkv|mov|webm)$', caseSensitive: false).hasMatch(path);
+  static bool _isVideo(String path) => RegExp(
+        r'\.(mp4|m4v|mkv|mov|webm|avi|wmv|flv|ts|m2ts|rmvb)$',
+        caseSensitive: false,
+      ).hasMatch(path);
 
   static String? _collectionTitleFromDirectory(String value) {
     final match = RegExp(r'^(.*?)\s*[-－—]\s*影集\s*$').firstMatch(value);

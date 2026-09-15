@@ -1,0 +1,21 @@
+services:
+  mujing-nas:
+    environment:
+      # The selected overlay owns this container path; users only provide the
+      # host-side MDCNG_DATA_ROOT in .env.
+      MUJING_MDCNG_DATA_DIR: /imports/mdcng
+    volumes:
+      # 默认双盘媒体：Windows 类别目录可绑定 disk1/… 或 disk2/…。
+      - type: bind
+        source: ${MEDIA_ROOT_DISK1:?Set MEDIA_ROOT_DISK1 in .env before enabling the dual-media MDCNG overlay.}
+        target: /media/disk1
+        read_only: true
+      - type: bind
+        source: ${MEDIA_ROOT_DISK2:?Set MEDIA_ROOT_DISK2 in .env before enabling the dual-media MDCNG overlay.}
+        target: /media/disk2
+        read_only: true
+      # MDCNG 演员审核只读取 config/data；绝不挂载 config.json。
+      - type: bind
+        source: ${MDCNG_DATA_ROOT:?Set MDCNG_DATA_ROOT to MDCNG config/data in .env.}
+        target: /imports/mdcng
+        read_only: true

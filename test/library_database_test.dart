@@ -19,9 +19,11 @@ Future<void> main() async {
   final database =
       NasLibraryDatabase('${directory.path}${Platform.pathSeparator}data');
   var probeCalls = 0;
+  List<String>? probeArguments;
   final metadataProbe = NasMediaMetadataProbe(
     runner: (command, arguments) async {
       probeCalls++;
+      probeArguments = arguments;
       return ProcessResult(
         1,
         0,
@@ -40,6 +42,17 @@ Future<void> main() async {
       metadataProbe: metadataProbe,
     );
     _expect(scan.scannedFiles == 1, 'scanner imports supported video files');
+    _expect(
+      NasMediaMetadataProbe().timeout == const Duration(seconds: 5),
+      'scanner uses a short metadata probe deadline',
+    );
+    _expect(
+      probeArguments!.contains('-probesize') &&
+          probeArguments!.contains('1048576') &&
+          probeArguments!.contains('-analyzeduration') &&
+          probeArguments!.contains('1000000'),
+      'scanner limits ffprobe analysis to a small media header budget',
+    );
     final movie = database.listMovies().single;
     _expect(movie.title == 'sample', 'scanner derives a display title');
     final actorOne = database.createActor(
@@ -201,6 +214,52 @@ Future<void> main() async {
         reopenedRoot.id == configuredRoot.id, 'media root ID survives reopen');
     _expect(reopenedRoot.lastScannedAt == configuredRoot.lastScannedAt,
         'scan timestamp survives reopen');
+
+    final unreadableRoot = Directory(
+      '${directory.path}${Platform.pathSeparator}unreadable-media',
+    );
+    final unreadableVideo = File(
+      '${unreadableRoot.path}${Platform.pathSeparator}cannot-probe.avi',
+    );
+    await unreadableVideo.parent.create(recursive: true);
+    await unreadableVideo.writeAsBytes(const [0, 1, 2, 3]);
+    final failedProbeDatabase = NasLibraryDatabase(
+      '${directory.path}${Platform.pathSeparator}failed-probe-data',
+    );
+    var failedProbeCalls = 0;
+    try {
+      await failedProbeDatabase.open();
+      final failedProbe = NasMediaMetadataProbe(
+        runner: (_, __) async {
+          failedProbeCalls++;
+          return ProcessResult(2, 1, '', 'unsupported media');
+        },
+      );
+      await failedProbeDatabase.scanConfiguredRoot(
+        rootName: '无法读取的媒体根',
+        containerPath: unreadableRoot.path,
+        mediaService: NasMediaService(
+          mediaDir: unreadableRoot.path,
+          fixtureRelativePath: null,
+        ),
+        metadataProbe: failedProbe,
+      );
+      await failedProbeDatabase.scanConfiguredRoot(
+        rootName: '无法读取的媒体根',
+        containerPath: unreadableRoot.path,
+        mediaService: NasMediaService(
+          mediaDir: unreadableRoot.path,
+          fixtureRelativePath: null,
+        ),
+        metadataProbe: failedProbe,
+      );
+      _expect(
+        failedProbeCalls == 1,
+        'unchanged files with unavailable metadata do not probe repeatedly',
+      );
+    } finally {
+      await failedProbeDatabase.close();
+    }
   } finally {
     await database.close();
     await directory.delete(recursive: true);
