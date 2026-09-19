@@ -181,6 +181,7 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/相对于媒体目录的/test.mp4
 - `PATCH /api/v1/playback/sessions/{id}/progress`：viewer 写入当前进度，并更新持久化观看历史。
 - `DELETE /api/v1/playback/sessions/{id}`：关闭会话。
 - `GET` / `HEAD /api/v1/playback/sessions/{id}/stream`：支持无 Range 的 `200`、单 Range 的 `206` 和非法 Range 的 `416`，不把整文件读入内存。
+- `POST /api/v1/movies/search`：在 SQLite 内完成关键词、标签、观看状态、分辨率和资料实体筛选后分页返回。兼容旧的单分类 `categoryId`；可选 `categoryIds`、`seriesIds`、`publisherIds`、`actorIds` 字符串数组，同一数组内按任一匹配，不同维度及其他条件之间按同时满足匹配。可选数组不存在时表示不限；字段一旦出现就必须包含 1 至 80 个现有实体 ID，空数组、空值、重复、畸形、超限或不存在的 ID 返回 `400 invalid_request`。
 
 服务使用 `sqlite3` 在 `/data/db/mujing.sqlite` 建立版本化 migration、WAL 和 `media_roots` / `movies` / `episodes` 表。生产环境把容器 `/media` 作为只读边界，启动时不自动扫描；在 Windows NAS 管理页创建类别并绑定其子目录后，才会显式扫描该类别中的 `mp4`、`m4v`、`mkv`、`mov`、`webm`、`avi`、`wmv`、`flv`、`ts`、`m2ts` 与 `rmvb` 文件。类别目录不得相同、互为父子或经符号链接越出媒体根；扫描结果只保存稳定媒体根 ID 与相对路径，绝不向 API 返回宿主机路径。`MUJING_SCAN_ON_START` 仅保留给隔离的旧测试构造，环境配置中不再启用它。
 

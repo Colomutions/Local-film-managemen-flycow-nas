@@ -437,6 +437,10 @@ class NasMovieSearchFilter {
   const NasMovieSearchFilter({
     required this.query,
     required this.categoryId,
+    this.categoryIds = const {},
+    this.seriesIds = const {},
+    this.publisherIds = const {},
+    this.actorIds = const {},
     this.isFavorite,
     required this.resolutions,
     required this.watchStates,
@@ -449,6 +453,10 @@ class NasMovieSearchFilter {
 
   final String query;
   final String? categoryId;
+  final Set<String> categoryIds;
+  final Set<String> seriesIds;
+  final Set<String> publisherIds;
+  final Set<String> actorIds;
   final bool? isFavorite;
   final Set<String> resolutions;
   final Set<String> watchStates;
@@ -457,6 +465,17 @@ class NasMovieSearchFilter {
   final int page;
   final int pageSize;
   final List<NasMovieSearchTagCondition> tagConditions;
+
+  Set<String> get effectiveCategoryIds => {
+        ...categoryIds,
+        if (categoryId != null) categoryId!,
+      };
+
+  bool get hasEntityConditions =>
+      effectiveCategoryIds.isNotEmpty ||
+      seriesIds.isNotEmpty ||
+      publisherIds.isNotEmpty ||
+      actorIds.isNotEmpty;
 }
 
 class NasMovieSearchPage {
@@ -2480,6 +2499,30 @@ class NasLibraryDatabase {
         ELSE 0
       END +
       CASE
+        WHEN lower(COALESCE(series.display_name, '')) = lower(terms.query)
+          OR lower(COALESCE(series.original_name, '')) = lower(terms.query)
+          OR lower(COALESCE(series.translated_name, '')) = lower(terms.query)
+          OR lower(COALESCE(publisher.display_name, '')) = lower(terms.query)
+          OR lower(COALESCE(publisher.original_name, '')) = lower(terms.query) THEN 300
+        WHEN lower(COALESCE(series.display_name, '')) LIKE lower(terms.query_prefix)
+          OR lower(COALESCE(series.original_name, '')) LIKE lower(terms.query_prefix)
+          OR lower(COALESCE(series.translated_name, '')) LIKE lower(terms.query_prefix)
+          OR lower(COALESCE(publisher.display_name, '')) LIKE lower(terms.query_prefix)
+          OR lower(COALESCE(publisher.original_name, '')) LIKE lower(terms.query_prefix) THEN 280
+        WHEN lower(COALESCE(series.display_name, '')) LIKE lower(terms.query_like)
+          OR lower(COALESCE(series.original_name, '')) LIKE lower(terms.query_like)
+          OR lower(COALESCE(series.translated_name, '')) LIKE lower(terms.query_like)
+          OR lower(COALESCE(publisher.display_name, '')) LIKE lower(terms.query_like)
+          OR lower(COALESCE(publisher.original_name, '')) LIKE lower(terms.query_like) THEN 260
+        ELSE 0
+      END +
+      CASE
+        WHEN lower(COALESCE(category.name, '')) = lower(terms.query) THEN 240
+        WHEN lower(COALESCE(category.name, '')) LIKE lower(terms.query_prefix) THEN 220
+        WHEN lower(COALESCE(category.name, '')) LIKE lower(terms.query_like) THEN 200
+        ELSE 0
+      END +
+      CASE
         WHEN EXISTS (
           SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
           WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
@@ -2510,6 +2553,12 @@ class NasLibraryDatabase {
         terms.query = '' OR lower(m.title) LIKE lower(terms.query_like)
         OR lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_like)
         OR lower(COALESCE(m.summary, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(series.display_name, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(series.original_name, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(series.translated_name, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(publisher.display_name, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(publisher.original_name, '')) LIKE lower(terms.query_like)
+        OR lower(COALESCE(category.name, '')) LIKE lower(terms.query_like)
         OR (terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
           COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_like))
         OR EXISTS (
@@ -2559,9 +2608,24 @@ class NasLibraryDatabase {
       )''',
     ];
     final whereValues = <Object?>[];
-    if (filter.categoryId != null) {
-      clauses.add('m.category_id = ?');
-      whereValues.add(filter.categoryId);
+    void addIdSetClause(String column, Set<String> ids) {
+      if (ids.isEmpty) return;
+      final sorted = ids.toList()..sort();
+      clauses.add('$column IN (${List.filled(sorted.length, '?').join(', ')})');
+      whereValues.addAll(sorted);
+    }
+
+    addIdSetClause('m.category_id', filter.effectiveCategoryIds);
+    addIdSetClause('m.series_id', filter.seriesIds);
+    addIdSetClause('m.publisher_id', filter.publisherIds);
+    if (filter.actorIds.isNotEmpty) {
+      final actorIds = filter.actorIds.toList()..sort();
+      clauses.add('''EXISTS (
+        SELECT 1 FROM movie_actor_links selected_actor
+        WHERE selected_actor.movie_id = m.id
+          AND selected_actor.actor_id IN (${List.filled(actorIds.length, '?').join(', ')})
+      )''');
+      whereValues.addAll(actorIds);
     }
     if (filter.isFavorite != null) {
       clauses.add('m.is_favorite = ?');

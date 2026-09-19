@@ -957,7 +957,7 @@ class NasHealthServer {
     final hasDatabaseLibrary =
         config.managedCategoryLibrary || _libraryDatabase.hasScannedMediaRoots;
     if (!hasDatabaseLibrary) {
-      if (filter.categoryId != null ||
+      if (filter.hasEntityConditions ||
           filter.isFavorite != null ||
           filter.resolutions.isNotEmpty ||
           filter.watchStates.isNotEmpty ||
@@ -979,8 +979,14 @@ class NasHealthServer {
         },
       });
     }
-    if (filter.categoryId != null &&
-        _libraryDatabase.findCategory(filter.categoryId!) == null) {
+    if (filter.effectiveCategoryIds.any(
+          (id) => _libraryDatabase.findCategory(id) == null,
+        ) ||
+        filter.seriesIds.any((id) => _libraryDatabase.findSeries(id) == null) ||
+        filter.publisherIds.any(
+          (id) => _libraryDatabase.findPublisher(id) == null,
+        ) ||
+        filter.actorIds.any((id) => _libraryDatabase.findActor(id) == null)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     for (final condition in filter.tagConditions) {
@@ -2850,7 +2856,13 @@ class NasHealthServer {
       'pageSize',
       'tagConditions',
     };
-    const fields = {...requiredFields, 'isFavorite'};
+    const entityFields = {
+      'categoryIds',
+      'seriesIds',
+      'publisherIds',
+      'actorIds',
+    };
+    const fields = {...requiredFields, 'isFavorite', ...entityFields};
     if (body == null ||
         body.keys.any((key) => !fields.contains(key)) ||
         !body.keys.toSet().containsAll(requiredFields) ||
@@ -2876,6 +2888,26 @@ class NasHealthServer {
     final watchStates = (body['watchStates'] as List)
         .map((value) => value is String ? value.trim() : null)
         .toList(growable: false);
+    final entityIds = <String, Set<String>>{};
+    for (final field in entityFields) {
+      final raw = body[field];
+      if (raw == null) {
+        entityIds[field] = const {};
+        continue;
+      }
+      if (raw is! List ||
+          raw.isEmpty ||
+          raw.length > 80 ||
+          raw.any((value) => value is! String)) {
+        return null;
+      }
+      final values = raw.cast<String>().map((value) => value.trim()).toList();
+      if (values.any((value) => value.isEmpty) ||
+          values.toSet().length != values.length) {
+        return null;
+      }
+      entityIds[field] = values.toSet();
+    }
     if (query.length > 240 ||
         categoryId?.isEmpty == true ||
         resolutions.any((value) => value == null || value.isEmpty) ||
@@ -2940,6 +2972,10 @@ class NasHealthServer {
     return NasMovieSearchFilter(
       query: query,
       categoryId: categoryId,
+      categoryIds: entityIds['categoryIds']!,
+      seriesIds: entityIds['seriesIds']!,
+      publisherIds: entityIds['publisherIds']!,
+      actorIds: entityIds['actorIds']!,
       isFavorite: body['isFavorite'] as bool?,
       resolutions: resolutions.cast<String>().toSet(),
       watchStates: watchStates.cast<String>().toSet(),

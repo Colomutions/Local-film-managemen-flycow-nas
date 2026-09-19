@@ -76,6 +76,65 @@ Future<void> main() async {
       body: {'name': '推理'},
     );
     final categoryId = (category.json['data'] as Map)['id'] as String;
+    final secondCategory = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/categories',
+      token: adminToken,
+      body: {'name': '纪录片'},
+    );
+    final secondCategoryId =
+        (secondCategory.json['data'] as Map)['id'] as String;
+    final publisherOne = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/publishers',
+      token: adminToken,
+      body: {'displayName': '发行商甲'},
+    );
+    final publisherOneId = (publisherOne.json['data'] as Map)['id'] as String;
+    final publisherTwo = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/publishers',
+      token: adminToken,
+      body: {'displayName': '发行商乙'},
+    );
+    final publisherTwoId = (publisherTwo.json['data'] as Map)['id'] as String;
+    final seriesOne = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/series',
+      token: adminToken,
+      body: {'displayName': '系列甲', 'publisherId': publisherOneId},
+    );
+    final seriesOneId = (seriesOne.json['data'] as Map)['id'] as String;
+    final seriesTwo = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/series',
+      token: adminToken,
+      body: {'displayName': '系列乙', 'publisherId': publisherTwoId},
+    );
+    final seriesTwoId = (seriesTwo.json['data'] as Map)['id'] as String;
+    final actorOne = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: adminToken,
+      body: {'translatedName': '演员甲'},
+    );
+    final actorOneId =
+        ((actorOne.json['data'] as Map)['actor'] as Map)['id'] as String;
+    final actorTwo = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: adminToken,
+      body: {'translatedName': '演员乙'},
+    );
+    final actorTwoId =
+        ((actorTwo.json['data'] as Map)['actor'] as Map)['id'] as String;
     final rootOne = await _tag(base, adminToken, name: '题材', level: 1);
     final rootTwo = await _tag(base, adminToken, name: '氛围', level: 1);
     final second = await _tag(
@@ -96,6 +155,35 @@ Future<void> main() async {
     await _patchMovie(
         base, adminToken, movieIds['beta']!, [second], categoryId);
     await _patchMovie(base, adminToken, movieIds['gamma']!, [rootTwo]);
+    await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movieIds['alpha']}',
+      token: adminToken,
+      body: {
+        'publisherId': publisherOneId,
+        'seriesId': seriesOneId,
+        'actorIds': [actorOneId],
+      },
+    );
+    await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movieIds['beta']}',
+      token: adminToken,
+      body: {
+        'publisherId': publisherTwoId,
+        'seriesId': seriesTwoId,
+        'actorIds': [actorTwoId],
+      },
+    );
+    await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/movies/${movieIds['gamma']}',
+      token: adminToken,
+      body: {'publisherId': publisherTwoId, 'categoryId': secondCategoryId},
+    );
     database
       ..setMovieFavorite(movieId: movieIds['alpha']!, isFavorite: true)
       ..setMovieFavorite(movieId: movieIds['beta']!, isFavorite: true);
@@ -184,6 +272,56 @@ Future<void> main() async {
       resolutions: const ['1080P'],
     );
     _expect(_ids(filtered).single == movieIds['beta'], '关键词、分类与分辨率共同筛选');
+
+    final multiDimension = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      categoryIds: [categoryId, secondCategoryId],
+      publisherIds: [publisherTwoId],
+      actorIds: [actorOneId, actorTwoId],
+    );
+    _expect(
+      _ids(multiDimension).single == movieIds['beta'],
+      '同维度任选其一且不同实体维度同时满足',
+    );
+    final seriesAny = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      seriesIds: [seriesOneId, seriesTwoId],
+    );
+    _expect(
+      _ids(seriesAny).toSet().containsAll([
+            movieIds['alpha']!,
+            movieIds['beta']!,
+          ]) &&
+          !_ids(seriesAny).contains(movieIds['gamma']),
+      '同一系列维度的多选使用任选其一语义',
+    );
+    final publisherKeyword = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      q: '发行商乙',
+    );
+    _expect(
+      _ids(publisherKeyword).toSet().containsAll([
+        movieIds['beta']!,
+        movieIds['gamma']!,
+      ]),
+      '关键词可搜索发行商和系列名称',
+    );
+    final categoryKeyword = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      q: '纪录片',
+    );
+    _expect(
+      _ids(categoryKeyword).single == movieIds['gamma'],
+      '关键词可搜索分类名称',
+    );
 
     final betaEpisode = database.episodesForMovie(movieIds['beta']!).single;
     database
@@ -400,6 +538,53 @@ Future<void> main() async {
       'exclude': [],
     });
     _expectError(nonexistent, HttpStatus.badRequest, 'invalid_request');
+    final nonexistentEntity = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      actorIds: const ['actor-does-not-exist'],
+    );
+    _expectError(
+      nonexistentEntity,
+      HttpStatus.badRequest,
+      'invalid_request',
+    );
+    final duplicateEntity = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      publisherIds: [publisherOneId, publisherOneId],
+    );
+    _expectError(
+      duplicateEntity,
+      HttpStatus.badRequest,
+      'invalid_request',
+    );
+    final emptyEntity = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      extraFields: const {'actorIds': <String>[]},
+    );
+    _expectError(emptyEntity, HttpStatus.badRequest, 'invalid_request');
+    final malformedEntity = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      extraFields: {
+        'actorIds': [actorOneId, 7],
+      },
+    );
+    _expectError(malformedEntity, HttpStatus.badRequest, 'invalid_request');
+    final oversizedEntity = await _search(
+      base,
+      viewerToken,
+      {'all': [], 'any': [], 'exclude': []},
+      extraFields: {
+        'actorIds': List.generate(81, (index) => 'actor-$index'),
+      },
+    );
+    _expectError(oversizedEntity, HttpStatus.badRequest, 'invalid_request');
     await _request(
       base,
       'POST',
@@ -492,6 +677,11 @@ Future<_Response> _search(
   String? categoryId,
   List<String> resolutions = const [],
   List<String> watchStates = const [],
+  List<String> categoryIds = const [],
+  List<String> seriesIds = const [],
+  List<String> publisherIds = const [],
+  List<String> actorIds = const [],
+  Map<String, Object?> extraFields = const {},
   bool? isFavorite,
   String sort = 'title',
   String order = 'asc',
@@ -506,6 +696,10 @@ Future<_Response> _search(
       body: {
         'q': q,
         'categoryId': categoryId,
+        if (categoryIds.isNotEmpty) 'categoryIds': categoryIds,
+        if (seriesIds.isNotEmpty) 'seriesIds': seriesIds,
+        if (publisherIds.isNotEmpty) 'publisherIds': publisherIds,
+        if (actorIds.isNotEmpty) 'actorIds': actorIds,
         if (isFavorite != null) 'isFavorite': isFavorite,
         'resolutions': resolutions,
         'watchStates': watchStates,
@@ -514,6 +708,7 @@ Future<_Response> _search(
         'page': page,
         'pageSize': pageSize,
         'tagConditions': tagConditions,
+        ...extraFields,
       },
     );
 
