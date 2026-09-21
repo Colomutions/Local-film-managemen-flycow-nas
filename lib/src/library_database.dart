@@ -9,6 +9,7 @@ import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
 import 'movie_actor.dart';
+import 'novels/novel_repository.dart';
 
 String _normalizeCatalogNumber(String value) =>
     value.trim().toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
@@ -1004,7 +1005,7 @@ class NasMdcngMetadataApply {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 30;
+  static const currentSchemaVersion = 31;
   static const _metadataFieldKeys = {
     'title',
     'originalTitle',
@@ -1025,6 +1026,8 @@ class NasLibraryDatabase {
   Database? _database;
 
   Database get _db => _database ?? (throw StateError('Database is not open.'));
+
+  NasNovelRepository get novels => NasNovelRepository(_db);
 
   Future<void> open() async {
     if (_database != null) return;
@@ -1052,6 +1055,17 @@ class NasLibraryDatabase {
   Future<void> close() async {
     _database?.dispose();
     _database = null;
+  }
+
+  Future<void> checkpointAndClose() async {
+    if (_database == null) return;
+    _db.execute('PRAGMA wal_checkpoint(TRUNCATE)');
+    await close();
+  }
+
+  bool validateIntegrity() {
+    final result = _db.select('PRAGMA integrity_check');
+    return result.length == 1 && result.single['integrity_check'] == 'ok';
   }
 
   Future<void> createBackupSnapshot(File target) async {
@@ -1801,18 +1815,36 @@ class NasLibraryDatabase {
           )
           .isNotEmpty;
       if (hasEpisodesTable) {
-        _db.execute('''
-          ALTER TABLE episodes ADD COLUMN metadata_probed_at TEXT;
-          UPDATE episodes
-          SET metadata_probed_at = updated_at
-          WHERE duration_ms IS NOT NULL
-             OR video_width IS NOT NULL
-             OR video_height IS NOT NULL;
-        ''');
+        final episodeColumns = _db
+            .select('PRAGMA table_info(episodes)')
+            .map((row) => row['name'] as String)
+            .toSet();
+        _db.execute('ALTER TABLE episodes ADD COLUMN metadata_probed_at TEXT');
+        if (episodeColumns.containsAll({
+          'updated_at',
+          'duration_ms',
+          'video_width',
+          'video_height',
+        })) {
+          _db.execute('''
+            UPDATE episodes
+            SET metadata_probed_at = updated_at
+            WHERE duration_ms IS NOT NULL
+               OR video_width IS NOT NULL
+               OR video_height IS NOT NULL
+          ''');
+        }
       }
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [30, _now()],
+      );
+    }
+    if (current < 31) {
+      migrateNovelSchema(_db);
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [31, _now()],
       );
     }
   }

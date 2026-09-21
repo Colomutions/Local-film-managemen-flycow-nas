@@ -3,6 +3,26 @@ import 'dart:io';
 
 import 'auth.dart';
 
+class NasPreparedBackupContribution {
+  const NasPreparedBackupContribution({
+    required this.manifestFields,
+    required this.complete,
+    required this.abandon,
+  });
+
+  final Map<String, Object?> manifestFields;
+  final Future<void> Function() complete;
+  final Future<void> Function() abandon;
+}
+
+typedef NasBackupContributionPreparer = Future<NasPreparedBackupContribution>
+    Function({
+  required String backupId,
+  required Directory temporaryDirectory,
+  required File databaseTarget,
+  required Future<void> Function(File target) databaseSnapshot,
+});
+
 class NasBackupRecord {
   const NasBackupRecord({
     required this.id,
@@ -48,8 +68,23 @@ class NasBackupService {
   Directory get _backupDirectory =>
       Directory('$dataDir${Platform.pathSeparator}backups');
 
+  Future<void> recoverIncomplete() async {
+    final root = _backupDirectory;
+    if (!await root.exists()) return;
+    final temporaryName = RegExp(
+      r'^\.tmp-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    );
+    await for (final entity in root.list(followLinks: false)) {
+      if (entity is! Directory) continue;
+      final name = entity.path.split(Platform.pathSeparator).last;
+      if (!temporaryName.hasMatch(name)) continue;
+      await entity.delete(recursive: true);
+    }
+  }
+
   Future<NasBackupRecord> create({
     required Future<void> Function(File target) databaseSnapshot,
+    NasBackupContributionPreparer? prepareContribution,
   }) async {
     final id = newUuidV4();
     final createdAt = DateTime.now().toUtc();
@@ -61,11 +96,22 @@ class NasBackupService {
     final destination =
         Directory('${backupRoot.path}${Platform.pathSeparator}$id');
     await temporary.create();
+    NasPreparedBackupContribution? contribution;
+    var contributionCompleted = false;
     try {
-      await databaseSnapshot(
-        File(
-            '${temporary.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite'),
+      final databaseTarget = File(
+        '${temporary.path}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite',
       );
+      if (prepareContribution == null) {
+        await databaseSnapshot(databaseTarget);
+      } else {
+        contribution = await prepareContribution(
+          backupId: id,
+          temporaryDirectory: temporary,
+          databaseTarget: databaseTarget,
+          databaseSnapshot: databaseSnapshot,
+        );
+      }
       await _copySanitizedJsonFile(
         File(
             '$dataDir${Platform.pathSeparator}state${Platform.pathSeparator}server.json'),
@@ -91,14 +137,29 @@ class NasBackupService {
       );
       await File('${temporary.path}${Platform.pathSeparator}manifest.json')
           .writeAsString(
-        jsonEncode(record.toJson()),
+        jsonEncode({
+          ...record.toJson(),
+          ...?contribution?.manifestFields,
+        }),
         flush: true,
       );
       await temporary.rename(destination.path);
+      await contribution?.complete();
+      contributionCompleted = true;
       return record;
     } catch (_) {
+      if (!contributionCompleted) {
+        try {
+          await contribution?.abandon();
+        } catch (_) {
+          // Startup recovery also clears a job whose cleanup cannot finish.
+        }
+      }
       if (await temporary.exists()) {
         await temporary.delete(recursive: true);
+      }
+      if (await destination.exists()) {
+        await destination.delete(recursive: true);
       }
       rethrow;
     }
@@ -166,7 +227,8 @@ class NasBackupService {
     final targetPath = _normalizedAbsolutePath(target.path);
     if (_isWithinPath(targetPath, dataPath) ||
         _isWithinPath(targetPath, sourcePath)) {
-      throw StateError('Restore target must be outside the live data directory.');
+      throw StateError(
+          'Restore target must be outside the live data directory.');
     }
 
     final manifest = File(
@@ -200,7 +262,7 @@ class NasBackupService {
   }
 
   Future<void> _copyRestoreTree(Directory source, Directory target) async {
-    const allowedDirectories = {'db', 'state', 'config', 'artwork'};
+    const allowedDirectories = {'db', 'state', 'config', 'artwork', 'novels'};
     await for (final entity in source.list(followLinks: false)) {
       final name = entity.path.split(Platform.pathSeparator).last;
       if (entity is Link) {
@@ -215,9 +277,11 @@ class NasBackupService {
       if (entity is! Directory || !allowedDirectories.contains(name)) {
         throw StateError('Backup contains an unsupported entry.');
       }
-      await _copyRestoreDirectory(entity, Directory(
-        '${target.path}${Platform.pathSeparator}$name',
-      ));
+      await _copyRestoreDirectory(
+          entity,
+          Directory(
+            '${target.path}${Platform.pathSeparator}$name',
+          ));
     }
   }
 
@@ -226,7 +290,8 @@ class NasBackupService {
     Directory target,
   ) async {
     await target.create(recursive: true);
-    await for (final entity in source.list(recursive: true, followLinks: false)) {
+    await for (final entity
+        in source.list(recursive: true, followLinks: false)) {
       final relativePath = entity.path.substring(source.path.length + 1);
       final destination = File(
         '${target.path}${Platform.pathSeparator}$relativePath',

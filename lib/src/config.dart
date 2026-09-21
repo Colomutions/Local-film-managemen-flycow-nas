@@ -20,6 +20,11 @@ class NasConfig {
     this.diagnosticMode = false,
     this.logMaxBytes = 2 * 1024 * 1024,
     this.logRetentionFiles = 3,
+    this.novelDir,
+    this.novelQuotaBytes,
+    this.maxNovelUploadBytes = 64 * 1024 * 1024,
+    this.novelUploadConcurrency = 1,
+    this.novelUploadRequestsPerMinute = 30,
   });
 
   factory NasConfig.fromEnvironment(Map<String, String> environment) {
@@ -56,6 +61,26 @@ class NasConfig {
           _positiveInt(environment, 'MUJING_LOG_MAX_BYTES', 2 * 1024 * 1024),
       logRetentionFiles:
           _positiveInt(environment, 'MUJING_LOG_RETENTION_FILES', 3),
+      novelDir: _absoluteDirectory(environment, 'MUJING_NOVEL_DIR'),
+      novelQuotaBytes: _optionalPositiveInt(
+        environment,
+        'MUJING_NOVEL_QUOTA_BYTES',
+      ),
+      maxNovelUploadBytes: _positiveInt(
+        environment,
+        'MUJING_MAX_NOVEL_UPLOAD_BYTES',
+        64 * 1024 * 1024,
+      ),
+      novelUploadConcurrency: _positiveInt(
+        environment,
+        'MUJING_NOVEL_UPLOAD_CONCURRENCY',
+        1,
+      ),
+      novelUploadRequestsPerMinute: _positiveInt(
+        environment,
+        'MUJING_NOVEL_UPLOAD_REQUESTS_PER_MINUTE',
+        30,
+      ),
     );
   }
 
@@ -87,6 +112,11 @@ class NasConfig {
   final bool diagnosticMode;
   final int logMaxBytes;
   final int logRetentionFiles;
+  final String? novelDir;
+  final int? novelQuotaBytes;
+  final int maxNovelUploadBytes;
+  final int novelUploadConcurrency;
+  final int novelUploadRequestsPerMinute;
 
   static String _logLevel(Map<String, String> environment) {
     final value = _value(environment, 'MUJING_LOG_LEVEL', 'INFO').toUpperCase();
@@ -101,6 +131,19 @@ class NasConfig {
       Map<String, String> environment, String key, int defaultValue) {
     final value = _optionalValue(environment, key);
     final parsed = value == null ? defaultValue : int.tryParse(value);
+    if (parsed == null || parsed < 1) {
+      throw ArgumentError.value(value, key, 'must be a positive integer');
+    }
+    return parsed;
+  }
+
+  static int? _optionalPositiveInt(
+    Map<String, String> environment,
+    String key,
+  ) {
+    final value = _optionalValue(environment, key);
+    if (value == null) return null;
+    final parsed = int.tryParse(value);
     if (parsed == null || parsed < 1) {
       throw ArgumentError.value(value, key, 'must be a positive integer');
     }

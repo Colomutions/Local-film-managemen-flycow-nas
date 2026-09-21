@@ -8,5 +8,8 @@ environment:
 
 dependencies:
   archive: ^3.6.1
+  crypto: ^3.0.7
+  mime: ^2.1.0
   sqlite3: ^2.4.5
+  unorm_dart: ^0.3.2
   xml: ^6.5.0

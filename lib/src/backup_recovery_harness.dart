@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
 
 import 'backup_service.dart';
@@ -52,6 +54,8 @@ class NasBackupRecoveryHarness {
         if (check.length != 1 || check.single['integrity_check'] != 'ok') {
           throw StateError('Restored SQLite snapshot integrity check failed.');
         }
+        await _verifyNovelPayload(target, database);
+        _resetNovelRuntimeState(database);
       } finally {
         database.dispose();
       }
@@ -59,6 +63,150 @@ class NasBackupRecoveryHarness {
       rethrow;
     } catch (_) {
       throw StateError('Restored SQLite snapshot integrity check failed.');
+    }
+  }
+
+  void _resetNovelRuntimeState(Database database) {
+    final hasNovelTables = database
+        .select(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'novel_idempotency'",
+        )
+        .isNotEmpty;
+    if (!hasNovelTables) return;
+    final now = DateTime.now().toUtc().toIso8601String();
+    database.execute('BEGIN IMMEDIATE');
+    try {
+      database
+          .execute("DELETE FROM novel_idempotency WHERE state = 'in_progress'");
+      database.execute(
+        "DELETE FROM novel_idempotency WHERE state != 'in_progress' AND expires_at <= ?",
+        [now],
+      );
+      database.execute(
+        '''UPDATE novel_idempotency
+           SET state = 'gone', owner_nonce = NULL, lease_expires_at = NULL,
+               http_status = 410, response_json = NULL, updated_at = ?
+           WHERE state = 'succeeded' AND expires_at > ?
+             AND (novel_id IS NULL OR NOT EXISTS(
+               SELECT 1 FROM novels WHERE novels.id = novel_idempotency.novel_id
+             ))''',
+        [now, now],
+      );
+      database.execute(
+        "UPDATE novel_backup_jobs SET status = 'abandoned' WHERE status = 'running'",
+      );
+      database.execute(
+        '''DELETE FROM novel_backup_pins
+           WHERE job_id IN (
+             SELECT id FROM novel_backup_jobs WHERE status = 'abandoned'
+           )''',
+      );
+      final usage = database
+          .select(
+            'SELECT COALESCE(SUM(size_bytes), 0) AS total FROM novels',
+          )
+          .first['total'] as int;
+      database.execute(
+        '''UPDATE novel_quota_state
+           SET logical_bytes = ?, updated_at = ? WHERE singleton_id = 1''',
+        [usage, now],
+      );
+      database.execute('COMMIT');
+    } catch (_) {
+      database.execute('ROLLBACK');
+      rethrow;
+    }
+  }
+
+  Future<void> _verifyNovelPayload(
+    Directory target,
+    Database database,
+  ) async {
+    final manifestFile =
+        File('${target.path}${Platform.pathSeparator}manifest.json');
+    final decoded = jsonDecode(await manifestFile.readAsString());
+    if (decoded is! Map) throw StateError('Backup manifest is invalid.');
+    final novelManifest = decoded['novels'];
+    final hasNovelTable = database
+        .select(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'novels'",
+        )
+        .isNotEmpty;
+    final databaseNovelCount = hasNovelTable
+        ? database.select('SELECT COUNT(*) AS count FROM novels').first['count']
+            as int
+        : 0;
+    if (novelManifest == null) {
+      if (databaseNovelCount != 0) {
+        throw StateError('Backup omits novel content referenced by SQLite.');
+      }
+      return;
+    }
+    if (novelManifest is! Map ||
+        novelManifest['version'] != 1 ||
+        novelManifest['items'] is! List) {
+      throw StateError('Novel backup manifest is invalid.');
+    }
+    final items = novelManifest['items'] as List;
+    if (items.length != databaseNovelCount) {
+      throw StateError('Novel backup manifest does not match SQLite.');
+    }
+    final expectedObjects = <String>{};
+    for (final raw in items) {
+      if (raw is! Map) throw StateError('Novel backup entry is invalid.');
+      final novelId = raw['novelId'];
+      final revision = raw['revision'];
+      final relativePath = raw['relativePath'];
+      final sizeBytes = raw['sizeBytes'];
+      final digest = raw['sha256'];
+      if (novelId is! String ||
+          revision is! int ||
+          revision < 1 ||
+          sizeBytes is! int ||
+          sizeBytes < 0 ||
+          digest is! String ||
+          !RegExp(r'^[a-f0-9]{64}$').hasMatch(digest) ||
+          relativePath != 'novels/objects/$digest') {
+        throw StateError('Novel backup entry is invalid.');
+      }
+      final rows = database.select(
+        '''SELECT revision, size_bytes, content_sha256 FROM novels
+           WHERE id = ?''',
+        [novelId],
+      );
+      if (rows.length != 1 ||
+          rows.single['revision'] != revision ||
+          rows.single['size_bytes'] != sizeBytes ||
+          rows.single['content_sha256'] != digest) {
+        throw StateError('Novel backup entry does not match SQLite.');
+      }
+      if (!expectedObjects.add(digest)) continue;
+      final object = File(
+        '${target.path}${Platform.pathSeparator}novels'
+        '${Platform.pathSeparator}objects${Platform.pathSeparator}$digest',
+      );
+      if (await FileSystemEntity.type(object.path, followLinks: false) !=
+              FileSystemEntityType.file ||
+          await object.length() != sizeBytes) {
+        throw StateError(
+            'Novel backup object is missing or has an invalid size.');
+      }
+      final actual = await sha256.bind(object.openRead()).first;
+      if (actual.toString() != digest) {
+        throw StateError('Novel backup object has an invalid digest.');
+      }
+    }
+    final objectDirectory = Directory(
+      '${target.path}${Platform.pathSeparator}novels'
+      '${Platform.pathSeparator}objects',
+    );
+    if (await objectDirectory.exists()) {
+      await for (final entity in objectDirectory.list(followLinks: false)) {
+        final name = entity.path.split(Platform.pathSeparator).last;
+        if (entity is! File || !expectedObjects.contains(name)) {
+          throw StateError('Novel backup contains an unmanifested object.');
+        }
+      }
     }
   }
 

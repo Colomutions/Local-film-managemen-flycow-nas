@@ -11,7 +11,7 @@ Future<void> main() async {
     await _corruptStateFailsBeforeDatabaseOpen(directory);
     await _corruptDatabaseFailsWithoutRewritingIt(directory);
     await _futureSchemaFailsWithoutPartialMigration(directory);
-    await _staleBackupTemporaryDirectoryIsPreserved(directory);
+    await _staleBackupTemporaryDirectoryIsRecovered(directory);
   } finally {
     await directory.delete(recursive: true);
   }
@@ -87,13 +87,18 @@ Future<void> _futureSchemaFailsWithoutPartialMigration(Directory root) async {
   }
 }
 
-Future<void> _staleBackupTemporaryDirectoryIsPreserved(Directory root) async {
+Future<void> _staleBackupTemporaryDirectoryIsRecovered(Directory root) async {
   final data = Directory('${root.path}${Platform.pathSeparator}stale-backup');
   final partial = File(
-    '${data.path}${Platform.pathSeparator}backups${Platform.pathSeparator}.tmp-interrupted${Platform.pathSeparator}partial',
+    '${data.path}${Platform.pathSeparator}backups${Platform.pathSeparator}.tmp-123e4567-e89b-42d3-a456-426614174000${Platform.pathSeparator}partial',
+  );
+  final unrelated = File(
+    '${data.path}${Platform.pathSeparator}backups${Platform.pathSeparator}.tmp-interrupted${Platform.pathSeparator}keep',
   );
   await partial.parent.create(recursive: true);
   await partial.writeAsString('unfinished backup');
+  await unrelated.parent.create(recursive: true);
+  await unrelated.writeAsString('not a managed temporary backup');
   final server = _server(data, root);
   await server.start();
   try {
@@ -102,10 +107,10 @@ Future<void> _staleBackupTemporaryDirectoryIsPreserved(Directory root) async {
   } finally {
     await server.stop();
   }
-  _expect(await partial.exists(),
-      'startup does not delete interrupted backup data');
-  _expect(await partial.readAsString() == 'unfinished backup',
-      'stale backup data remains unchanged');
+  _expect(!await partial.exists(),
+      'startup deletes a managed interrupted backup directory');
+  _expect(await unrelated.exists(),
+      'startup preserves directories outside the managed pattern');
 }
 
 NasHealthServer _server(Directory data, Directory root) => NasHealthServer(

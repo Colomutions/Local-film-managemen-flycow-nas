@@ -8,6 +8,7 @@ import 'ai_metadata_service.dart';
 import 'artwork_service.dart';
 import 'auth.dart';
 import 'backup_service.dart';
+import 'backup_recovery_harness.dart';
 import 'config.dart';
 import 'diagnostic_log.dart';
 import 'fixture_library.dart';
@@ -19,6 +20,11 @@ import 'library/taxonomy_transfer.dart';
 import 'library_database.dart';
 import 'media_service.dart';
 import 'movie_actor.dart';
+import 'novels/novel_backup.dart';
+import 'novels/novel_http.dart';
+import 'novels/novel_service.dart';
+import 'novels/novel_storage.dart';
+import 'novels/restore_activation.dart';
 import 'persistent_state.dart';
 import 'range.dart';
 
@@ -104,6 +110,10 @@ class NasHealthServer {
   final NasDiagnosticLogger _logger;
   final NasAiMetadataClient _aiMetadataClient;
   final NasMdcngActorSource? _mdcngActorSource;
+  NasNovelHttpApi? _novelApi;
+  NasNovelBackupCoordinator? _novelBackupCoordinator;
+  NasRestoreActivationService? _restoreActivation;
+  bool _maintenance = false;
   HttpServer? _server;
   NasPersistentState? _state;
   final Map<String, _PairingSession> _pairingSessions = {};
@@ -126,7 +136,16 @@ class NasHealthServer {
     _state =
         await _stateStore.load() ?? NasPersistentState(serverId: newUuidV4());
     await _persistState();
+    if (config.novelDir case final novelDir?) {
+      _restoreActivation = NasRestoreActivationService(
+        dataDir: config.dataDir,
+        novelDir: novelDir,
+      );
+      await _restoreActivation!.recoverIncompleteActivation();
+    }
     await _libraryDatabase.open();
+    await _backupService.recoverIncomplete();
+    await _initializeNovelServices();
     _configuredMediaRoot = _libraryDatabase.ensureConfiguredMediaRoot(
       rootName: config.mediaRootName,
       containerPath: config.mediaDir,
@@ -162,6 +181,74 @@ class NasHealthServer {
     unawaited(_serve(server));
   }
 
+  Future<void> _initializeNovelServices() async {
+    _novelApi = null;
+    _novelBackupCoordinator = null;
+    if (config.novelDir case final novelDir?) {
+      final novelService = NasNovelService(
+        repository: _libraryDatabase.novels,
+        storage: NasNovelStorage(
+          rootPath: novelDir,
+          maxUploadBytes: config.maxNovelUploadBytes,
+        ),
+        quotaBytes: config.novelQuotaBytes,
+        uploadConcurrency: config.novelUploadConcurrency,
+        uploadRequestsPerMinute: config.novelUploadRequestsPerMinute,
+      );
+      await novelService.initialize();
+      _novelApi = NasNovelHttpApi(novelService);
+      if (novelService.isReady) {
+        _novelBackupCoordinator = NasNovelBackupCoordinator(
+          repository: novelService.repository,
+          storage: novelService.storage,
+          writeBarrier: novelService.writeBarrier,
+        );
+      }
+    }
+  }
+
+  /// Local operational restore entry point. It is intentionally not exposed
+  /// through HTTP because activating a database replaces all NAS state.
+  Future<void> restoreBackup(String backupId) async {
+    final activation = _restoreActivation;
+    if (_server == null || activation == null || config.novelDir == null) {
+      throw StateError('Restore activation is unavailable.');
+    }
+    final parent = await Directory.systemTemp.createTemp('mujing-restore-');
+    final isolated =
+        Directory('${parent.path}${Platform.pathSeparator}validated');
+    try {
+      await NasBackupRecoveryHarness(_backupService).restore(
+        backupId: backupId,
+        target: isolated,
+      );
+      await activation.activate(
+        restoredDirectory: isolated,
+        enterMaintenance: () async {
+          _maintenance = true;
+          while (_activeRequests > 0) {
+            await Future<void>.delayed(const Duration(milliseconds: 5));
+          }
+        },
+        leaveMaintenance: () async => _maintenance = false,
+        closeDatabase: () async {
+          await _libraryDatabase.checkpointAndClose();
+          _novelApi = null;
+          _novelBackupCoordinator = null;
+        },
+        openAndValidateDatabase: () async {
+          await _libraryDatabase.open();
+          if (!_libraryDatabase.validateIntegrity()) {
+            throw StateError('Activated database failed integrity check.');
+          }
+          await _initializeNovelServices();
+        },
+      );
+    } finally {
+      if (await parent.exists()) await parent.delete(recursive: true);
+    }
+  }
+
   Future<void> stop() async {
     _logger.event('service.stop', fields: {
       'component': 'nas.service',
@@ -176,6 +263,9 @@ class NasHealthServer {
     _scanJobs.clear();
     await server?.close(force: true);
     await _libraryDatabase.close();
+    _novelApi = null;
+    _novelBackupCoordinator = null;
+    _restoreActivation = null;
   }
 
   Future<void> _serve(HttpServer server) async {
@@ -199,6 +289,8 @@ class NasHealthServer {
         _safeIncomingId(request.headers.value('x-mujing-trace-id'), 't');
     final requestId =
         _safeIncomingId(request.headers.value('x-mujing-request-id'), 'r');
+    request.response.headers.set('x-mujing-trace-id', traceId);
+    request.response.headers.set('x-mujing-request-id', requestId);
     final route = nasRouteTemplate(request.uri.path);
     _activeRequests++;
     _logger.event('http.request.start', fields: {
@@ -216,6 +308,13 @@ class NasHealthServer {
       final path = request.uri.path;
       if (path == '/health') {
         return await _health(request);
+      }
+      if (_maintenance && path.startsWith('/api/v1/')) {
+        return await _error(
+          request,
+          HttpStatus.serviceUnavailable,
+          'service_maintenance',
+        );
       }
       if (request.method == 'GET' && path == '/api/v1/server-info') {
         return await _serverInfo(request);
@@ -240,6 +339,59 @@ class NasHealthServer {
       if (path.startsWith('/api/v1/admin/') && device.scope != 'admin') {
         return await _error(
             request, HttpStatus.forbidden, 'insufficient_scope');
+      }
+      final novelApi = _novelApi;
+      if (request.method == 'GET' && path == '/api/v1/novels') {
+        return novelApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.list(request);
+      }
+      if (request.method == 'POST' && path == '/api/v1/novels') {
+        return novelApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.create(
+                request,
+                deviceId: device.deviceId,
+                isAdmin: device.scope == 'admin',
+              );
+      }
+      if ((request.method == 'GET' || request.method == 'HEAD') &&
+          RegExp(r'^/api/v1/novels/[^/]+/content$').hasMatch(path)) {
+        return novelApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.content(request, request.uri.pathSegments[3]);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/novels/[^/]+$').hasMatch(path)) {
+        return novelApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.detail(request, request.uri.pathSegments[3]);
+      }
+      if (request.method == 'PUT' &&
+          RegExp(r'^/api/v1/admin/novels/[^/]+$').hasMatch(path)) {
+        return novelApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.replace(
+                request,
+                deviceId: device.deviceId,
+                novelId: request.uri.pathSegments[4],
+              );
+      }
+      if (request.method == 'DELETE' &&
+          RegExp(r'^/api/v1/admin/novels/[^/]+$').hasMatch(path)) {
+        return novelApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.delete(
+                request,
+                deviceId: device.deviceId,
+                novelId: request.uri.pathSegments[4],
+              );
       }
       if (request.method == 'GET' && path == '/api/v1/admin/media-roots') {
         return await _adminMediaRoots(request);
@@ -729,6 +881,7 @@ class NasHealthServer {
             'mdcng_actor_source_not_configured',
           )
         : await _mdcngActorSource.checkAvailability();
+    final novelReady = _novelApi?.isReady ?? false;
     final data = <String, Object>{
       'serverId': _state!.serverId,
       'serverName': config.serverName,
@@ -750,9 +903,20 @@ class NasHealthServer {
         'mdcngActors': mdcngActorAvailability.isAvailable,
         'profilePackages': true,
         'sourceRename': config.allowSourceRename,
+        'novels': novelReady,
+        'novelUpload': novelReady,
+        'novelProgress': false,
+        'novelUploadResume': false,
+        'novelFormats': const ['txt'],
+        if (novelReady) 'maxNovelUploadBytes': config.maxNovelUploadBytes,
       },
       'capabilityStatus': {
         'mdcngActors': mdcngActorAvailability.reason,
+        if (!novelReady)
+          'novels': _novelApi?.unavailableReason ??
+              (config.novelDir == null
+                  ? 'storage_not_configured'
+                  : 'storage_unavailable'),
       },
       'pairingScopes': const ['viewer', 'admin'],
     };
@@ -3834,8 +3998,18 @@ class NasHealthServer {
     final watch = Stopwatch()..start();
     _logger.event('backup.start', fields: {'component': 'nas.backup'});
     try {
+      if (_novelBackupCoordinator == null &&
+          _libraryDatabase.novels.hasNovels) {
+        await _error(
+          request,
+          HttpStatus.serviceUnavailable,
+          'novel_storage_unavailable',
+        );
+        return;
+      }
       final backup = await _backupService.create(
         databaseSnapshot: _libraryDatabase.createBackupSnapshot,
+        prepareContribution: _novelBackupCoordinator?.prepare,
       );
       _logger.event('backup.end', fields: {
         'component': 'nas.backup',
@@ -7031,6 +7205,8 @@ class NasHealthServer {
       'playback_not_ready': 'The playback stream has not started.',
       'resource_not_found': 'Resource not found.',
       'service_unavailable': 'Service is unavailable.',
+      'novel_storage_unavailable': 'Novel storage is unavailable.',
+      'service_maintenance': 'The NAS database is being restored.',
       'source_rename_disabled':
           'Source rename is disabled until the writable media deployment opt-in is enabled.',
       'invalid_source_name':
