@@ -45,6 +45,12 @@ Future<void> main() async {
       capabilities['maxNovelUploadBytes'] == config.maxNovelUploadBytes,
       'server declares upload limit',
     );
+    _expect(
+        capabilities['comics'] == false &&
+            capabilities['comicUpload'] == false &&
+            capabilities['comicUploadResume'] == false &&
+            (capabilities['comicFormats'] as List).isEmpty,
+        'unimplemented comic transfer stays disabled');
     final serverId = infoData['serverId'] as String;
     final viewer = await _pair(base, serverId, scope: 'viewer');
     final admin = await _pair(base, serverId, scope: 'admin');

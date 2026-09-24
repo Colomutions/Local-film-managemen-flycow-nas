@@ -76,6 +76,15 @@ class MdcngNfoSidecarReader {
 
   final MdcngNfoParser parser;
 
+  Future<bool> hasNfoForVideo(NasMediaFile video) async {
+    final name = _fileName(video.file.path);
+    final dotIndex = name.lastIndexOf('.');
+    if (dotIndex <= 0) return false;
+    final nfo =
+        await _sibling(video.file, '${name.substring(0, dotIndex)}.nfo');
+    return nfo.exists();
+  }
+
   Future<MdcngNfoSidecar> readForVideo(NasMediaFile video) async {
     final videoName = _fileName(video.file.path);
     final dotIndex = videoName.lastIndexOf('.');
@@ -116,21 +125,24 @@ class MdcngNfoSidecarReader {
     await _inspectArtwork(
       video: video.file,
       kind: MdcngNfoArtworkKind.poster,
-      fileName: movie.poster,
+      fileName: movie.poster ?? 'poster.jpg',
+      reportMissing: movie.poster != null,
       artwork: artwork,
       issues: issues,
     );
     await _inspectArtwork(
       video: video.file,
       kind: MdcngNfoArtworkKind.fanart,
-      fileName: movie.fanart,
+      fileName: movie.fanart ?? 'fanart.jpg',
+      reportMissing: movie.fanart != null,
       artwork: artwork,
       issues: issues,
     );
     await _inspectArtwork(
       video: video.file,
       kind: MdcngNfoArtworkKind.thumb,
-      fileName: movie.thumb,
+      fileName: movie.thumb ?? 'thumb.jpg',
+      reportMissing: movie.thumb != null,
       artwork: artwork,
       issues: issues,
     );
@@ -172,6 +184,7 @@ class MdcngNfoSidecarReader {
     required File video,
     required MdcngNfoArtworkKind kind,
     required String? fileName,
+    required bool reportMissing,
     required List<MdcngNfoArtwork> artwork,
     required List<MdcngNfoSidecarIssue> issues,
   }) async {
@@ -199,12 +212,14 @@ class MdcngNfoSidecarReader {
       return;
     }
     if (!await image.exists()) {
-      issues.add(
-        MdcngNfoSidecarIssue(
-          code: 'artwork_not_found',
-          field: kind.wireName,
-        ),
-      );
+      if (reportMissing) {
+        issues.add(
+          MdcngNfoSidecarIssue(
+            code: 'artwork_not_found',
+            field: kind.wireName,
+          ),
+        );
+      }
       return;
     }
 

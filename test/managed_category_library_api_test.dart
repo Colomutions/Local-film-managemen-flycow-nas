@@ -330,6 +330,73 @@ Future<void> main() async {
     );
     _expect(deleted.statusCode == HttpStatus.noContent, '删除目录分类成功');
     await _expectMovieTitles(base, viewerToken, const ['异类目标影集']);
+
+    for (final name in ['part-1', 'part-2']) {
+      await File('${otherDirectory.path}${Platform.pathSeparator}$name.mp4')
+          .writeAsBytes(List<int>.generate(8, (index) => index));
+    }
+    final collectionScan = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/scan-jobs',
+      token: adminToken,
+      body: {'categoryId': otherCategory['id']},
+    );
+    _expect(collectionScan.statusCode == HttpStatus.accepted, '影集来源文件扫描已启动');
+    final collectionScanJob =
+        (collectionScan.json['data'] as Map<String, dynamic>)['id'] as String;
+    await _waitForFinishedJob(base, collectionScanJob, adminToken);
+    final scannedFiles = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/media-files?page=1&pageSize=20',
+      token: adminToken,
+    );
+    _expect(scannedFiles.statusCode == HttpStatus.ok, '可读取待合并视频');
+    final files = ((scannedFiles.json['data'] as Map<String, dynamic>)['items']
+            as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .where((item) => (item['title'] as String).startsWith('part-'))
+        .toList(growable: false);
+    _expect(files.length == 2, '待合并视频已分别建档');
+    final episodeIds =
+        files.map((item) => item['id'] as String).toList(growable: false);
+    final metadataSourceMovieId = files.first['movieId'] as String;
+    final mergedCollection = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/collections/$otherCollectionId/episodes',
+      token: adminToken,
+      body: {
+        'episodeIds': episodeIds,
+        'metadataSourceMovieId': metadataSourceMovieId,
+      },
+    );
+    _expect(mergedCollection.statusCode == HttpStatus.ok, '同分类文件可通过 HTTP 合并');
+    final mergedDetails = mergedCollection.json['data'] as Map<String, dynamic>;
+    _expect(mergedDetails['episodeCount'] == 2, '影集包含两段视频');
+    final splitCollection = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/collections/$otherCollectionId/split',
+      token: adminToken,
+      body: {
+        'episodeIds': [episodeIds.first]
+      },
+    );
+    _expect(splitCollection.statusCode == HttpStatus.ok, '影集分集可通过 HTTP 拆分');
+    final remainingCollection = await _request(
+      base,
+      'GET',
+      '/api/v1/movies/$otherCollectionId',
+      token: viewerToken,
+    );
+    _expect(
+      (remainingCollection.json['data']
+              as Map<String, dynamic>)['episodeCount'] ==
+          1,
+      '拆分后影集保留未选中的视频',
+    );
   } finally {
     await server.stop();
     await directory.delete(recursive: true);

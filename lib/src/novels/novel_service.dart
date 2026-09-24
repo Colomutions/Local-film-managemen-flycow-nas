@@ -116,7 +116,7 @@ class NasNovelService {
       repository.cleanupRuntimeState();
       for (final novel in repository.allIncludingUnhealthy()) {
         try {
-          await storage.verifyObject(
+          await storage.verifyObjectMetadata(
             novel.contentSha256,
             expectedSizeBytes: novel.sizeBytes,
           );

@@ -20,9 +20,11 @@ DeepSeek 影片资料识别仅在 Windows 本机影片编辑流程中运行。NA
 
 1. 在 NAS 上将本目录放在应用数据位置（例如飞牛 Docker 的项目目录）。
 2. 复制 `.env.example` 为 `.env`，并设置 `PUID`、`PGID` 和端口。`PUID:PGID` 必须对 `./data` 有写权限；它表示容器内进程访问 NAS 文件时采用的 Linux 用户/组编号。
-3. 主编排文件挂载 `./data:/data` 和可写小说库 `${NOVEL_ROOT:-./novels}:/novels`。服务身份与设备令牌哈希保存在 `/data/state/server.json`；原始令牌和配对码不会写入该文件。
+3. 主编排文件挂载 `./data:/data`、可写小说库 `${NOVEL_ROOT:-./novels}:/novels` 和可写漫画库 `${COMIC_ROOT:-./comics}:/comics`。服务身份与设备令牌哈希保存在 `/data/state/server.json`；原始令牌和配对码不会写入该文件。
 
 小说库只接收完整 UTF-8 TXT 文件。正文作为不可变内容对象保存在 `/novels`，索引、配额、幂等记录和删除审计保存在 `/data` 的 SQLite。`NOVEL_ROOT` 必须是可持久化且对 `PUID:PGID` 可写的目录；不要把它放在容器临时层。`MUJING_NOVEL_QUOTA_BYTES` 留空表示不设置逻辑容量上限，单文件默认上限为 64 MiB。
+
+漫画库接收 ZIP、CBZ 和 PDF，提供完整上传、断点续传、列表、Range 下载及管理端替换和删除。`COMIC_ROOT` 必须是持久化且对 `PUID:PGID` 可写的目录；漫画原文件和登记库都保存在该卷，系统备份不复制漫画文件。`MUJING_COMIC_QUOTA_BYTES` 留空表示不设置逻辑容量上限，单文件默认上限为 2 GiB。容器内使用 `unzip` 和 `pdfinfo` 校验格式，工具不可用时漫画能力关闭。
 
 真实媒体目录尚未确定，因此最小服务默认不挂载。所有日常启动、构建、重启都使用唯一入口：
 
@@ -157,7 +159,13 @@ dart run test/startup_integrity_test.dart
 
 `viewer` 用于 Android 浏览、播放和观看状态 API；`admin` 由 Windows 管理端显式请求。所有 `/api/v1/admin/*` 路由都会拒绝 viewer 为 `403 insufficient_scope`，不会把 Android 默认升级为 admin。
 
-`capabilities` 是 NAS 端实际功能清单，而不是 token 权限的替代品。当前包含 `movies`、`playback`、`watchHistory`、`management`、`categories`、`actors`、`publishers`、`series`、`tags`、`mdcngNfo`、`mdcngActors`、`profilePackages`、`sourceRename`、`transcoding`、`novels`、`novelUpload`、`novelProgress`、`novelUploadResume` 和 `novelFormats`。小说目录不可用时，`novels` 与 `novelUpload` 保持 `false`，并通过 `capabilityStatus.novels` 返回不含路径的状态码。Windows 和 Android 会先按能力清单启用页面和操作，再按 viewer/admin scope 授权；旧档案重新连接一次即可获得清单。`capabilityStatus.mdcngActors` 也只返回不含路径的状态码，用于区分未配置、目录不可达、数据库缺失或不可读。
+MDCNG NFO 可导入单视频影片或包含多个视频的影集。预览会列出每个有同名 NFO 的视频；默认选择此前确认过的来源，否则选择自然排序中的第一份。导入的标题、简介、演员、标签和海报属于整部影片，视频文件名及各自播放进度不变。NFO 未明确引用图片时，NAS 会查找视频同目录的 `poster.jpg`、`fanart.jpg` 和 `thumb.jpg`；目前只导入海报和 `fanart.jpg`（影片画廊），`thumb.jpg` 仅供预览。
+
+分类管理的批量 MDCNG 导入由 NAS 后台逐部串行执行，扫描和批量导入不会同时启动。预览仅统计已扫描影片，不遍历 NFO。批量操作补全空字段、更新之前由 MDCNG 导入的文本字段，保留人工修改的字段；扫描默认标题可被 NFO 标题替换。既有海报或画廊图片不会被批量覆盖。无法精确匹配的演员、标签会列为待核对，其他字段继续导入。没有 NFO 或解析失败的影片列为失败，可在任务完成后重试。任务进度在服务运行期间保留；服务重启后可重新运行同一分类，已导入的来源摘要避免重复写入。二次媒体扫描不会自动重读 NFO。
+
+管理员接口：`POST /api/v1/admin/mdcng-imports/preview` 接受 `movieId` 和可选的 `episodeId`；`POST /api/v1/admin/mdcng-imports/apply` 使用预览返回的 `episodeId` 与 `nfoContentHash`。批量接口为 `GET /api/v1/admin/mdcng-import-jobs/preview?categoryId=...`、`POST /api/v1/admin/mdcng-import-jobs`、`GET /api/v1/admin/mdcng-import-jobs?categoryId=...`、`GET /api/v1/admin/mdcng-import-jobs/{id}`，以及 `POST /api/v1/admin/mdcng-import-jobs/{id}/retry` 或 `/cancel`。
+
+`capabilities` 是 NAS 端实际功能清单，而不是 token 权限的替代品。当前包含 `movies`、`playback`、`watchHistory`、`management`、`categories`、`actors`、`publishers`、`series`、`tags`、`mdcngNfo`、`mdcngActors`、`profilePackages`、`sourceRename`、`transcoding`、`novels`、`novelUpload`、`novelProgress`、`novelUploadResume`、`novelFormats`、`comics`、`comicUpload`、`comicUploadResume` 和 `comicFormats`。小说或漫画目录不可用时对应能力为 `false`，原因由 `capabilityStatus` 返回。Windows 和 Android 会先按能力清单启用页面和操作，再按 viewer/admin scope 授权；旧档案重新连接一次即可获得清单。`capabilityStatus.mdcngActors` 也只返回不含路径的状态码，用于区分未配置、目录不可达、数据库缺失或不可读。
 
 浏览 API 由 NAS SQLite 和扫描结果提供：
 

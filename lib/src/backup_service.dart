@@ -139,6 +139,7 @@ class NasBackupService {
           .writeAsString(
         jsonEncode({
           ...record.toJson(),
+          'comicContentIncluded': false,
           ...?contribution?.manifestFields,
         }),
         flush: true,

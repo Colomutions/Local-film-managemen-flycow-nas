@@ -3730,6 +3730,53 @@ class NasLibraryDatabase {
     return rows.isEmpty ? null : _withResolution(_mapMovie(rows.single));
   }
 
+  List<String> activeMovieIdsForCategory(String categoryId) => _db
+      .select('''
+        SELECT id FROM movies
+        WHERE category_id = ? AND lifecycle_state = 'active'
+          AND EXISTS (SELECT 1 FROM episodes WHERE movie_id = movies.id)
+        ORDER BY id
+      ''', [categoryId])
+      .map((row) => row['id'] as String)
+      .toList(growable: false);
+
+  String? preferredMdcngEpisodeIdForMovie(String movieId) {
+    final linked = _db.select('''
+      SELECT record.episode_id FROM movie_metadata_field_sources source
+      JOIN mdcng_import_records record ON record.id = source.import_record_id
+      WHERE source.movie_id = ?
+      ORDER BY record.created_at DESC, record.id DESC LIMIT 1
+    ''', [movieId]);
+    if (linked.isNotEmpty) return linked.single['episode_id'] as String;
+    final rows = _db.select('''
+      SELECT episode_id FROM mdcng_import_records
+      WHERE movie_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
+    ''', [movieId]);
+    return rows.isEmpty ? null : rows.single['episode_id'] as String;
+  }
+
+  bool hasDefaultScannedTitle(String movieId) {
+    final rows = _db.select('''
+      SELECT m.title, m.entry_type, m.collection_key,
+             (SELECT e.relative_path FROM episodes e
+              WHERE e.movie_id = m.id ORDER BY e.id LIMIT 1) AS relative_path
+      FROM movies m WHERE m.id = ?
+    ''', [movieId]);
+    if (rows.isEmpty) return false;
+    final row = rows.single;
+    final collectionKey = row['collection_key'] as String?;
+    if (collectionKey != null) {
+      final folder = collectionKey
+          .substring(collectionKey.indexOf(':') + 1)
+          .split('/')
+          .last;
+      return row['title'] == _collectionTitleFromDirectory(folder);
+    }
+    if (row['entry_type'] != 'single') return false;
+    final path = row['relative_path'] as String?;
+    return path != null && row['title'] == _titleFromPath(path);
+  }
+
   NasLibraryMovie? setMovieFavorite({
     required String movieId,
     required bool isFavorite,
@@ -4284,6 +4331,16 @@ class NasLibraryDatabase {
     ''', [targetMovieId, fromMovieId]);
     _db.execute('''
       UPDATE movie_carousel_images SET movie_id = ? WHERE movie_id = ?
+    ''', [targetMovieId, fromMovieId]);
+    _db.execute('DELETE FROM movie_metadata_field_sources WHERE movie_id = ?',
+        [targetMovieId]);
+    _db.execute('''
+      INSERT INTO movie_metadata_field_sources(
+        movie_id, field_key, source_kind, import_record_id,
+        source_content_hash, updated_at
+      ) SELECT ?, field_key, source_kind, import_record_id,
+               source_content_hash, updated_at
+        FROM movie_metadata_field_sources WHERE movie_id = ?
     ''', [targetMovieId, fromMovieId]);
   }
 

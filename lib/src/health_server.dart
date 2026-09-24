@@ -25,6 +25,7 @@ import 'novels/novel_http.dart';
 import 'novels/novel_service.dart';
 import 'novels/novel_storage.dart';
 import 'novels/restore_activation.dart';
+import 'comics/comic_http.dart';
 import 'persistent_state.dart';
 import 'range.dart';
 
@@ -110,8 +111,11 @@ class NasHealthServer {
   final NasDiagnosticLogger _logger;
   final NasAiMetadataClient _aiMetadataClient;
   final NasMdcngActorSource? _mdcngActorSource;
+  Future<NasMdcngActorSourceAvailability>? _mdcngAvailabilityProbe;
+  DateTime? _mdcngAvailabilityCheckedAt;
   NasNovelHttpApi? _novelApi;
   NasNovelBackupCoordinator? _novelBackupCoordinator;
+  ComicHttpApi? _comicApi;
   NasRestoreActivationService? _restoreActivation;
   bool _maintenance = false;
   HttpServer? _server;
@@ -119,6 +123,8 @@ class NasHealthServer {
   final Map<String, _PairingSession> _pairingSessions = {};
   final Map<String, _PlaybackSession> _playbackSessions = {};
   final Map<String, _ScanJob> _scanJobs = {};
+  final Map<String, _MdcngBatchJob> _mdcngBatchJobs = {};
+  Future<void>? _activeMdcngBatchTask;
   _FixturePlaybackState? _fixturePlaybackState;
   NasMediaRoot? _configuredMediaRoot;
   int _activeRequests = 0;
@@ -136,16 +142,17 @@ class NasHealthServer {
     _state =
         await _stateStore.load() ?? NasPersistentState(serverId: newUuidV4());
     await _persistState();
-    if (config.novelDir case final novelDir?) {
+    if (config.novelDir != null || config.comicDir != null) {
       _restoreActivation = NasRestoreActivationService(
         dataDir: config.dataDir,
-        novelDir: novelDir,
+        novelDir: config.novelDir,
       );
       await _restoreActivation!.recoverIncompleteActivation();
     }
     await _libraryDatabase.open();
     await _backupService.recoverIncomplete();
     await _initializeNovelServices();
+    await _initializeComicServices();
     _configuredMediaRoot = _libraryDatabase.ensureConfiguredMediaRoot(
       rootName: config.mediaRootName,
       containerPath: config.mediaDir,
@@ -207,17 +214,35 @@ class NasHealthServer {
     }
   }
 
+  Future<void> _initializeComicServices() async {
+    _comicApi?.close();
+    _comicApi = null;
+    if (config.comicDir case final comicDir?) {
+      final api = ComicHttpApi(
+        rootPath: comicDir,
+        maxUploadBytes: config.maxComicUploadBytes,
+        maxChunkBytes: config.maxComicChunkBytes,
+        quotaBytes: config.comicQuotaBytes,
+      );
+      await api.initialize();
+      _comicApi = api;
+    }
+  }
+
   /// Local operational restore entry point. It is intentionally not exposed
   /// through HTTP because activating a database replaces all NAS state.
   Future<void> restoreBackup(String backupId) async {
     final activation = _restoreActivation;
-    if (_server == null || activation == null || config.novelDir == null) {
+    if (_server == null || activation == null) {
       throw StateError('Restore activation is unavailable.');
     }
     final parent = await Directory.systemTemp.createTemp('mujing-restore-');
     final isolated =
         Directory('${parent.path}${Platform.pathSeparator}validated');
     try {
+      if (config.comicDir != null && (_comicApi == null || !_comicApi!.ready)) {
+        throw StateError('Comic catalog is unavailable for restore.');
+      }
       await NasBackupRecoveryHarness(_backupService).restore(
         backupId: backupId,
         target: isolated,
@@ -235,6 +260,8 @@ class NasHealthServer {
           await _libraryDatabase.checkpointAndClose();
           _novelApi = null;
           _novelBackupCoordinator = null;
+          _comicApi?.close();
+          _comicApi = null;
         },
         openAndValidateDatabase: () async {
           await _libraryDatabase.open();
@@ -242,6 +269,8 @@ class NasHealthServer {
             throw StateError('Activated database failed integrity check.');
           }
           await _initializeNovelServices();
+          await _initializeComicServices();
+          await _comicApi?.invalidateSessionsForRestore();
         },
       );
     } finally {
@@ -261,10 +290,18 @@ class NasHealthServer {
     _pairingSessions.clear();
     _playbackSessions.clear();
     _scanJobs.clear();
+    for (final job in _mdcngBatchJobs.values) {
+      if (job.status == 'running' || job.status == 'queued')
+        job.cancelled = true;
+    }
+    await _activeMdcngBatchTask;
+    _mdcngBatchJobs.clear();
     await server?.close(force: true);
     await _libraryDatabase.close();
     _novelApi = null;
     _novelBackupCoordinator = null;
+    _comicApi?.close();
+    _comicApi = null;
     _restoreActivation = null;
   }
 
@@ -339,6 +376,17 @@ class NasHealthServer {
       if (path.startsWith('/api/v1/admin/') && device.scope != 'admin') {
         return await _error(
             request, HttpStatus.forbidden, 'insufficient_scope');
+      }
+      if (path == '/api/v1/comics' ||
+          path.startsWith('/api/v1/comics/') ||
+          path == '/api/v1/admin/comics' ||
+          path.startsWith('/api/v1/admin/comics/')) {
+        final comicApi = _comicApi;
+        return comicApi == null
+            ? await _error(request, HttpStatus.serviceUnavailable,
+                'comic_storage_unavailable')
+            : await comicApi.handle(request,
+                deviceId: device.deviceId, admin: device.scope == 'admin');
       }
       final novelApi = _novelApi;
       if (request.method == 'GET' && path == '/api/v1/novels') {
@@ -536,6 +584,27 @@ class NasHealthServer {
       if (request.method == 'POST' &&
           path == '/api/v1/admin/mdcng-imports/apply') {
         return await _applyMdcngImport(request);
+      }
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/mdcng-import-jobs') {
+        return await _createMdcngBatchJob(request);
+      }
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/mdcng-import-jobs') {
+        return await _listMdcngBatchJobs(request);
+      }
+      if (request.method == 'GET' &&
+          path == '/api/v1/admin/mdcng-import-jobs/preview') {
+        return await _previewMdcngBatchJob(request);
+      }
+      if (request.method == 'GET' &&
+          RegExp(r'^/api/v1/admin/mdcng-import-jobs/[^/]+$').hasMatch(path)) {
+        return await _getMdcngBatchJob(request);
+      }
+      if (request.method == 'POST' &&
+          RegExp(r'^/api/v1/admin/mdcng-import-jobs/[^/]+/(retry|cancel)$')
+              .hasMatch(path)) {
+        return await _changeMdcngBatchJob(request);
       }
       if (request.method == 'GET' &&
           path == '/api/v1/admin/mdcng-actor-imports') {
@@ -876,12 +945,9 @@ class NasHealthServer {
   }
 
   Future<void> _serverInfo(HttpRequest request) async {
-    final mdcngActorAvailability = _mdcngActorSource == null
-        ? const NasMdcngActorSourceAvailability.unavailable(
-            'mdcng_actor_source_not_configured',
-          )
-        : await _mdcngActorSource.checkAvailability();
+    final mdcngActorAvailability = await _cachedMdcngAvailability();
     final novelReady = _novelApi?.isReady ?? false;
+    final comicReady = _comicApi?.ready ?? false;
     final data = <String, Object>{
       'serverId': _state!.serverId,
       'serverName': config.serverName,
@@ -900,6 +966,7 @@ class NasHealthServer {
         'series': true,
         'tags': true,
         'mdcngNfo': true,
+        'mdcngNfoBatch': true,
         'mdcngActors': mdcngActorAvailability.isAvailable,
         'profilePackages': true,
         'sourceRename': config.allowSourceRename,
@@ -909,9 +976,18 @@ class NasHealthServer {
         'novelUploadResume': false,
         'novelFormats': const ['txt'],
         if (novelReady) 'maxNovelUploadBytes': config.maxNovelUploadBytes,
+        'comics': comicReady,
+        'comicUpload': comicReady,
+        'comicUploadResume': comicReady,
+        'comicFormats':
+            comicReady ? const ['zip', 'cbz', 'pdf'] : const <String>[],
+        if (comicReady) 'maxComicUploadBytes': config.maxComicUploadBytes,
+        if (comicReady) 'maxComicChunkBytes': config.maxComicChunkBytes,
       },
       'capabilityStatus': {
         'mdcngActors': mdcngActorAvailability.reason,
+        if (!comicReady)
+          'comics': _comicApi?.unavailableReason ?? 'storage_not_configured',
         if (!novelReady)
           'novels': _novelApi?.unavailableReason ??
               (config.novelDir == null
@@ -924,6 +1000,27 @@ class NasHealthServer {
       data['connection'] = {'endpoint': advertiseUrl};
     }
     await _writeJson(request.response, HttpStatus.ok, {'data': data});
+  }
+
+  Future<NasMdcngActorSourceAvailability> _cachedMdcngAvailability() {
+    final source = _mdcngActorSource;
+    if (source == null) {
+      return Future.value(
+        const NasMdcngActorSourceAvailability.unavailable(
+          'mdcng_actor_source_not_configured',
+        ),
+      );
+    }
+    final now = DateTime.now().toUtc();
+    final checkedAt = _mdcngAvailabilityCheckedAt;
+    final probe = _mdcngAvailabilityProbe;
+    if (probe != null &&
+        checkedAt != null &&
+        now.difference(checkedAt) < const Duration(seconds: 30)) {
+      return probe;
+    }
+    _mdcngAvailabilityCheckedAt = now;
+    return _mdcngAvailabilityProbe = source.checkAvailability();
   }
 
   Future<void> _createPairingSession(HttpRequest request) async {
@@ -3505,6 +3602,9 @@ class NasHealthServer {
       );
 
   Future<void> _createAdminCategory(HttpRequest request) async {
+    if (_activeMdcngBatchTask != null) {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
     final body = await _readJsonBody(request);
     final name = _categoryName(body);
     final sources = await _categorySourceInputs(body);
@@ -3538,6 +3638,9 @@ class NasHealthServer {
   }
 
   Future<void> _updateAdminCategory(HttpRequest request) async {
+    if (_activeMdcngBatchTask != null) {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
     final body = await _readJsonBody(request);
     final name = _categoryName(body);
     final categoryId = request.uri.pathSegments.last;
@@ -3592,6 +3695,9 @@ class NasHealthServer {
   }
 
   Future<void> _deleteAdminCategory(HttpRequest request) async {
+    if (_activeMdcngBatchTask != null) {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
     if (!_libraryDatabase.deleteCategory(
       request.uri.pathSegments.last,
       deleteMovies: config.managedCategoryLibrary,
@@ -4330,32 +4436,38 @@ class NasHealthServer {
   Future<void> _previewMdcngImport(HttpRequest request) async {
     final body = await _readJsonBody(request);
     final movieId = body?['movieId'];
+    final requestedEpisodeId = body?['episodeId'];
     if (body == null ||
-        body.length != 1 ||
+        body.keys.any((key) => key != 'movieId' && key != 'episodeId') ||
         movieId is! String ||
-        movieId.isEmpty) {
+        movieId.isEmpty ||
+        (requestedEpisodeId != null &&
+            (requestedEpisodeId is! String || requestedEpisodeId.isEmpty))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
     final movie = _libraryDatabase.findMovieForAdmin(movieId);
     if (movie == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    final episodes = _libraryDatabase.episodesForMovie(movie.id);
-    if (episodes.length != 1) {
-      return _error(
-        request,
-        HttpStatus.conflict,
-        'mdcng_import_requires_single_episode',
-      );
+    final sources = await _mdcngSourcesForMovie(movie.id);
+    if (sources.isEmpty) {
+      return _error(request, HttpStatus.notFound, 'mdcng_sidecar_not_found');
     }
-    final episode = episodes.single;
-    if (!episode.isAvailable) {
+    final preferredEpisodeId =
+        _libraryDatabase.preferredMdcngEpisodeIdForMovie(movie.id);
+    final selected = requestedEpisodeId == null
+        ? sources
+                .where((source) => source.episode.id == preferredEpisodeId)
+                .firstOrNull ??
+            sources.first
+        : sources
+            .where((source) => source.episode.id == requestedEpisodeId)
+            .firstOrNull;
+    if (selected == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    final video = await _fileForEpisode(episode);
-    if (video == null) {
-      return _error(request, HttpStatus.notFound, 'resource_not_found');
-    }
+    final episode = selected.episode;
+    final video = selected.video;
 
     final MdcngNfoSidecar sidecar;
     try {
@@ -4412,6 +4524,14 @@ class NasHealthServer {
           'nfoFileName': sidecar.nfoFileName,
           'nfoContentHash': sidecar.nfoContentHash,
         },
+        'sources': sources
+            .map((source) => {
+                  'episodeId': source.episode.id,
+                  'sourceFileName':
+                      _sourceFileName(source.episode.relativePath),
+                  'nfoFileName': source.nfoFileName,
+                })
+            .toList(growable: false),
         'current': {
           'title': movie.title,
           'originalTitle': movie.originalTitle,
@@ -4494,6 +4614,9 @@ class NasHealthServer {
 
   /// 写入前重新读取 sidecar；客户端必须提交预览返回的内容摘要和字段选择。
   Future<void> _applyMdcngImport(HttpRequest request) async {
+    if (_activeMdcngBatchTask != null) {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
     final body = await _readJsonBody(request);
     final movieId = body?['movieId'];
     final episodeId = body?['episodeId'];
@@ -4549,14 +4672,6 @@ class NasHealthServer {
         episode.movieId != movie.id ||
         !episode.isAvailable) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
-    }
-    final episodes = _libraryDatabase.episodesForMovie(movie.id);
-    if (episodes.length != 1) {
-      return _error(
-        request,
-        HttpStatus.conflict,
-        'mdcng_import_requires_single_episode',
-      );
     }
     final video = await _fileForEpisode(episode);
     if (video == null) {
@@ -4776,6 +4891,376 @@ class NasHealthServer {
       }
       return _error(
           request, HttpStatus.internalServerError, 'mdcng_import_failed');
+    }
+  }
+
+  Future<List<_MdcngSource>> _mdcngSourcesForMovie(
+    String movieId, {
+    bool firstOnly = false,
+  }) async {
+    final sources = <_MdcngSource>[];
+    const reader = MdcngNfoSidecarReader();
+    final episodes = _libraryDatabase.episodesForMovie(movieId);
+    final preferredId = firstOnly
+        ? _libraryDatabase.preferredMdcngEpisodeIdForMovie(movieId)
+        : null;
+    final ordered = firstOnly && preferredId != null
+        ? [
+            ...episodes.where((episode) => episode.id == preferredId),
+            ...episodes.where((episode) => episode.id != preferredId),
+          ]
+        : episodes;
+    for (final episode in ordered) {
+      if (!episode.isAvailable) continue;
+      final video = await _fileForEpisode(episode);
+      if (video == null) continue;
+      try {
+        if (!await reader.hasNfoForVideo(video)) continue;
+      } on FileSystemException {
+        continue;
+      } on MdcngNfoSidecarException {
+        continue;
+      }
+      final name = _sourceFileName(episode.relativePath);
+      sources.add(_MdcngSource(
+        episode: episode,
+        video: video,
+        nfoFileName: '${name.substring(0, name.lastIndexOf('.'))}.nfo',
+      ));
+      if (firstOnly) break;
+    }
+    return sources;
+  }
+
+  Future<void> _createMdcngBatchJob(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final categoryId = body?['categoryId'];
+    if (body == null ||
+        body.length != 1 ||
+        categoryId is! String ||
+        _libraryDatabase.findCategory(categoryId) == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    if (_activeMdcngBatchTask != null) {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
+    if (_scanJobs.values
+        .any((job) => job.status == 'queued' || job.status == 'running')) {
+      return _error(request, HttpStatus.conflict, 'scan_running');
+    }
+    final job = _MdcngBatchJob(
+      id: newUuidV4(),
+      categoryId: categoryId,
+      movieIds: _libraryDatabase.activeMovieIdsForCategory(categoryId),
+    );
+    _rememberMdcngBatchJob(job);
+    _activeMdcngBatchTask =
+        Future<void>.delayed(Duration.zero).then((_) => _runMdcngBatchJob(job));
+    await _writeJson(request.response, HttpStatus.accepted, {
+      'data': _mdcngBatchJobPayload(job),
+    });
+  }
+
+  Future<void> _listMdcngBatchJobs(HttpRequest request) async {
+    final categoryId = request.uri.queryParameters['categoryId'];
+    if (categoryId == null ||
+        _libraryDatabase.findCategory(categoryId) == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final jobs = _mdcngBatchJobs.values
+        .where((job) => job.categoryId == categoryId)
+        .toList(growable: false);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'job': jobs.isEmpty ? null : _mdcngBatchJobPayload(jobs.last)},
+    });
+  }
+
+  Future<void> _previewMdcngBatchJob(HttpRequest request) async {
+    final categoryId = request.uri.queryParameters['categoryId'];
+    if (categoryId == null ||
+        _libraryDatabase.findCategory(categoryId) == null) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'categoryId': categoryId,
+        'movieCount':
+            _libraryDatabase.activeMovieIdsForCategory(categoryId).length,
+      },
+    });
+  }
+
+  Future<void> _getMdcngBatchJob(HttpRequest request) async {
+    final job = _mdcngBatchJobs[request.uri.pathSegments.last];
+    if (job == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': _mdcngBatchJobPayload(job),
+    });
+  }
+
+  Future<void> _changeMdcngBatchJob(HttpRequest request) async {
+    final segments = request.uri.pathSegments;
+    final job = _mdcngBatchJobs[segments[segments.length - 2]];
+    if (job == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (segments.last == 'cancel') {
+      if (job.status == 'running' || job.status == 'queued')
+        job.cancelled = true;
+      return _writeJson(request.response, HttpStatus.ok, {
+        'data': _mdcngBatchJobPayload(job),
+      });
+    }
+    if (_activeMdcngBatchTask != null || job.status != 'succeeded') {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
+    final retryIds = job.failures.keys.toList(growable: false);
+    if (retryIds.isEmpty) {
+      return _error(request, HttpStatus.conflict, 'mdcng_no_failed_items');
+    }
+    final retry = _MdcngBatchJob(
+      id: newUuidV4(),
+      categoryId: job.categoryId,
+      movieIds: retryIds,
+    );
+    _rememberMdcngBatchJob(retry);
+    _activeMdcngBatchTask = Future<void>.delayed(Duration.zero)
+        .then((_) => _runMdcngBatchJob(retry));
+    await _writeJson(request.response, HttpStatus.accepted, {
+      'data': _mdcngBatchJobPayload(retry),
+    });
+  }
+
+  Map<String, Object?> _mdcngBatchJobPayload(_MdcngBatchJob job) => {
+        'id': job.id,
+        'categoryId': job.categoryId,
+        'status': job.status,
+        'errorCode': job.errorCode,
+        'total': job.movieIds.length,
+        'processed': job.processed,
+        'applied': job.applied,
+        'skipped': job.skipped,
+        'failed': job.failures.length,
+        'warningCount': job.warnings.length,
+        'warnings': job.status == 'running'
+            ? const <Object>[]
+            : job.warnings.entries
+                .map((entry) => {
+                      'movieId': entry.key,
+                      'title': entry.value.title,
+                      'fields': entry.value.fields,
+                    })
+                .toList(growable: false),
+        'failures': job.status == 'running'
+            ? const <Object>[]
+            : job.failures.entries
+                .map((entry) => {
+                      'movieId': entry.key,
+                      'title': entry.value.title,
+                      'reason': entry.value.reason,
+                    })
+                .toList(growable: false),
+      };
+
+  void _rememberMdcngBatchJob(_MdcngBatchJob job) {
+    _mdcngBatchJobs[job.id] = job;
+    while (_mdcngBatchJobs.length > 10) {
+      _mdcngBatchJobs.remove(_mdcngBatchJobs.keys.first);
+    }
+  }
+
+  Future<void> _runMdcngBatchJob(_MdcngBatchJob job) async {
+    job.status = 'running';
+    try {
+      for (final movieId in job.movieIds) {
+        if (job.cancelled) break;
+        final movie = _libraryDatabase.findMovieForAdmin(movieId);
+        try {
+          final result = await _importMdcngBatchMovie(movieId, job.categoryId);
+          if (result.warnings.isNotEmpty) {
+            job.warnings[movieId] = (
+              title: movie?.title ?? '未知影片',
+              fields: result.warnings,
+            );
+          }
+          if (result.status == 'applied') {
+            job.applied++;
+          } else {
+            job.skipped++;
+          }
+        } on Object catch (error) {
+          job.failures[movieId] = (
+            title: movie?.title ?? '未知影片',
+            reason: error is MdcngNfoSidecarException
+                ? error.code
+                : error is FileSystemException
+                    ? 'sidecar_read_failed'
+                    : 'mdcng_import_failed',
+          );
+        }
+        job.processed++;
+        await Future<void>.delayed(Duration.zero);
+      }
+      job.status = job.cancelled ? 'cancelled' : 'succeeded';
+    } on Object {
+      job.status = 'failed';
+      job.errorCode = 'mdcng_import_failed';
+    } finally {
+      _activeMdcngBatchTask = null;
+    }
+  }
+
+  Future<({String status, List<String> warnings})> _importMdcngBatchMovie(
+      String movieId, String categoryId) async {
+    final movie = _libraryDatabase.findMovieForAdmin(movieId);
+    if (movie == null || movie.categoryId != categoryId) {
+      return (status: 'skipped', warnings: const <String>[]);
+    }
+    final sources = await _mdcngSourcesForMovie(movieId, firstOnly: true);
+    if (sources.isEmpty) {
+      throw const MdcngNfoSidecarException('sidecar_not_found');
+    }
+    final source = sources.first;
+    const reader = MdcngNfoSidecarReader();
+    final sidecar = await reader.readForVideo(source.video);
+    final provenance = _libraryDatabase.metadataFieldSourcesForMovie(movieId);
+    final fields = <String>[];
+    final warnings = <String>[];
+    bool canUpdate(String key, {required bool empty}) {
+      final previous = provenance[key];
+      if (previous?.sourceKind == 'manual' ||
+          previous?.sourceContentHash == sidecar.nfoContentHash) {
+        return false;
+      }
+      return previous?.sourceKind == 'mdcng' || empty;
+    }
+
+    final title = _nullableTrimmed(sidecar.movie.title);
+    final originalTitle = _mdcngOriginalTitle(sidecar.movie);
+    final catalogNumber = _nullableTrimmed(sidecar.movie.catalogNumber);
+    final summary = _nullableTrimmed(sidecar.movie.plot) ??
+        _nullableTrimmed(sidecar.movie.outline);
+    if (title != null &&
+        title != movie.title &&
+        canUpdate('title',
+            empty: _libraryDatabase.hasDefaultScannedTitle(movieId))) {
+      fields.add('title');
+    }
+    if (originalTitle != null &&
+        originalTitle != movie.originalTitle &&
+        canUpdate('originalTitle',
+            empty: _nullableTrimmed(movie.originalTitle) == null)) {
+      fields.add('originalTitle');
+    }
+    if (catalogNumber != null &&
+        catalogNumber != movie.catalogNumber &&
+        canUpdate('catalogNumber',
+            empty: _nullableTrimmed(movie.catalogNumber) == null)) {
+      fields.add('catalogNumber');
+    }
+    if (summary != null &&
+        summary != movie.summary &&
+        canUpdate('summary', empty: _nullableTrimmed(movie.summary) == null)) {
+      fields.add('summary');
+    }
+
+    List<String>? actorIds;
+    if (sidecar.movie.actors.isNotEmpty &&
+        canUpdate('actors',
+            empty: _libraryDatabase.actorsForMovie(movieId).isEmpty)) {
+      final ids = <String>[];
+      for (final name
+          in sidecar.movie.actors.map((actor) => actor.name).toSet()) {
+        final actor = _libraryDatabase.findActiveActorByExactName(name);
+        if (actor == null) {
+          ids.clear();
+          break;
+        }
+        ids.add(actor.id);
+      }
+      if (ids.isNotEmpty) {
+        actorIds = ids;
+        fields.add('actors');
+      } else {
+        warnings.add('actors_unresolved');
+      }
+    }
+    List<String>? tagIds;
+    if (sidecar.movie.tagsAndGenres.isNotEmpty &&
+        canUpdate('tags',
+            empty: _libraryDatabase.tagsForMovie(movieId).isEmpty)) {
+      final ids = <String>[];
+      for (final name in sidecar.movie.tagsAndGenres) {
+        final tag = _libraryDatabase.findActiveTagByName(name);
+        if (tag == null) {
+          ids.clear();
+          break;
+        }
+        ids.add(tag.id);
+      }
+      if (ids.isNotEmpty) {
+        tagIds = ids.toSet().toList(growable: false);
+        fields.add('tags');
+      } else {
+        warnings.add('tags_unresolved');
+      }
+    }
+    final poster = sidecar.artwork
+        .where((item) => item.kind == MdcngNfoArtworkKind.poster)
+        .firstOrNull;
+    final fanart = sidecar.artwork
+        .where((item) => item.kind == MdcngNfoArtworkKind.fanart)
+        .firstOrNull;
+    if (poster != null &&
+        movie.posterFileName == null &&
+        canUpdate('poster', empty: true)) fields.add('poster');
+    if (fanart != null &&
+        canUpdate('fanart',
+            empty: _libraryDatabase.carouselImagesForMovie(movieId).isEmpty) &&
+        _libraryDatabase.carouselImagesForMovie(movieId).isEmpty) {
+      fields.add('fanart');
+    }
+    if (fields.isEmpty) return (status: 'skipped', warnings: warnings);
+
+    String? posterFileName;
+    String? fanartFileName;
+    try {
+      if (fields.contains('poster')) {
+        final bytes = await reader.readArtworkBytes(
+            video: source.video, artwork: poster!);
+        posterFileName = await _artworkService.savePoster(
+            movieId: movieId, mimeType: poster.mimeType, bytes: bytes);
+      }
+      if (fields.contains('fanart')) {
+        final bytes = await reader.readArtworkBytes(
+            video: source.video, artwork: fanart!);
+        fanartFileName = await _artworkService.saveCarouselImage(
+            movieId: movieId, mimeType: fanart.mimeType, bytes: bytes);
+      }
+      _libraryDatabase.applyMdcngMetadata(NasMdcngMetadataApply(
+        movieId: movieId,
+        episodeId: source.episode.id,
+        nfoFileName: sidecar.nfoFileName,
+        nfoContentHash: sidecar.nfoContentHash,
+        fieldKeys: fields,
+        title: fields.contains('title') ? title : null,
+        originalTitle: fields.contains('originalTitle') ? originalTitle : null,
+        catalogNumber: fields.contains('catalogNumber') ? catalogNumber : null,
+        summary: fields.contains('summary') ? summary : null,
+        actorIds: actorIds,
+        tagIds: tagIds,
+        posterFileName: posterFileName,
+        fanartFileName: fanartFileName,
+      ));
+      return (status: 'applied', warnings: warnings);
+    } on Object {
+      await _deleteMdcngImportedArtwork(
+        posterFileName: posterFileName,
+        fanartFileName: fanartFileName,
+      );
+      rethrow;
     }
   }
 
@@ -5817,7 +6302,7 @@ class NasHealthServer {
         metadataSourceMovieId is! String) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final targetMovieId = request.uri.pathSegments[5];
+    final targetMovieId = request.uri.pathSegments[4];
     if (!_libraryDatabase.mergeEpisodesIntoSeries(
       targetMovieId: targetMovieId,
       episodeIds: episodeIds.cast<String>(),
@@ -5840,7 +6325,7 @@ class NasHealthServer {
         episodeIds.any((item) => item is! String)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final movieId = request.uri.pathSegments[5];
+    final movieId = request.uri.pathSegments[4];
     final movies = _libraryDatabase.splitEpisodesIntoSingles(
       movieId: movieId,
       episodeIds: episodeIds.cast<String>(),
@@ -6009,6 +6494,9 @@ class NasHealthServer {
   }
 
   Future<void> _createScanJob(HttpRequest request) async {
+    if (_activeMdcngBatchTask != null) {
+      return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
+    }
     final body = await _readJsonBody(request);
     final categoryId = body?['categoryId'];
     final mediaRootId = body?['mediaRootId'];
@@ -7221,8 +7709,11 @@ class NasHealthServer {
           'The requested episodes cannot be split from this collection.',
       'collection_migration_conflict':
           'The migration preview is stale or requires a valid metadata source.',
-      'mdcng_import_requires_single_episode':
-          'MDCNG import preview currently requires a movie with exactly one episode.',
+      'mdcng_batch_running':
+          'A category MDCNG import is running; wait for it to finish.',
+      'mdcng_no_failed_items':
+          'The category MDCNG import has no failed items to retry.',
+      'scan_running': 'A media scan is running; wait for it to finish.',
       'mdcng_sidecar_not_found':
           'No MDCNG NFO matching the video file name was found next to the video.',
       'invalid_mdcng_sidecar':
@@ -7439,6 +7930,38 @@ class _ScanJob {
   DateTime? startedAt;
   DateTime? finishedAt;
   String? errorCode;
+}
+
+class _MdcngSource {
+  const _MdcngSource({
+    required this.episode,
+    required this.video,
+    required this.nfoFileName,
+  });
+
+  final NasLibraryEpisode episode;
+  final NasMediaFile video;
+  final String nfoFileName;
+}
+
+class _MdcngBatchJob {
+  _MdcngBatchJob({
+    required this.id,
+    required this.categoryId,
+    required this.movieIds,
+  });
+
+  final String id;
+  final String categoryId;
+  final List<String> movieIds;
+  final Map<String, ({String title, String reason})> failures = {};
+  final Map<String, ({String title, List<String> fields})> warnings = {};
+  String status = 'queued';
+  String? errorCode;
+  int processed = 0;
+  int applied = 0;
+  int skipped = 0;
+  bool cancelled = false;
 }
 
 List<String> _stringListFromJson(String? value) {

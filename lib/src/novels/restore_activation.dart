@@ -6,11 +6,11 @@ import 'package:crypto/crypto.dart';
 class NasRestoreActivationService {
   NasRestoreActivationService({
     required this.dataDir,
-    required this.novelDir,
+    this.novelDir,
   });
 
   final String dataDir;
-  final String novelDir;
+  final String? novelDir;
 
   Directory get _databaseDirectory =>
       Directory('$dataDir${Platform.pathSeparator}db');
@@ -120,6 +120,8 @@ class NasRestoreActivationService {
     if (decoded is! Map) throw StateError('Backup manifest is invalid.');
     final novels = decoded['novels'];
     if (novels == null) return;
+    if (novelDir == null)
+      throw StateError('Novel storage is unavailable for restore.');
     if (novels is! Map || novels['items'] is! List) {
       throw StateError('Novel backup manifest is invalid.');
     }

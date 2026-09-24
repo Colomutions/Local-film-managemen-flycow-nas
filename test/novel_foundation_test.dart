@@ -262,7 +262,6 @@ Future<void> _testStorageAndRepository() async {
     }
     _expect(invalidUtf8Rejected, 'invalid UTF-8 is rejected');
 
-    await storage.objectFile(received.sha256).delete();
     final service = NasNovelService(
       repository: repository,
       storage: storage,
@@ -270,6 +269,28 @@ Future<void> _testStorageAndRepository() async {
       uploadConcurrency: 1,
       uploadRequestsPerMinute: 30,
     );
+    final object = storage.objectFile(received.sha256);
+    final altered = List<int>.of(bytes)..[0] = bytes[0] == 0 ? 1 : 0;
+    await object.writeAsBytes(altered, flush: true);
+    await storage.verifyObjectMetadata(
+      received.sha256,
+      expectedSizeBytes: bytes.length,
+    );
+    var fullHashRejected = false;
+    try {
+      await storage.verifyObject(
+        received.sha256,
+        expectedSizeBytes: bytes.length,
+      );
+    } on NasNovelStorageException {
+      fullHashRejected = true;
+    }
+    _expect(fullHashRejected, 'full verification detects same-size corruption');
+    await service.initialize();
+    _expect(repository.find(created.novel.id) != null,
+        'startup metadata check does not read the full novel');
+
+    await object.delete();
     await service.initialize();
     _expect(
       repository.find(created.novel.id) == null &&

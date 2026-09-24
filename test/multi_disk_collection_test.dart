@@ -250,6 +250,14 @@ Future<void> main() async {
       ),
       '为来源条目建立标签关联',
     );
+    database.applyMdcngMetadata(NasMdcngMetadataApply(
+      movieId: separated.id,
+      episodeId: episodeForMigration.id,
+      nfoFileName: '001.nfo',
+      nfoContentHash: 'test-hash',
+      fieldKeys: const ['title'],
+      title: '来源 NFO 标题',
+    ));
 
     final manualSeries = database.createEmptySeries(
       title: '管理员影集',
@@ -262,6 +270,15 @@ Future<void> main() async {
         metadataSourceMovieId: separated.id,
       ),
       '管理员可把已扫描文件合并到空影集',
+    );
+    _expect(
+      database.preferredMdcngEpisodeIdForMovie(manualSeries.id) ==
+              episodeForMigration.id &&
+          database
+                  .metadataFieldSourcesForMovie(manualSeries.id)['title']
+                  ?.sourceKind ==
+              'mdcng',
+      '手工合并保留所选资料来源的 NFO 标记',
     );
     _expect(
       database.lastPlaybackStartedAtForMovie(manualSeries.id) != null,

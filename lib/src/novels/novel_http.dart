@@ -72,7 +72,7 @@ class NasNovelHttpApi {
         );
       }
       try {
-        await service.storage.verifyObject(
+        await service.storage.verifyObjectMetadata(
           novel.contentSha256,
           expectedSizeBytes: novel.sizeBytes,
         );

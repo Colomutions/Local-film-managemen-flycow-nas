@@ -231,14 +231,9 @@ class NasNovelStorage {
     String digest, {
     required int expectedSizeBytes,
   }) async {
+    await verifyObjectMetadata(digest, expectedSizeBytes: expectedSizeBytes);
     final file = objectFile(digest);
     try {
-      if (!await file.exists() || await file.length() != expectedSizeBytes) {
-        throw const NasNovelStorageException(
-          'novel_content_unavailable',
-          'novel content is missing or has an invalid size',
-        );
-      }
       final actual = await sha256.bind(file.openRead()).first;
       if (actual.toString() != digest) {
         throw const NasNovelStorageException(
@@ -250,6 +245,29 @@ class NasNovelStorage {
       throw NasNovelStorageException(
         'novel_content_unavailable',
         'novel content could not be read',
+        error,
+      );
+    }
+  }
+
+  Future<void> verifyObjectMetadata(
+    String digest, {
+    required int expectedSizeBytes,
+  }) async {
+    final file = objectFile(digest);
+    try {
+      final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file ||
+          stat.size != expectedSizeBytes) {
+        throw const NasNovelStorageException(
+          'novel_content_unavailable',
+          'novel content is missing or has an invalid size',
+        );
+      }
+    } on FileSystemException catch (error) {
+      throw NasNovelStorageException(
+        'novel_content_unavailable',
+        'novel content could not be checked',
         error,
       );
     }

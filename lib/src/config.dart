@@ -25,6 +25,10 @@ class NasConfig {
     this.maxNovelUploadBytes = 64 * 1024 * 1024,
     this.novelUploadConcurrency = 1,
     this.novelUploadRequestsPerMinute = 30,
+    this.comicDir,
+    this.comicQuotaBytes,
+    this.maxComicUploadBytes = 2 * 1024 * 1024 * 1024,
+    this.maxComicChunkBytes = 64 * 1024 * 1024,
   });
 
   factory NasConfig.fromEnvironment(Map<String, String> environment) {
@@ -81,6 +85,13 @@ class NasConfig {
         'MUJING_NOVEL_UPLOAD_REQUESTS_PER_MINUTE',
         30,
       ),
+      comicDir: _absoluteDirectory(environment, 'MUJING_COMIC_DIR'),
+      comicQuotaBytes:
+          _optionalPositiveInt(environment, 'MUJING_COMIC_QUOTA_BYTES'),
+      maxComicUploadBytes: _positiveInt(
+          environment, 'MUJING_MAX_COMIC_UPLOAD_BYTES', 2 * 1024 * 1024 * 1024),
+      maxComicChunkBytes: _positiveInt(
+          environment, 'MUJING_MAX_COMIC_CHUNK_BYTES', 64 * 1024 * 1024),
     );
   }
 
@@ -117,6 +128,10 @@ class NasConfig {
   final int maxNovelUploadBytes;
   final int novelUploadConcurrency;
   final int novelUploadRequestsPerMinute;
+  final String? comicDir;
+  final int? comicQuotaBytes;
+  final int maxComicUploadBytes;
+  final int maxComicChunkBytes;
 
   static String _logLevel(Map<String, String> environment) {
     final value = _value(environment, 'MUJING_LOG_LEVEL', 'INFO').toUpperCase();
