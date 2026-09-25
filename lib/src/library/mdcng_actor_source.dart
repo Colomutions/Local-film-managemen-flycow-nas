@@ -13,6 +13,10 @@ class NasMdcngActorSource {
   NasMdcngActorSource(this.dataDir);
 
   final String dataDir;
+  static const _snapshotLifetime = Duration(seconds: 30);
+  Future<_MdcngActorSnapshot>? _snapshotRead;
+  _MdcngActorSnapshot? _snapshot;
+  DateTime? _snapshotAt;
 
   /// A cheap readiness probe for server-info. It deliberately exposes only a
   /// stable reason code, never the administrator's source path or file names.
@@ -45,7 +49,45 @@ class NasMdcngActorSource {
 
   Future<List<NasMdcngActorSourceRecord>> readCompletedActors({
     Map<String, String> selectedProfileKeys = const {},
+    bool forceRefresh = false,
   }) async {
+    final snapshot = await _loadSnapshot(forceRefresh: forceRefresh);
+    return snapshot.tasks
+        .map(
+          (task) => _recordFor(
+            task: task,
+            lookup: snapshot.lookup,
+            selectedProfileKey: selectedProfileKeys[task.id],
+          ),
+        )
+        .toList(growable: false);
+  }
+
+  Future<_MdcngActorSnapshot> _loadSnapshot(
+      {required bool forceRefresh}) async {
+    final cached = _snapshot;
+    final checkedAt = _snapshotAt;
+    if (!forceRefresh &&
+        cached != null &&
+        checkedAt != null &&
+        DateTime.now().difference(checkedAt) < _snapshotLifetime) {
+      return cached;
+    }
+    final reading = _snapshotRead;
+    if (reading != null) return reading;
+    final next = _readSnapshot();
+    _snapshotRead = next;
+    try {
+      final result = await next;
+      _snapshot = result;
+      _snapshotAt = DateTime.now();
+      return result;
+    } finally {
+      _snapshotRead = null;
+    }
+  }
+
+  Future<_MdcngActorSnapshot> _readSnapshot() async {
     final root = Directory(dataDir);
     if (!await root.exists()) {
       throw const NasMdcngActorSourceException('source_unavailable');
@@ -63,16 +105,7 @@ class NasMdcngActorSource {
     // lock side files next to the database).  Query a short-lived local copy
     // instead.  The source directory remains entirely read-only.
     final profiles = await _readProfilesSnapshot(actressFile);
-    return tasks
-        .map(
-          (task) => _recordFor(
-            task: task,
-            profiles: profiles,
-            imageFiles: imageFiles,
-            selectedProfileKey: selectedProfileKeys[task.id],
-          ),
-        )
-        .toList(growable: false);
+    return _MdcngActorSnapshot(tasks, _MdcngActorLookup(profiles, imageFiles));
   }
 
   String _path(String name) => '$dataDir${Platform.pathSeparator}$name';
@@ -200,21 +233,23 @@ class NasMdcngActorSource {
 
   NasMdcngActorSourceRecord _recordFor({
     required _MdcngTask task,
-    required List<_MdcngProfile> profiles,
-    required List<File> imageFiles,
+    required _MdcngActorLookup lookup,
     required String? selectedProfileKey,
   }) {
-    final automaticMatches = _matchProfiles(task.displayName, profiles);
-    final suggestions = _suggestProfiles(
-      task.displayName,
-      profiles,
-      automaticMatches,
-    );
+    final normalizedName = _normalizeName(task.displayName);
+    final automaticMatches =
+        lookup.exactProfiles[normalizedName] ?? const <_MdcngProfile>[];
+    final suggestions = automaticMatches.isNotEmpty
+        ? automaticMatches
+        : (normalizedName.runes.length < 2
+                ? const <_MdcngProfile>[]
+                : lookup.prefixProfiles[_namePrefix(normalizedName)] ??
+                    const <_MdcngProfile>[])
+            .take(12)
+            .toList(growable: false);
     final selectedMatches = selectedProfileKey == null
         ? const <_MdcngProfile>[]
-        : profiles
-            .where((profile) => profile.key == selectedProfileKey)
-            .toList(growable: false);
+        : lookup.profilesByKey[selectedProfileKey] ?? const <_MdcngProfile>[];
     // A manual choice is never made by fuzzy matching: it must be the exact
     // canonical name from Actress.db and must identify one profile.
     final resolved = selectedMatches.length == 1
@@ -224,7 +259,13 @@ class NasMdcngActorSource {
             : null;
     final images = resolved == null
         ? const <NasMdcngActorSourceImage>[]
-        : _imagesFor(resolved.name, imageFiles);
+        : _imagesFor(
+            resolved.name,
+            lookup.imageFilesByPrefix[
+                    _namePrefix(_normalizeName(resolved.name))] ??
+                const <File>[],
+            lookup.imageLength,
+          );
     final fingerprint = sha256Hex(
       jsonEncode({
         // Bump when the set of NAS-owned fields derived from one unchanged
@@ -284,6 +325,13 @@ class NasMdcngActorSource {
               key: profile.key,
               name: profile.name,
               romanizedName: profile.roma,
+              hasPhoto: _hasPhotoForName(
+                profile.name,
+                lookup.imageFilesByPrefix[
+                        _namePrefix(_normalizeName(profile.name))] ??
+                    const <File>[],
+              ),
+              missingFieldCount: _missingCandidateFieldCount(profile),
             ),
           )
           .toList(growable: false),
@@ -292,50 +340,10 @@ class NasMdcngActorSource {
     );
   }
 
-  List<_MdcngProfile> _matchProfiles(
-    String sourceName,
-    List<_MdcngProfile> profiles,
-  ) {
-    final normalizedSource = _normalizeName(sourceName);
-    if (normalizedSource.isEmpty) return const <_MdcngProfile>[];
-    final exact = profiles
-        .where(
-          (profile) => [profile.name, ...profile.aliases]
-              .map(_normalizeName)
-              .contains(normalizedSource),
-        )
-        .toList(growable: false);
-    // A prefix or fuzzy match must never become an automatic import decision.
-    // It can be offered below as a candidate, but a person has to select it.
-    return _distinctProfiles(exact);
-  }
-
-  /// Provides a small, explicit-choice-only list when translated and native
-  /// spellings differ (for example 涼森玲夢 and 涼森れむ).  These suggestions
-  /// never resolve a profile automatically.
-  List<_MdcngProfile> _suggestProfiles(
-    String sourceName,
-    List<_MdcngProfile> profiles,
-    List<_MdcngProfile> automaticMatches,
-  ) {
-    if (automaticMatches.isNotEmpty) return automaticMatches;
-    final normalized = _normalizeName(sourceName);
-    final prefix = String.fromCharCodes(normalized.runes.take(2));
-    if (prefix.runes.length < 2) return const <_MdcngProfile>[];
-    return _distinctProfiles(
-      profiles
-          .where(
-            (profile) => [profile.name, ...profile.aliases].any(
-              (candidate) => _normalizeName(candidate).startsWith(prefix),
-            ),
-          )
-          .toList(growable: false),
-    ).take(12).toList(growable: false);
-  }
-
   List<NasMdcngActorSourceImage> _imagesFor(
     String name,
     List<File> imageFiles,
+    int Function(File) imageLength,
   ) {
     final normalizedName = _normalizeName(name);
     final result = <NasMdcngActorSourceImage>[];
@@ -350,18 +358,102 @@ class NasMdcngActorSource {
           fileName: fileName,
           kind: isBackdrop ? 'backdrop' : 'photo',
           mimeType: _mimeTypeForPath(file.path)!,
+          byteLength: imageLength(file),
         ),
       );
     }
     return result;
   }
+
+  bool _hasPhotoForName(String name, List<File> imageFiles) {
+    final normalizedName = _normalizeName(name);
+    return imageFiles.any((file) {
+      final fileName = file.uri.pathSegments.last;
+      final baseName = fileName.replaceFirst(RegExp(r'\.[^.]+$'), '');
+      return _normalizeName(baseName).startsWith(normalizedName) &&
+          !baseName.toLowerCase().contains('big');
+    });
+  }
+
+  int _missingCandidateFieldCount(_MdcngProfile profile) => <Object?>[
+        profile.roma,
+        profile.birthday,
+        profile.heightCm,
+        profile.bust,
+        profile.waist,
+        profile.hip,
+        profile.cup,
+        profile.birthplace,
+        profile.careerPeriod,
+        profile.debutWork,
+        profile.accountUrl,
+        profile.officialSiteUrl,
+      ]
+          .where((value) => value == null || value is String && value.isEmpty)
+          .length;
+}
+
+class _MdcngActorSnapshot {
+  const _MdcngActorSnapshot(this.tasks, this.lookup);
+
+  final List<_MdcngTask> tasks;
+  final _MdcngActorLookup lookup;
+}
+
+class _MdcngActorLookup {
+  _MdcngActorLookup(List<_MdcngProfile> profiles, List<File> imageFiles) {
+    for (final profile in profiles) {
+      profilesByKey.putIfAbsent(profile.key, () => []).add(profile);
+      for (final name in [profile.name, ...profile.aliases]) {
+        final normalized = _normalizeName(name);
+        if (normalized.isEmpty) continue;
+        exactProfiles.putIfAbsent(normalized, () => []).add(profile);
+        if (normalized.runes.length >= 2) {
+          prefixProfiles
+              .putIfAbsent(_namePrefix(normalized), () => [])
+              .add(profile);
+        }
+      }
+    }
+    for (final entry in exactProfiles.entries) {
+      exactProfiles[entry.key] = _distinctProfiles(entry.value);
+    }
+    for (final entry in prefixProfiles.entries) {
+      prefixProfiles[entry.key] = _distinctProfiles(entry.value);
+    }
+    for (final file in imageFiles) {
+      final fileName = file.uri.pathSegments.last;
+      final baseName = fileName.replaceFirst(RegExp(r'\.[^.]+$'), '');
+      final normalized = _normalizeName(baseName);
+      if (normalized.isEmpty) continue;
+      imageFilesByPrefix
+          .putIfAbsent(_namePrefix(normalized), () => [])
+          .add(file);
+      if (normalized.runes.length >= 2) {
+        imageFilesByPrefix
+            .putIfAbsent(
+              String.fromCharCodes(normalized.runes.take(1)),
+              () => [],
+            )
+            .add(file);
+      }
+    }
+  }
+
+  final Map<String, List<_MdcngProfile>> exactProfiles = {};
+  final Map<String, List<_MdcngProfile>> prefixProfiles = {};
+  final Map<String, List<_MdcngProfile>> profilesByKey = {};
+  final Map<String, List<File>> imageFilesByPrefix = {};
+  final Map<String, int> _imageLengths = {};
+
+  int imageLength(File file) =>
+      _imageLengths.putIfAbsent(file.path, file.lengthSync);
 }
 
 class NasMdcngActorSourceAvailability {
   const NasMdcngActorSourceAvailability._(this.isAvailable, this.reason);
 
-  const NasMdcngActorSourceAvailability.available()
-      : this._(true, 'available');
+  const NasMdcngActorSourceAvailability.available() : this._(true, 'available');
 
   const NasMdcngActorSourceAvailability.unavailable(String reason)
       : this._(false, reason);
@@ -489,11 +581,15 @@ class NasMdcngActorProfileCandidate {
     required this.key,
     required this.name,
     required this.romanizedName,
+    required this.hasPhoto,
+    required this.missingFieldCount,
   });
 
   final String key;
   final String name;
   final String? romanizedName;
+  final bool hasPhoto;
+  final int missingFieldCount;
 }
 
 class NasMdcngActorSourceImage {
@@ -502,14 +598,14 @@ class NasMdcngActorSourceImage {
     required this.fileName,
     required this.kind,
     required this.mimeType,
+    required this.byteLength,
   });
 
   final File file;
   final String fileName;
   final String kind;
   final String mimeType;
-
-  int get byteLength => file.lengthSync();
+  final int byteLength;
 }
 
 class _MdcngTask {
@@ -594,6 +690,9 @@ String _normalizeName(String value) => value
     .toLowerCase()
     .replaceAll('凉', '涼')
     .replaceAll(RegExp(r'[\s·・._-]'), '');
+
+String _namePrefix(String normalized) =>
+    String.fromCharCodes(normalized.runes.take(2));
 
 /// Actress.db has no explicit country column.  Derive only the country we can
 /// identify confidently from a Japanese prefecture-style birthplace; leave all

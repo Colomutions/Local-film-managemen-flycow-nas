@@ -1005,7 +1005,7 @@ class NasMdcngMetadataApply {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 31;
+  static const currentSchemaVersion = 32;
   static const _metadataFieldKeys = {
     'title',
     'originalTitle',
@@ -1845,6 +1845,20 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [31, _now()],
+      );
+    }
+    if (current < 32) {
+      _db.execute('''
+        CREATE TABLE mdcng_actor_deferred (
+          source_id TEXT NOT NULL,
+          emby_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(source_id, emby_id)
+        );
+      ''');
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [32, _now()],
       );
     }
   }
@@ -3306,6 +3320,7 @@ class NasLibraryDatabase {
     String? originalName,
     String? translatedName,
     List<String> aliases = const [],
+    List<NasActor>? candidates,
   }) {
     final names = <String?>[
       stageName,
@@ -3320,7 +3335,7 @@ class NasLibraryDatabase {
         .where((value) => value.isNotEmpty)
         .toSet();
     if (queries.isEmpty) return const [];
-    return listActors(includeArchived: true)
+    return (candidates ?? listActors(includeArchived: true))
         .where((actor) => queries.any(_actorSearchText(actor).contains))
         .toList(growable: false);
   }
@@ -3438,6 +3453,40 @@ class NasLibraryDatabase {
       LIMIT 1
     ''', [sourceId, embyId]);
     return rows.isEmpty ? null : findActor(rows.single['actor_id'] as String);
+  }
+
+  Set<String> mdcngDeferredEmbyIdsForSource(String sourceId) => _db
+      .select('SELECT emby_id FROM mdcng_actor_deferred WHERE source_id = ?',
+          [sourceId])
+      .map((row) => row['emby_id'] as String)
+      .toSet();
+
+  bool isMdcngActorDeferred(
+          {required String sourceId, required String embyId}) =>
+      _db.select('''
+        SELECT 1 FROM mdcng_actor_deferred
+        WHERE source_id = ? AND emby_id = ? LIMIT 1
+      ''', [sourceId, embyId]).isNotEmpty;
+
+  void setMdcngActorDeferred({
+    required String sourceId,
+    required String embyId,
+    required bool deferred,
+  }) {
+    if (isMdcngActorDeferred(sourceId: sourceId, embyId: embyId) == deferred) {
+      return;
+    }
+    if (deferred) {
+      _db.execute('''
+        INSERT INTO mdcng_actor_deferred(source_id, emby_id, created_at)
+        VALUES (?, ?, ?)
+      ''', [sourceId, embyId, _now()]);
+    } else {
+      _db.execute('''
+        DELETE FROM mdcng_actor_deferred
+        WHERE source_id = ? AND emby_id = ?
+      ''', [sourceId, embyId]);
+    }
   }
 
   Map<String, String> mdcngProfileKeysForSource(String sourceId) {

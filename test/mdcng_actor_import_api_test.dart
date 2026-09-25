@@ -81,7 +81,80 @@ Future<void> main() async {
         .where((candidate) => candidate['name'] == '涼森れむ')).single;
     _expect(candidate['key'] is String,
         'returns candidates only for an explicit user selection');
+    _expect(candidate['hasPhoto'] == true,
+        'candidate summary reports an available portrait');
+    _expect(candidate['missingFieldCount'] == 0,
+        'candidate summary reports missing profile fields');
     _expect(item['syncState'] == 'new', 'unlinked actor is a new import');
+
+    final viewerDecision = await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/mdcng-actor-imports/decision',
+      token: viewer,
+      body: {'taskId': '2', 'deferred': true},
+    );
+    _expect(viewerDecision.statusCode == HttpStatus.forbidden,
+        'only admins can defer actor imports');
+    final deferred = await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/mdcng-actor-imports/decision',
+      token: admin,
+      body: {'taskId': '2', 'deferred': true},
+    );
+    _expect(deferred.statusCode == HttpStatus.ok,
+        'admin can mark an actor as not to import');
+    final storedDecisions = sqlite3.open(
+      '${config.dataDir}${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite',
+      mode: OpenMode.readOnly,
+    );
+    try {
+      _expect(
+        storedDecisions.select('''
+          SELECT emby_id FROM mdcng_actor_deferred WHERE source_id = ?
+        ''', [config.mdcngSourceId]).single['emby_id'] == '1537',
+        'decision is persisted in the NAS database',
+      );
+    } finally {
+      storedDecisions.dispose();
+    }
+    final deferredList = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/mdcng-actor-imports',
+      token: admin,
+    );
+    final deferredItems =
+        ((deferredList.json['data'] as Map<String, dynamic>)['items'] as List)
+            .cast<Map<String, dynamic>>();
+    _expect(
+        deferredItems
+                .where((item) => item['taskId'] == '2')
+                .single['syncState'] ==
+            'deferred',
+        'list shows the persisted decision');
+    final deferredPreview = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/mdcng-actor-imports/batch-preview',
+      token: admin,
+    );
+    final deferredData = deferredPreview.json['data'] as Map<String, dynamic>;
+    _expect((deferredData['summary'] as Map<String, dynamic>)['deferred'] == 1,
+        'batch preview counts deferred actors');
+    _expect(
+        (deferredData['summary'] as Map<String, dynamic>)['eligibleTotal'] == 0,
+        'deferred actors cannot enter the batch confirmation');
+    final restored = await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/mdcng-actor-imports/decision',
+      token: admin,
+      body: {'taskId': '2', 'deferred': false},
+    );
+    _expect(restored.statusCode == HttpStatus.ok,
+        'admin can restore an actor for later import');
 
     final batchPreview = await _request(
       base,
@@ -104,6 +177,37 @@ Future<void> main() async {
     _expect(batchItem['status'] == 'eligible_create',
         'unique source profile is eligible for a safe create');
 
+    await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/mdcng-actor-imports/decision',
+      token: admin,
+      body: {'taskId': '2', 'deferred': true},
+    );
+    final staleBatch = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/batch-apply',
+      token: admin,
+      body: {
+        'items': [
+          {
+            'taskId': batchItem['taskId'],
+            'fingerprint': batchItem['fingerprint']
+          }
+        ]
+      },
+    );
+    _expect((staleBatch.json['data'] as Map<String, dynamic>)['skipped'] == 1,
+        'execution rechecks a decision made after batch preview');
+    await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/mdcng-actor-imports/decision',
+      token: admin,
+      body: {'taskId': '2', 'deferred': false},
+    );
+
     final batchApplied = await _request(
       base,
       'POST',
@@ -123,6 +227,15 @@ Future<void> main() async {
     final batchResult = batchApplied.json['data'] as Map<String, dynamic>;
     _expect(batchResult['created'] == 1 && batchResult['failed'] == 0,
         'batch imports one directly resolved actress');
+    final importedDecision = await _request(
+      base,
+      'PUT',
+      '/api/v1/admin/mdcng-actor-imports/decision',
+      token: admin,
+      body: {'taskId': '2', 'deferred': true},
+    );
+    _expect(importedDecision.statusCode == HttpStatus.conflict,
+        'an imported actor cannot be relabeled as not imported');
 
     final preview = await _request(
       base,
@@ -164,6 +277,49 @@ Future<void> main() async {
       'preview contains full birthday',
     );
 
+    final mergeTarget = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: admin,
+      body: {'stageName': '涼森れむ', 'originalName': '旧原名'},
+    );
+    _expect(mergeTarget.statusCode == HttpStatus.created,
+        'creates a similar actor for merge preview');
+    final mergeTargetId = mergeTarget.json['data']['actor']['id'] as String;
+    final mergePreview = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/preview',
+      token: admin,
+      body: {
+        'taskId': item['taskId'],
+        'selectedProfileKey': candidate['key'],
+        'targetActorId': mergeTargetId,
+      },
+    );
+    _expect(mergePreview.statusCode == HttpStatus.ok,
+        'admin can preview against the selected merge target');
+    final mergeData = mergePreview.json['data'] as Map<String, dynamic>;
+    _expect(mergeData['comparisonActorId'] == mergeTargetId,
+        'merge preview identifies the compared actor');
+    final mergeDiffs =
+        (mergeData['fieldDiffs'] as List<dynamic>).cast<Map<String, dynamic>>();
+    _expect(
+      mergeDiffs
+              .where((diff) => diff['key'] == 'originalName')
+              .single['status'] ==
+          'replace_requires_confirmation',
+      'merge preview flags the target actor field that would be replaced',
+    );
+    final originalNameDiff =
+        mergeDiffs.where((diff) => diff['key'] == 'originalName').single;
+    _expect(
+      originalNameDiff['currentValue'] == '旧原名' &&
+          originalNameDiff['proposedValue'] == '涼森れむ',
+      'merge preview shows both text values',
+    );
+
     const fields = [
       'stageName',
       'originalName',
@@ -181,7 +337,7 @@ Future<void> main() async {
       'photo',
       'backdrop',
     ];
-    final applied = await _request(
+    final missingConfirmation = await _request(
       base,
       'POST',
       '/api/v1/admin/mdcng-actor-imports/apply',
@@ -191,8 +347,33 @@ Future<void> main() async {
         'fingerprint': fingerprint,
         'fieldKeys': fields,
         'overwriteFieldKeys': const [],
-        'targetActorId': null,
-        'createNew': true,
+        'targetActorId': mergeTargetId,
+        'createNew': false,
+        'selectedProfileKey': candidate['key'],
+      },
+    );
+    _expect(
+      missingConfirmation.statusCode == HttpStatus.conflict &&
+          missingConfirmation.json['error']['code'] ==
+              'mdcng_actor_overwrite_confirmation_required',
+      'merging without field confirmation is rejected',
+    );
+    final overwriteFieldKeys = mergeDiffs
+        .where((diff) => diff['requiresConfirmation'] == true)
+        .map((diff) => diff['key'] as String)
+        .toList(growable: false);
+    final applied = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/apply',
+      token: admin,
+      body: {
+        'taskId': source['taskId'],
+        'fingerprint': fingerprint,
+        'fieldKeys': fields,
+        'overwriteFieldKeys': overwriteFieldKeys,
+        'targetActorId': mergeTargetId,
+        'createNew': false,
         'selectedProfileKey': candidate['key'],
       },
     );
@@ -200,6 +381,8 @@ Future<void> main() async {
         applied.statusCode == HttpStatus.ok, 'confirmed actor data imports');
     final appliedData = applied.json['data'] as Map<String, dynamic>;
     final actor = appliedData['actor'] as Map<String, dynamic>;
+    _expect(actor['id'] == mergeTargetId,
+        'confirmed fields merge into the selected actor');
     _expect(actor['stageName'] == '凉森玲梦',
         'writes the library Chinese common name as the display name');
     _expect(actor['originalName'] == '涼森れむ',

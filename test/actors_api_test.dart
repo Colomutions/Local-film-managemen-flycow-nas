@@ -60,6 +60,9 @@ Future<void> main() async {
       body: {
         'stageName': '测试演员',
         'originalName': 'Test Actor',
+        'romanizedName': 'Test Romaji',
+        'birthDate': '1996-04-12',
+        'birthMonth': '1996-04',
         'aliases': ['Test-Actor'],
         'gender': 'female',
         'bodyType': '柔弱',
@@ -71,6 +74,10 @@ Future<void> main() async {
     final actor = (created.json['data'] as Map<String, dynamic>)['actor']
         as Map<String, dynamic>;
     final actorId = actor['id'] as String;
+    _expect(actor['romanizedName'] == 'Test Romaji',
+        'romanized name is saved when creating an actor');
+    _expect(actor['birthDate'] == '1996-04-12',
+        'full birth date is saved when creating an actor');
     _expect(actor['movieCount'] == 0, 'new actor has no movie relation');
     _expect(
       (actor['publishers'] as List<dynamic>).single['id'] == publisherId,
@@ -92,11 +99,20 @@ Future<void> main() async {
       'PATCH',
       '/api/v1/admin/actors/$actorId',
       token: token,
-      body: {'heightCm': 168, 'birthMonth': '1996-04'},
+      body: {
+        'heightCm': 168,
+        'birthMonth': '1996-04',
+        'birthDate': '1996-04-13',
+        'romanizedName': 'Updated Romaji',
+      },
     );
     _expect(updated.statusCode == HttpStatus.ok, 'admin can update actor');
     _expect(
         updated.json['data']['heightCm'] == 168, 'updated value is returned');
+    _expect(updated.json['data']['romanizedName'] == 'Updated Romaji',
+        'romanized name is saved when updating an actor');
+    _expect(updated.json['data']['birthDate'] == '1996-04-13',
+        'full birth date is saved when updating an actor');
     _expect(
         updated.json['data']['age'] is int, 'age is derived from birth month');
 

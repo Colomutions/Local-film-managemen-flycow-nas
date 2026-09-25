@@ -19,6 +19,19 @@ Future<void> main() async {
         .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
     await File('${photos.path}${Platform.pathSeparator}涼森れむ-big-old.jpg')
         .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    await File('${photos.path}${Platform.pathSeparator}涼森れな-big-old.jpg')
+        .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    final profiles = sqlite3.open(
+      '${data.path}${Platform.pathSeparator}Actress.db',
+    );
+    try {
+      profiles.execute(
+        'INSERT INTO Info(Name, Href) VALUES (?, ?)',
+        ['涼森れな', 'actress-other'],
+      );
+    } finally {
+      profiles.dispose();
+    }
 
     final source = NasMdcngActorSource(data.path);
     final records = await source.readCompletedActors();
@@ -30,6 +43,24 @@ Future<void> main() async {
         .single;
     _expect(candidate.key.isNotEmpty,
         'suggests the shared-name-prefix profile for an explicit choice');
+    _expect(candidate.hasPhoto, 'portrait candidate is marked');
+    _expect(candidate.missingFieldCount == 0,
+        'complete candidate has no missing profile fields');
+    _expect(
+      records.single.candidates
+              .where((candidate) => candidate.name == '涼森れな')
+              .single
+              .missingFieldCount ==
+          12,
+      'sparse candidate reports missing profile fields',
+    );
+    _expect(
+      !records.single.candidates
+          .where((candidate) => candidate.name == '涼森れな')
+          .single
+          .hasPhoto,
+      'a backdrop-only candidate is not marked as having a portrait',
+    );
 
     final selectedRecords = await source.readCompletedActors(
       selectedProfileKeys: {'1': candidate.key},
@@ -51,6 +82,36 @@ Future<void> main() async {
     );
     _expect(record.fingerprint.length == 64,
         'returns a stable preview fingerprint');
+    await File('${photos.path}${Platform.pathSeparator}涼森れむ-old.jpg')
+        .writeAsBytes(const [0], mode: FileMode.append);
+    final cached = await source.readCompletedActors(
+      selectedProfileKeys: {'1': candidate.key},
+    );
+    _expect(cached.single.fingerprint == record.fingerprint,
+        'repeated reviews reuse image metadata without touching the disk');
+    final refreshed = await source.readCompletedActors(
+      selectedProfileKeys: {'1': candidate.key},
+      forceRefresh: true,
+    );
+    _expect(refreshed.single.fingerprint != record.fingerprint,
+        'apply refreshes the source fingerprint after an image changes');
+
+    _addManyActors(data.path, 1000);
+    final largeRead = Stopwatch()..start();
+    final manyRecords = await source.readCompletedActors(forceRefresh: true);
+    largeRead.stop();
+    _expect(
+        manyRecords.length == 1001, 'reads over a thousand completed actors');
+    _expect(
+        manyRecords
+                .where((item) => item.taskId == '500')
+                .single
+                .profile
+                ?.name ==
+            '测试演员500',
+        'resolves a profile in the large indexed source');
+    stdout.writeln(
+        '1001 actor source records: ${largeRead.elapsedMilliseconds} ms');
   } finally {
     await directory.delete(recursive: true);
   }
@@ -109,6 +170,29 @@ void _createProfileDatabase(String path) {
     ''');
   } finally {
     database.dispose();
+  }
+}
+
+void _addManyActors(String dataPath, int count) {
+  final tasks = sqlite3.open('$dataPath${Platform.pathSeparator}mdc_ng.db');
+  final profiles = sqlite3.open('$dataPath${Platform.pathSeparator}Actress.db');
+  try {
+    tasks.execute('BEGIN');
+    profiles.execute('BEGIN');
+    for (var id = 3; id <= count + 2; id++) {
+      final name = '测试演员$id';
+      tasks.execute('''
+        INSERT INTO actress_task(id, name, status, stage, emby_id)
+        VALUES (?, ?, 2, 1000, ?)
+      ''', [id, name, 'emby-$id']);
+      profiles.execute(
+          'INSERT INTO Info(Name, Href) VALUES (?, ?)', [name, 'actress-$id']);
+    }
+    tasks.execute('COMMIT');
+    profiles.execute('COMMIT');
+  } finally {
+    tasks.dispose();
+    profiles.dispose();
   }
 }
 

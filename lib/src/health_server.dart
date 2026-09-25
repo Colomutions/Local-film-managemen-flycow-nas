@@ -41,6 +41,17 @@ bool _mdcngActorHasValue(Object? value) => switch (value) {
       _ => true,
     };
 
+String? _mdcngActorDiffDisplayValue(
+  String field,
+  Object? value, {
+  required bool current,
+}) {
+  if (!_mdcngActorHasValue(value)) return null;
+  if (current && (field == 'photo' || field == 'backdrop')) return '已有图片';
+  if (value is Iterable) return value.join('、');
+  return value.toString();
+}
+
 bool _mdcngActorValuesEqual(String field, Object? left, Object? right) {
   if (field == 'aliases' && left is Iterable && right is Iterable) {
     final normalize = (Iterable<dynamic> values) => values
@@ -609,6 +620,10 @@ class NasHealthServer {
       if (request.method == 'GET' &&
           path == '/api/v1/admin/mdcng-actor-imports') {
         return await _listMdcngActorImports(request);
+      }
+      if (request.method == 'PUT' &&
+          path == '/api/v1/admin/mdcng-actor-imports/decision') {
+        return await _setMdcngActorImportDecision(request);
       }
       if (request.method == 'POST' &&
           path == '/api/v1/admin/mdcng-actor-imports/preview') {
@@ -1582,6 +1597,8 @@ class NasHealthServer {
       translatedName: values['translated_name'] as String?,
       aliases: aliases,
       gender: values['gender'] as String?,
+      romanizedName: values['romanized_name'] as String?,
+      birthDate: values['birth_date'] as String?,
       birthMonth: values['birth_month'] as String?,
       heightCm: values['height_cm'] as int?,
       weightKg: values['weight_kg'] as int?,
@@ -3322,8 +3339,10 @@ class NasHealthServer {
       'stageName': 'stage_name',
       'originalName': 'original_name',
       'translatedName': 'translated_name',
+      'romanizedName': 'romanized_name',
       'aliases': 'aliases_json',
       'gender': 'gender',
+      'birthDate': 'birth_date',
       'birthMonth': 'birth_month',
       'heightCm': 'height_cm',
       'weightKg': 'weight_kg',
@@ -3362,6 +3381,14 @@ class NasHealthServer {
           if (value != null &&
               (value is! String ||
                   !RegExp(r'^\d{4}-(0[1-9]|1[0-2])$').hasMatch(value))) {
+            return null;
+          }
+          values[databaseKey] = value;
+        case 'birthDate':
+          if (value != null &&
+              (value is! String ||
+                  !RegExp(r'^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$')
+                      .hasMatch(value))) {
             return null;
           }
           values[databaseKey] = value;
@@ -5281,15 +5308,21 @@ class NasHealthServer {
   Future<void> _listMdcngActorImports(HttpRequest request) async {
     final records = await _readMdcngActorRecords(request);
     if (records == null) return;
+    final actorCandidates = _libraryDatabase.listActors(includeArchived: true);
+    final deferred = _libraryDatabase.mdcngDeferredEmbyIdsForSource(
+      config.mdcngSourceId,
+    );
     final items = records.map((record) {
       final linked = _libraryDatabase.findActorByMdcngSource(
         sourceId: config.mdcngSourceId,
         embyId: record.embyId,
       );
-      final similar = linked == null
+      final isDeferred = deferred.contains(record.embyId);
+      final similar = linked == null && !isDeferred
           ? _libraryDatabase.findSimilarActors(
               stageName: record.profile?.name,
               aliases: [record.sourceName, ...?record.profile?.aliases],
+              candidates: actorCandidates,
             )
           : const <NasActor>[];
       return {
@@ -5306,9 +5339,11 @@ class NasHealthServer {
         'hasBackdrop': record.backdrop != null,
         'syncState': linked != null
             ? 'linked'
-            : similar.isEmpty
-                ? 'new'
-                : 'needs_resolution',
+            : isDeferred
+                ? 'deferred'
+                : similar.isEmpty
+                    ? 'new'
+                    : 'needs_resolution',
         'similarActors': similar.map(_actorPayload).toList(growable: false),
       };
     }).toList(growable: false);
@@ -5322,14 +5357,59 @@ class NasHealthServer {
     });
   }
 
+  Future<void> _setMdcngActorImportDecision(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    final taskId = body?['taskId'];
+    final deferred = body?['deferred'];
+    if (body == null ||
+        body.length != 2 ||
+        taskId is! String ||
+        taskId.isEmpty ||
+        deferred is! bool) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final records = await _readMdcngActorRecords(request);
+    if (records == null) return;
+    final record = records.where((item) => item.taskId == taskId).firstOrNull;
+    if (record == null) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (deferred &&
+        _libraryDatabase.findActorByMdcngSource(
+              sourceId: config.mdcngSourceId,
+              embyId: record.embyId,
+            ) !=
+            null) {
+      return _error(
+          request, HttpStatus.conflict, 'mdcng_actor_already_imported');
+    }
+    _libraryDatabase.setMdcngActorDeferred(
+      sourceId: config.mdcngSourceId,
+      embyId: record.embyId,
+      deferred: deferred,
+    );
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'taskId': taskId, 'deferred': deferred},
+    });
+  }
+
   /// Previews only the records that are safe to write without any additional
   /// decision.  This deliberately leaves unresolved profile mappings and
   /// similar existing actors out of the batch confirmation set.
   Future<void> _previewMdcngActorBatchImport(HttpRequest request) async {
     final records = await _readMdcngActorRecords(request);
     if (records == null) return;
-    final plans =
-        records.map(_planMdcngActorBatchImport).toList(growable: false);
+    final actorCandidates = _libraryDatabase.listActors(includeArchived: true);
+    final deferred = _libraryDatabase.mdcngDeferredEmbyIdsForSource(
+      config.mdcngSourceId,
+    );
+    final plans = records
+        .map((record) => _planMdcngActorBatchImport(
+              record,
+              actorCandidates: actorCandidates,
+              deferredEmbyIds: deferred,
+            ))
+        .toList(growable: false);
     final counts = <String, int>{
       'eligibleCreate': 0,
       'eligibleUpdate': 0,
@@ -5337,6 +5417,7 @@ class NasHealthServer {
       'needsTargetResolution': 0,
       'alreadyImported': 0,
       'noSafeChanges': 0,
+      'deferred': 0,
     };
     for (final plan in plans) {
       final key = switch (plan.status) {
@@ -5345,6 +5426,7 @@ class NasHealthServer {
         'needs_profile_resolution' => 'needsProfileResolution',
         'needs_target_resolution' => 'needsTargetResolution',
         'already_imported' => 'alreadyImported',
+        'deferred' => 'deferred',
         _ => 'noSafeChanges',
       };
       counts[key] = counts[key]! + 1;
@@ -5392,7 +5474,7 @@ class NasHealthServer {
     if (requested.length != rawItems.length) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final records = await _readMdcngActorRecords(request);
+    final records = await _readMdcngActorRecords(request, forceRefresh: true);
     if (records == null) return;
     final byTaskId = {for (final record in records) record.taskId: record};
     var created = 0;
@@ -5434,8 +5516,16 @@ class NasHealthServer {
   }
 
   _MdcngActorBatchPlan _planMdcngActorBatchImport(
-    NasMdcngActorSourceRecord record,
-  ) {
+      NasMdcngActorSourceRecord record,
+      {List<NasActor>? actorCandidates,
+      Set<String>? deferredEmbyIds}) {
+    if (deferredEmbyIds?.contains(record.embyId) ??
+        _libraryDatabase.isMdcngActorDeferred(
+          sourceId: config.mdcngSourceId,
+          embyId: record.embyId,
+        )) {
+      return _MdcngActorBatchPlan(record: record, status: 'deferred');
+    }
     if (record.profile == null || record.profileResolution != 'matched') {
       return _MdcngActorBatchPlan(
           record: record, status: 'needs_profile_resolution');
@@ -5456,6 +5546,7 @@ class NasHealthServer {
       final similar = _libraryDatabase.findSimilarActors(
         stageName: record.profile!.name,
         aliases: [record.sourceName, ...record.profile!.aliases],
+        candidates: actorCandidates,
       );
       if (similar.isNotEmpty) {
         return _MdcngActorBatchPlan(
@@ -5508,6 +5599,8 @@ class NasHealthServer {
               'key': candidate.key,
               'name': candidate.name,
               'romanizedName': candidate.romanizedName,
+              'hasPhoto': candidate.hasPhoto,
+              'missingFieldCount': candidate.missingFieldCount,
             },
           )
           .toList(growable: false);
@@ -5516,12 +5609,18 @@ class NasHealthServer {
     final body = await _readJsonBody(request);
     final taskId = body?['taskId'];
     final selectedProfileKey = body?['selectedProfileKey'];
+    final targetActorId = body?['targetActorId'];
     if (body == null ||
         body.keys.any(
-          (key) => key != 'taskId' && key != 'selectedProfileKey',
+          (key) =>
+              key != 'taskId' &&
+              key != 'selectedProfileKey' &&
+              key != 'targetActorId',
         ) ||
         taskId is! String ||
         taskId.isEmpty ||
+        (targetActorId != null &&
+            (targetActorId is! String || targetActorId.isEmpty)) ||
         (selectedProfileKey != null &&
             (selectedProfileKey is! String || selectedProfileKey.isEmpty))) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
@@ -5536,10 +5635,29 @@ class NasHealthServer {
     if (record == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
+    if (_libraryDatabase.isMdcngActorDeferred(
+      sourceId: config.mdcngSourceId,
+      embyId: record.embyId,
+    )) {
+      return _error(request, HttpStatus.conflict, 'mdcng_actor_deferred');
+    }
     final linked = _libraryDatabase.findActorByMdcngSource(
       sourceId: config.mdcngSourceId,
       embyId: record.embyId,
     );
+    final selectedTarget = targetActorId == null
+        ? null
+        : _libraryDatabase.findActor(targetActorId);
+    if (targetActorId != null &&
+        (selectedTarget == null || selectedTarget.archivedAt != null)) {
+      return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (linked != null &&
+        selectedTarget != null &&
+        selectedTarget.id != linked.id) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final comparisonActor = selectedTarget ?? linked;
     final similar = linked == null
         ? _libraryDatabase.findSimilarActors(
             stageName: record.profile?.name,
@@ -5563,13 +5681,14 @@ class NasHealthServer {
         'candidates': _mdcngActorCandidatePayloads(record),
         'proposed': _mdcngActorProposedPayload(record),
         'current': linked == null ? null : _actorPayload(linked),
+        'comparisonActorId': comparisonActor?.id,
         'similarActors': similar.map(_actorPayload).toList(growable: false),
         'recommendedAction': linked != null
             ? 'update'
             : similar.isEmpty
                 ? 'create'
                 : 'resolve',
-        'fieldDiffs': _mdcngActorFieldDiffs(record, linked),
+        'fieldDiffs': _mdcngActorFieldDiffs(record, comparisonActor),
       },
     });
   }
@@ -5577,6 +5696,7 @@ class NasHealthServer {
   Future<List<NasMdcngActorSourceRecord>?> _readMdcngActorRecords(
     HttpRequest request, {
     Map<String, String> selectedProfileKeys = const {},
+    bool forceRefresh = false,
   }) async {
     final source = _mdcngActorSource;
     if (source == null) {
@@ -5589,6 +5709,7 @@ class NasHealthServer {
     }
     try {
       return await source.readCompletedActors(
+        forceRefresh: forceRefresh,
         selectedProfileKeys: {
           ..._libraryDatabase.mdcngProfileKeysForSource(config.mdcngSourceId),
           ...selectedProfileKeys,
@@ -5717,6 +5838,16 @@ class NasHealthServer {
                       ? 'replace_requires_confirmation'
                       : 'fill',
           'requiresConfirmation': needsConfirmation,
+          'currentValue': _mdcngActorDiffDisplayValue(
+            entry.key,
+            currentValue,
+            current: true,
+          ),
+          'proposedValue': _mdcngActorDiffDisplayValue(
+            entry.key,
+            entry.value,
+            current: false,
+          ),
         };
       },
     ).toList(growable: false);
@@ -5824,6 +5955,7 @@ class NasHealthServer {
 
     final records = await _readMdcngActorRecords(
       request,
+      forceRefresh: true,
       selectedProfileKeys:
           selectedProfileKey == null ? const {} : {taskId: selectedProfileKey},
     );
@@ -5831,6 +5963,12 @@ class NasHealthServer {
     final record = records.where((item) => item.taskId == taskId).firstOrNull;
     if (record == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (_libraryDatabase.isMdcngActorDeferred(
+      sourceId: config.mdcngSourceId,
+      embyId: record.embyId,
+    )) {
+      return _error(request, HttpStatus.conflict, 'mdcng_actor_deferred');
     }
     if (record.fingerprint != fingerprint) {
       return _error(request, HttpStatus.conflict, 'mdcng_actor_preview_stale');
@@ -5946,6 +6084,15 @@ class NasHealthServer {
           return;
         }
       }
+      if (_libraryDatabase.isMdcngActorDeferred(
+        sourceId: config.mdcngSourceId,
+        embyId: record.embyId,
+      )) {
+        await _deleteManagedAsset(newPhoto);
+        await _deleteManagedAsset(newBackdrop);
+        await _error(request, HttpStatus.conflict, 'mdcng_actor_deferred');
+        return;
+      }
       final aliases = fields.contains('aliases')
           ? [
               ...?target?.aliases,
@@ -6050,6 +6197,12 @@ class NasHealthServer {
     if (profile == null || !plan.isEligible || plan.fields.isEmpty) {
       return 'skipped';
     }
+    if (_libraryDatabase.isMdcngActorDeferred(
+      sourceId: config.mdcngSourceId,
+      embyId: record.embyId,
+    )) {
+      return 'skipped';
+    }
     if (_libraryDatabase.findMdcngActorImport(
           sourceId: config.mdcngSourceId,
           taskId: record.taskId,
@@ -6071,6 +6224,12 @@ class NasHealthServer {
         newBackdrop =
             await _saveMdcngActorImage(record.backdrop!, 'actor_backdrop');
         if (newBackdrop == null) return 'invalid_mdcng_actor_image';
+      }
+      if (_libraryDatabase.isMdcngActorDeferred(
+        sourceId: config.mdcngSourceId,
+        embyId: record.embyId,
+      )) {
+        return 'skipped';
       }
       final aliases = plan.fields.contains('aliases')
           ? [
@@ -7758,6 +7917,10 @@ class NasHealthServer {
           'The selected MDCNG actor image is missing or is not a valid image.',
       'mdcng_actor_import_failed':
           'The confirmed MDCNG actor data could not be imported.',
+      'mdcng_actor_deferred':
+          'This MDCNG actor is marked not to import. Restore it before importing.',
+      'mdcng_actor_already_imported':
+          'This MDCNG actor is already imported and cannot be marked not to import.',
     };
     return _writeJson(request.response, statusCode, {
       'error': {'code': code, 'message': messages[code] ?? 'Request failed.'},
