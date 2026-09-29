@@ -73,6 +73,7 @@ class NasDiagnosticLogger {
   int droppedDebugEvents = 0;
   int failures = 0;
   int _pendingWrites = 0;
+  final Map<String, (DateTime, int)> _warningBursts = {};
 
   factory NasDiagnosticLogger.forConfig(String dataDir, {
     required String minimumLevel,
@@ -102,12 +103,26 @@ class NasDiagnosticLogger {
       return;
     }
     try {
+      var suppressed = 0;
+      if (level == 'WARN' && event == 'http.response.end') {
+        final key = '${fields['method']}:${fields['route']}:${fields['status']}';
+        final previous = _warningBursts[key];
+        final now = _now();
+        if (previous != null && now.difference(previous.$1) < const Duration(seconds: 30)) {
+          _warningBursts[key] = (previous.$1, previous.$2 + 1);
+          return;
+        }
+        suppressed = previous?.$2 ?? 0;
+        if (_warningBursts.length >= 256) _warningBursts.remove(_warningBursts.keys.first);
+        _warningBursts[key] = (now, 0);
+      }
       final record = <String, Object?>{
         'schemaVersion': 1,
         'ts': _now().toUtc().toIso8601String(),
         'level': level,
         'component': component,
         'event': event,
+        if (suppressed > 0) 'suppressedSimilarWarnings': suppressed,
         ...fields,
       };
       final line = jsonEncode(_sanitize(record));

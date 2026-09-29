@@ -10,6 +10,7 @@ import 'auth.dart';
 import 'backup_service.dart';
 import 'backup_recovery_harness.dart';
 import 'config.dart';
+import 'disk_work_queue.dart';
 import 'diagnostic_log.dart';
 import 'fixture_library.dart';
 import 'library/mdcng_nfo.dart';
@@ -140,6 +141,13 @@ class NasHealthServer {
   NasMediaRoot? _configuredMediaRoot;
   int _activeRequests = 0;
   int _activeStreams = 0;
+  late final _diskWork = DiskWorkQueue(
+    playbackActive: () => _activeStreams > 0,
+    backgroundBytesPerSecond: config.backgroundReadBytesPerSecond,
+  );
+  Future<NasBackupRecord>? _pendingBackup;
+  final Map<String, String> _closedPlayback = {};
+
 
   bool get isRunning => _server != null;
   int get port => _server?.port ?? config.port;
@@ -148,6 +156,7 @@ class NasHealthServer {
     if (_server != null) {
       throw StateError('NAS health server is already running.');
     }
+    _diskWork.accepting = true;
     _logger.event('service.start',
         fields: {'component': 'nas.service', 'phase': 'startup'});
     _state =
@@ -220,7 +229,7 @@ class NasHealthServer {
           repository: novelService.repository,
           storage: novelService.storage,
           writeBarrier: novelService.writeBarrier,
-        );
+          );
       }
     }
   }
@@ -262,11 +271,14 @@ class NasHealthServer {
         restoredDirectory: isolated,
         enterMaintenance: () async {
           _maintenance = true;
+          _diskWork.accepting = false;
+          await _activeMdcngBatchTask;
+          await _diskWork.drain();
           while (_activeRequests > 0) {
             await Future<void>.delayed(const Duration(milliseconds: 5));
           }
         },
-        leaveMaintenance: () async => _maintenance = false,
+        leaveMaintenance: () async { _maintenance = false; _diskWork.accepting = true; },
         closeDatabase: () async {
           await _libraryDatabase.checkpointAndClose();
           _novelApi = null;
@@ -306,6 +318,7 @@ class NasHealthServer {
         job.cancelled = true;
     }
     await _activeMdcngBatchTask;
+    await _diskWork.drain();
     _mdcngBatchJobs.clear();
     await server?.close(force: true);
     await _libraryDatabase.close();
@@ -387,6 +400,12 @@ class NasHealthServer {
       if (path.startsWith('/api/v1/admin/') && device.scope != 'admin') {
         return await _error(
             request, HttpStatus.forbidden, 'insufficient_scope');
+      }
+      if (request.method == 'GET' && path == '/api/v1/cinema-home') {
+        return await _cinemaHome(request);
+      }
+      if (request.method == 'POST' && RegExp(r'^/api/v1/playback/sessions/[^/]+/finish$').hasMatch(path)) {
+        return await _finishPlayback(request, tokenHash);
       }
       if (path == '/api/v1/comics' ||
           path.startsWith('/api/v1/comics/') ||
@@ -970,6 +989,8 @@ class NasHealthServer {
       'minimumClientVersion': '1.0.0',
       'pairingRequired': true,
       'capabilities': {
+        'cinemaHome': true,
+        'playbackFinish': true,
         'movies': true,
         'playback': true,
         'watchHistory': true,
@@ -1154,35 +1175,46 @@ class NasHealthServer {
         },
       });
     }
-    final movies = _libraryDatabase
-        .listMovies(query: query)
-        .where((movie) =>
-            (categoryId == null ||
-                _categoryForMoviePayload(movie.id)?['id'] == categoryId) &&
-            (isFavorite == null || movie.isFavorite == isFavorite) &&
-            (tagIds == null ||
-                tagIds.isEmpty ||
-                _libraryDatabase
-                    .tagsForMovie(movie.id)
-                    .any((tag) => tagIds.contains(tag.id))) &&
-            (resolutions == null ||
-                resolutions.isEmpty ||
-                (movie.resolutionLabel != null &&
-                    resolutions.contains(movie.resolutionLabel))))
-        .toList();
-    movies.sort((left, right) => _compareMovies(left, right, sort, order));
-    final offset = (page - 1) * pageSize;
-    final paged = offset >= movies.length
-        ? const <NasLibraryMovie>[]
-        : movies.skip(offset).take(pageSize).toList(growable: false);
+    final result = _libraryDatabase.searchMovies(NasMovieSearchFilter(
+      query: query, categoryId: categoryId, isFavorite: isFavorite,
+      resolutions: resolutions ?? const {}, watchStates: const {},
+      sort: sort, order: order, page: page, pageSize: pageSize,
+      tagConditions: [for (final id in tagIds ?? <String>{})
+        NasMovieSearchTagCondition(group: 'any', tagId: id, includeDescendants: false)],
+    ));
+    final associations = _libraryDatabase.browseAssociations(result.items.map((movie) => movie.id).toList());
     return _writeJson(request.response, HttpStatus.ok, {
-      'data': {'items': paged.map(_databaseSummary).toList(growable: false)},
-      'page': {
-        'number': page,
-        'size': pageSize,
-        'total': movies.length,
-        'hasMore': offset + paged.length < movies.length,
-      },
+      'data': {'items': result.items.map((movie) => {
+        ..._databaseSearchSummary(movie),
+        ...associations[movie.id]!,
+      }).toList(growable: false)},
+      'page': {'number': result.number, 'size': result.size, 'total': result.total, 'hasMore': result.hasMore},
+    });
+  }
+
+  Future<void> _cinemaHome(HttpRequest request) async {
+    final versions = _libraryDatabase.revisions;
+    final etag = '"${versions['library']}:${versions['taxonomy']}"';
+    if (request.headers.value(HttpHeaders.ifNoneMatchHeader) == etag) {
+      request.response.statusCode = HttpStatus.notModified;
+      request.response.headers.set(HttpHeaders.etagHeader, etag);
+      return request.response.close();
+    }
+    Map<String, Object?> section(String? categoryId, String title) {
+      final page = _libraryDatabase.searchMovies(NasMovieSearchFilter(
+        query: '', categoryId: categoryId, resolutions: const {}, watchStates: const {},
+        sort: 'createdAt', order: 'desc', page: 1, pageSize: 8, tagConditions: const [],
+      ));
+      return {'id': categoryId ?? '', 'name': title, 'kind': categoryId == null ? 'all' : 'categories',
+        'items': page.items.map(_databaseSearchSummary).toList(growable: false),
+        'page': {'number': 1, 'size': 8, 'total': page.total, 'hasMore': page.hasMore}};
+    }
+    final categories = _libraryDatabase.listCategories();
+    final sections = [section(null, '最近加入'),
+      for (final category in categories.take(6)) section(category.id, category.name)];
+    request.response.headers.set(HttpHeaders.etagHeader, etag);
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {'sections': sections, 'revisions': versions},
     });
   }
 
@@ -2874,14 +2906,7 @@ class NasHealthServer {
     if (artwork == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    request.response.statusCode = HttpStatus.ok;
-    request.response.headers.contentType = ContentType.parse(artwork.mimeType);
-    request.response.headers.contentLength = await artwork.file.length();
-    request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
-    if (request.method == 'GET') {
-      await request.response.addStream(artwork.file.openRead());
-    }
-    await request.response.close();
+    return _serveArtwork(request, artwork);
   }
 
   Map<String, Object?> _publisherReferencePayload(NasPublisher publisher) => {
@@ -3002,7 +3027,7 @@ class NasHealthServer {
   Map<String, Object?> _managedAssetPayload(NasManagedAsset asset) => {
         'id': asset.id,
         'purpose': asset.purpose,
-        'url': '/api/v1/assets/${asset.id}',
+        'url': '/api/v1/assets/${asset.id}?v=${asset.fileName}',
         'mimeType': asset.mimeType,
         'createdAt': asset.createdAt,
       };
@@ -3068,22 +3093,6 @@ class NasHealthServer {
       'releaseDate' =>
         _compareNullableString(left.releaseDate, right.releaseDate),
       _ => left.createdAt.compareTo(right.createdAt),
-    };
-    final stable = compared == 0 ? left.id.compareTo(right.id) : compared;
-    return order == 'asc' ? stable : -stable;
-  }
-
-  int _compareMovies(
-    NasLibraryMovie left,
-    NasLibraryMovie right,
-    String sort,
-    String order,
-  ) {
-    final compared = switch (sort) {
-      'updatedAt' => left.updatedAt.compareTo(right.updatedAt),
-      'durationMs' => _compareNullableInt(left.durationMs, right.durationMs),
-      'recent' => left.playCount.compareTo(right.playCount),
-      _ => left.title.compareTo(right.title),
     };
     final stable = compared == 0 ? left.id.compareTo(right.id) : compared;
     return order == 'asc' ? stable : -stable;
@@ -4140,10 +4149,12 @@ class NasHealthServer {
         );
         return;
       }
-      final backup = await _backupService.create(
+      final pending = _pendingBackup ??= _diskWork.run('backup', () => _backupService.create(
         databaseSnapshot: _libraryDatabase.createBackupSnapshot,
         prepareContribution: _novelBackupCoordinator?.prepare,
-      );
+      ));
+      final NasBackupRecord backup;
+      try { backup = await pending; } finally { if (identical(pending, _pendingBackup)) _pendingBackup = null; }
       _logger.event('backup.end', fields: {
         'component': 'nas.backup',
         'outcome': 'success',
@@ -4982,7 +4993,7 @@ class NasHealthServer {
     );
     _rememberMdcngBatchJob(job);
     _activeMdcngBatchTask =
-        Future<void>.delayed(Duration.zero).then((_) => _runMdcngBatchJob(job));
+        Future<void>.delayed(Duration.zero).then((_) => _diskWork.run('mdcng:${job.id}', () => _runMdcngBatchJob(job)));
     await _writeJson(request.response, HttpStatus.accepted, {
       'data': _mdcngBatchJobPayload(job),
     });
@@ -5054,7 +5065,7 @@ class NasHealthServer {
     );
     _rememberMdcngBatchJob(retry);
     _activeMdcngBatchTask = Future<void>.delayed(Duration.zero)
-        .then((_) => _runMdcngBatchJob(retry));
+        .then((_) => _diskWork.run('mdcng:${retry.id}', () => _runMdcngBatchJob(retry)));
     await _writeJson(request.response, HttpStatus.accepted, {
       'data': _mdcngBatchJobPayload(retry),
     });
@@ -6671,6 +6682,11 @@ class NasHealthServer {
             _configuredMediaRoot?.id != mediaRootId)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final existing = _scanJobs.values.where((job) =>
+      (job.status == 'queued' || job.status == 'running') &&
+      job.categoryId == (categoryScan ? categoryId : null) &&
+      (categoryScan || job.mediaRootId == mediaRootId)).firstOrNull;
+    if (existing != null) return _writeJson(request.response, 202, {'data': _scanJobPayload(existing)});
     final job = _ScanJob(
       id: newUuidV4(),
       mediaRootId:
@@ -6679,7 +6695,7 @@ class NasHealthServer {
       createdAt: DateTime.now().toUtc(),
     );
     _scanJobs[job.id] = job;
-    unawaited(_runScanJob(job));
+    unawaited(_diskWork.run('scan:${job.categoryId ?? job.mediaRootId}', () => _runScanJob(job)));
     await _writeJson(request.response, HttpStatus.accepted, {
       'data': _scanJobPayload(job),
     });
@@ -6689,6 +6705,9 @@ class NasHealthServer {
     if (!config.managedCategoryLibrary || _configuredMediaRoot == null) {
       return null;
     }
+    final existing = _scanJobs.values.where((job) => job.categoryId == categoryId &&
+      (job.status == 'queued' || job.status == 'running')).firstOrNull;
+    if (existing != null) return existing;
     final job = _ScanJob(
       id: newUuidV4(),
       mediaRootId: _configuredMediaRoot!.id,
@@ -6696,7 +6715,7 @@ class NasHealthServer {
       createdAt: DateTime.now().toUtc(),
     );
     _scanJobs[job.id] = job;
-    unawaited(_runScanJob(job));
+    unawaited(_diskWork.run('scan:${job.categoryId ?? job.mediaRootId}', () => _runScanJob(job)));
     return job;
   }
 
@@ -6736,6 +6755,7 @@ class NasHealthServer {
               mediaService: _mediaService,
             )
           : await _libraryDatabase.scanCategory(
+              beforeFile: _diskWork.yieldToPlayback,
               categoryId: job.categoryId!,
               mediaRootId: job.mediaRootId,
               mediaService: _mediaService,
@@ -7205,6 +7225,22 @@ class NasHealthServer {
         'devicePlatform': record.devicePlatform,
       };
 
+  Future<void> _serveArtwork(HttpRequest request, NasArtworkFile artwork) async {
+    final stat = await artwork.file.stat();
+    final etag = 'W/"${artwork.file.uri.pathSegments.last}-${stat.size}-${stat.modified.microsecondsSinceEpoch}"';
+    request.response.headers.set(HttpHeaders.etagHeader, etag);
+    request.response.headers.set(HttpHeaders.cacheControlHeader, 'private, no-cache');
+    if (request.headers.value(HttpHeaders.ifNoneMatchHeader) == etag) {
+      request.response.statusCode = HttpStatus.notModified;
+      return request.response.close();
+    }
+    request.response.statusCode = HttpStatus.ok;
+    request.response.headers.contentType = ContentType.parse(artwork.mimeType);
+    request.response.headers.contentLength = stat.size;
+    if (request.method == 'GET') await request.response.addStream(artwork.file.openRead());
+    await request.response.close();
+  }
+
   Future<void> _poster(HttpRequest request) async {
     final movieId = request.uri.pathSegments.last;
     final databaseMovie = _libraryDatabase.findMovie(movieId);
@@ -7214,15 +7250,7 @@ class NasHealthServer {
       if (artwork == null) {
         return await _error(request, HttpStatus.notFound, 'resource_not_found');
       }
-      request.response.statusCode = HttpStatus.ok;
-      request.response.headers.contentType =
-          ContentType.parse(artwork.mimeType);
-      request.response.headers.contentLength = await artwork.file.length();
-      request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
-      if (request.method == 'GET') {
-        await request.response.addStream(artwork.file.openRead());
-      }
-      return request.response.close();
+      return _serveArtwork(request, artwork);
     }
     final bytes = _library.poster(movieId);
     if (bytes == null)
@@ -7355,14 +7383,7 @@ class NasHealthServer {
     final artwork = await _artworkService.carouselImage(image.fileName);
     if (artwork == null)
       return _error(request, HttpStatus.notFound, 'resource_not_found');
-    request.response.statusCode = HttpStatus.ok;
-    request.response.headers.contentType = ContentType.parse(artwork.mimeType);
-    request.response.headers.contentLength = await artwork.file.length();
-    request.response.headers.set(HttpHeaders.cacheControlHeader, 'no-store');
-    if (request.method == 'GET') {
-      await request.response.addStream(artwork.file.openRead());
-    }
-    await request.response.close();
+    return _serveArtwork(request, artwork);
   }
 
   Future<List<int>?> _readArtworkBytes(
@@ -7543,7 +7564,10 @@ class NasHealthServer {
         !const {'playing', 'paused'}.contains(state)) {
       return _error(request, HttpStatus.badRequest, 'invalid_request');
     }
-    if (session.purpose == 'playback' && session.started) {
+    if (session.purpose == 'playback' && session.started &&
+        !(state == 'paused' && session.playbackStatus == state &&
+          session.endPositionMs == positionMs && session.durationMs == durationMs)) {
+      _libraryDatabase.transaction(() {
       session.endPositionMs = positionMs > durationMs ? durationMs : positionMs;
       session.durationMs = durationMs;
       _reportPlaybackHistory(
@@ -7563,6 +7587,7 @@ class NasHealthServer {
           durationMs: durationMs,
         );
       }
+          });
     }
     _logger.event('playback.progress', level: 'DEBUG', fields: {
       'component': 'nas.playback',
@@ -7608,6 +7633,42 @@ class NasHealthServer {
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {'started': session.started},
     });
+  }
+
+  Future<void> _finishPlayback(HttpRequest request, String tokenHash) async {
+    final id = request.uri.pathSegments[4];
+    if (_closedPlayback[id] == tokenHash) {
+      request.response.statusCode = HttpStatus.noContent;
+      return request.response.close();
+    }
+    final session = _playbackSession(request, tokenHash);
+    if (session == null) return _error(request, 404, 'resource_not_found');
+    final body = await _readJsonBody(request);
+    final position = body?['positionMs'];
+    final duration = body?['durationMs'];
+    if (position is! int || duration is! int || position < 0 || duration < 0) {
+      return _error(request, 400, 'invalid_request');
+    }
+    _libraryDatabase.transaction(() {
+      if (session.started && session.purpose == 'playback') {
+        session.endPositionMs = position.clamp(0, duration);
+        session.durationMs = duration;
+        _libraryDatabase.savePlaybackProgress(movieId: session.movieId,
+          episodeId: session.episodeId, positionMs: position, durationMs: duration);
+        final now = DateTime.now().toUtc();
+        _reportPlaybackHistory(session, reportedAt: now, nextStatus: 'ended');
+        if (session.historyId != null) {
+          _libraryDatabase.finishPlaybackHistory(historyId: session.historyId!,
+            endPositionMs: session.endPositionMs, durationMs: duration,
+            lastReportedAt: now.toIso8601String(), watchDurationMs: session.watchDurationMs);
+        }
+      }
+    });
+    _playbackSessions.remove(id);
+    _closedPlayback[id] = tokenHash;
+    if (_closedPlayback.length > 256) _closedPlayback.remove(_closedPlayback.keys.first);
+    request.response.statusCode = HttpStatus.noContent;
+    await request.response.close();
   }
 
   Future<void> _deletePlaybackSession(

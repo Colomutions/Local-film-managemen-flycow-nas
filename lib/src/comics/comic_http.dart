@@ -65,7 +65,7 @@ class ComicHttpApi {
       }
       ready = true;
       unavailableReason = null;
-      _cleanupTimer = Timer.periodic(const Duration(hours: 1), (_) {
+      _cleanupTimer = Timer.periodic(const Duration(hours: 24), (_) {
         unawaited(_serialized(() async {
           await sessions.recover();
           catalog.cleanupExpiredIdempotency();

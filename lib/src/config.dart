@@ -28,6 +28,7 @@ class NasConfig {
     this.comicDir,
     this.comicQuotaBytes,
     this.maxComicUploadBytes = 2 * 1024 * 1024 * 1024,
+    this.backgroundReadBytesPerSecond = 16 * 1024 * 1024,
     this.maxComicChunkBytes = 64 * 1024 * 1024,
   });
 
@@ -90,6 +91,7 @@ class NasConfig {
           _optionalPositiveInt(environment, 'MUJING_COMIC_QUOTA_BYTES'),
       maxComicUploadBytes: _positiveInt(
           environment, 'MUJING_MAX_COMIC_UPLOAD_BYTES', 2 * 1024 * 1024 * 1024),
+      backgroundReadBytesPerSecond: _positiveInt(environment, 'MUJING_BACKGROUND_READ_BYTES_PER_SECOND', 16 * 1024 * 1024),
       maxComicChunkBytes: _positiveInt(
           environment, 'MUJING_MAX_COMIC_CHUNK_BYTES', 64 * 1024 * 1024),
     );
@@ -132,6 +134,7 @@ class NasConfig {
   final int? comicQuotaBytes;
   final int maxComicUploadBytes;
   final int maxComicChunkBytes;
+  final int backgroundReadBytesPerSecond;
 
   static String _logLevel(Map<String, String> environment) {
     final value = _value(environment, 'MUJING_LOG_LEVEL', 'INFO').toUpperCase();

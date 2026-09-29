@@ -1045,9 +1045,51 @@ class NasLibraryDatabase {
       database.execute('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
       _database = database;
       _migrate();
+      _initializeRevisions();
     } catch (_) {
       database.dispose();
       _database = null;
+      rethrow;
+    }
+  }
+
+  // TEMP counters roll back with business writes and never write to the WAL.
+  String _revisionEpoch = newUuidV4();
+  void _initializeRevisions() {
+    _revisionEpoch = newUuidV4();
+    _db.execute('PRAGMA temp_store=MEMORY');
+    _db.execute('CREATE TEMP TABLE resource_revisions (kind TEXT PRIMARY KEY, value INTEGER NOT NULL)');
+    for (final kind in ['library', 'taxonomy', 'watch', 'artwork']) {
+      _db.execute('INSERT INTO resource_revisions VALUES (?, 0)', [kind]);
+    }
+    final tables = _db.select("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
+    for (final row in tables) {
+      final table = row['name'] as String;
+      if (!RegExp(r'^[a-z_]+$').hasMatch(table)) continue;
+      final kind = table.contains('playback') ? 'watch'
+          : table.contains('tag') || table == 'library_categories' || table == 'category_media_sources' ? 'taxonomy'
+          : table.contains('asset') || table == 'movie_carousel_images' ? 'artwork'
+          : 'library';
+      for (final operation in ['INSERT', 'UPDATE', 'DELETE']) {
+        _db.execute("CREATE TEMP TRIGGER revision_${table}_$operation AFTER $operation ON main.$table BEGIN UPDATE resource_revisions SET value=value+1 WHERE kind='$kind'; END");
+      }
+    }
+  }
+
+  Map<String, String> get revisions => {
+    for (final row in _db.select('SELECT kind, value FROM resource_revisions'))
+      row['kind'] as String: '$_revisionEpoch:${row['value']}',
+  };
+
+  T transaction<T>(T Function() action) {
+    _db.execute('SAVEPOINT storage_batch');
+    try {
+      final result = action();
+      _db.execute('RELEASE storage_batch');
+      return result;
+    } catch (_) {
+      _db.execute('ROLLBACK TO storage_batch');
+      _db.execute('RELEASE storage_batch');
       rethrow;
     }
   }
@@ -2063,6 +2105,7 @@ class NasLibraryDatabase {
 
   Future<NasScanResult> scanCategory({
     required String categoryId,
+    Future<void> Function()? beforeFile,
     required String mediaRootId,
     required NasMediaService mediaService,
     NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
@@ -2093,6 +2136,7 @@ class NasLibraryDatabase {
     for (final source in sources) {
       final result = await _scanCategorySource(
         categoryId: categoryId,
+        beforeFile: beforeFile,
         source: source,
         mediaService: mediaService,
         metadataProbe: metadataProbe,
@@ -2111,6 +2155,7 @@ class NasLibraryDatabase {
   /// 分类扫描在单一物理来源盘内完成；盘不可读时绝不改写既有分集可用性。
   Future<NasScanResult> _scanCategorySource({
     required String categoryId,
+    Future<void> Function()? beforeFile,
     required NasCategoryMediaSource source,
     required NasMediaService mediaService,
     required NasMediaMetadataProbe metadataProbe,
@@ -2157,10 +2202,17 @@ class NasLibraryDatabase {
         ? listedDirectory
         : '$listedDirectory${Platform.pathSeparator}';
     // 成功穷举后才标记不可用，避免挂载中断导致“离线即删除”。
-    _markUnavailableEpisodesForSource(categoryId, source);
+    final seenPaths = <String>{};
+    final changes = <void Function()>[];
+    void flushChanges() {
+      if (changes.isEmpty) return;
+      transaction(() { for (final change in changes) { change(); } });
+      changes.clear();
+    }
     var scannedFiles = 0;
     final conflicts = <String>[];
     for (final entity in files) {
+      await beforeFile?.call();
       final listedFile = entity.absolute.path;
       if (!listedFile.startsWith(prefix)) continue;
       final inCategoryPath = listedFile
@@ -2173,12 +2225,13 @@ class NasLibraryDatabase {
         continue;
       }
       final relativePath = '${source.relativePath}/$inCategoryPath';
+      seenPaths.add(relativePath);
       final checked = NasMediaFile(File(listedFile), relativePath);
       final stat = await checked.file.stat();
       final existing = _db.select('''
         SELECT e.id, e.movie_id, e.file_size, e.media_modified_at,
                e.duration_ms, e.video_width, e.video_height, e.resolution_label,
-               e.metadata_probed_at,
+               e.metadata_probed_at, e.is_available,
                m.collection_key
         FROM episodes e JOIN movies m ON m.id = e.movie_id
         WHERE e.media_root_id = ? AND e.relative_path = ?
@@ -2203,7 +2256,16 @@ class NasLibraryDatabase {
           existing.single['file_size'] == fileSize &&
           existing.single['media_modified_at'] == modifiedAt &&
           existing.single['metadata_probed_at'] != null;
-      final metadata = unchanged ? null : await metadataProbe.probe(checked);
+      if (unchanged) {
+        if (existing.single['is_available'] != 1) {
+          final id = existing.single['id'] as String;
+          changes.add(() => _markExistingEpisodeAvailable(id));
+        }
+        scannedFiles++;
+        if (changes.length >= 100) flushChanges();
+        continue;
+      }
+      final metadata = await metadataProbe.probe(checked);
       final movieId = existing.isNotEmpty
           ? existing.single['movie_id'] as String
           : _movieIdForScannedEpisode(
@@ -2212,7 +2274,7 @@ class NasLibraryDatabase {
               title: grouping.displayTitle ?? _titleFromPath(inCategoryPath),
             );
       final timestamp = _now();
-      _db.execute('''
+      changes.add(() => _db.execute('''
         INSERT INTO episodes(
           id, movie_id, media_root_id, title, relative_path, duration_ms,
           video_width, video_height, resolution_label, metadata_probed_at,
@@ -2246,9 +2308,12 @@ class NasLibraryDatabase {
         fileSize,
         _naturalSortKey(inCategoryPath),
         timestamp,
-      ]);
+      ]));
+      if (changes.length >= 100) flushChanges();
       scannedFiles++;
     }
+    flushChanges();
+    _markUnavailableEpisodesForSource(categoryId, source, seenPaths: seenPaths);
     _markRootScanned(mediaRoot.id);
     return NasScanResult(
       scannedFiles: scannedFiles,
@@ -2259,8 +2324,9 @@ class NasLibraryDatabase {
 
   void _markUnavailableEpisodesForSource(
     String categoryId,
-    NasCategoryMediaSource source,
-  ) {
+    NasCategoryMediaSource source, {
+    Set<String> seenPaths = const {},
+  }) {
     final rows = _db.select('''
       SELECT e.id, e.relative_path FROM episodes e
       JOIN movies m ON m.id = e.movie_id
@@ -2270,20 +2336,24 @@ class NasLibraryDatabase {
     final ids = rows
         .where((row) {
           final path = row['relative_path'] as String;
-          return path == source.relativePath || path.startsWith(prefix);
+          return !seenPaths.contains(path) && (path == source.relativePath || path.startsWith(prefix));
         })
         .map((row) => row['id'] as String)
         .toList(growable: false);
-    for (final id in ids) {
+    for (var offset = 0; offset < ids.length; offset += 100) {
+      transaction(() {
+      for (final id in ids.skip(offset).take(100)) {
       _db.execute(
-          'UPDATE episodes SET is_available = 0, updated_at = ? WHERE id = ?',
+          'UPDATE episodes SET is_available = 0, updated_at = ? WHERE id = ? AND is_available != 0',
           [_now(), id]);
+      }
+      });
     }
   }
 
   void _markExistingEpisodeAvailable(String episodeId) {
     _db.execute(
-        'UPDATE episodes SET is_available = 1, updated_at = ? WHERE id = ?',
+        'UPDATE episodes SET is_available = 1, updated_at = ? WHERE id = ? AND is_available != 1',
         [_now(), episodeId]);
   }
 
@@ -5598,6 +5668,39 @@ class NasLibraryDatabase {
       WHERE m.id = ?
     ''', [movieId]);
     return rows.isEmpty ? null : _mapCategory(rows.single);
+  }
+
+  /// Batch the current page's associations; load tag ancestry only once.
+  Map<String, Map<String, Object?>> browseAssociations(List<String> ids) {
+    if (ids.isEmpty) return {};
+    final placeholders = List.filled(ids.length, '?').join(',');
+    final result = {for (final id in ids) id: <String, Object?>{
+      'actors': <Map<String, Object?>>[], 'tags': <Map<String, Object?>>[], 'tagPaths': <List<String>>[],
+    }};
+    for (final row in _db.select('''SELECT links.movie_id, a.id, a.stage_name,
+      a.original_name, a.translated_name, a.gender FROM movie_actor_links links
+      JOIN actors a ON a.id=links.actor_id WHERE links.movie_id IN ($placeholders)
+      ORDER BY a.id''', ids)) {
+      (result[row['movie_id']]!['actors'] as List).add({
+        'id': row['id'], 'name': [row['stage_name'], row['original_name'], row['translated_name']]
+          .whereType<String>().where((name) => name.trim().isNotEmpty).firstOrNull ?? '',
+        'gender': row['gender'],
+      });
+    }
+    final tags = _db.select('''SELECT links.movie_id, t.* FROM movie_tag_links links
+      JOIN tags t ON t.id=links.tag_id WHERE links.movie_id IN ($placeholders)
+      ORDER BY t.level, t.name COLLATE NOCASE, t.id''', ids);
+    final paths = _tagPathsForIds(tags.map((row) => row['id'] as String).toSet());
+    final pathsById = <String, List<List<String>>>{};
+    for (final path in paths) { pathsById.putIfAbsent(path.tagId, () => []).add(path.names); }
+    for (final row in tags) {
+      final item = result[row['movie_id']]!;
+      (item['tags'] as List).add({'id': row['id'], 'name': row['name'], 'level': row['level'],
+        'description': row['description'], 'color': row['color'], 'createdAt': row['created_at'],
+        'updatedAt': row['updated_at'], 'archivedAt': row['archived_at']});
+      (item['tagPaths'] as List).addAll(pathsById[row['id']] ?? const []);
+    }
+    return result;
   }
 
   List<NasTagPath> tagPathsForMovie(String movieId) {

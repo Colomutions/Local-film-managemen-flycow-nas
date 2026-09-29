@@ -35,10 +35,6 @@ class NasNovelBackupCoordinator {
       final copied = <String>{};
       for (final entry in captured) {
         if (!copied.add(entry.contentSha256)) continue;
-        await storage.verifyObject(
-          entry.contentSha256,
-          expectedSizeBytes: entry.sizeBytes,
-        );
         final source = storage.objectFile(entry.contentSha256);
         final target = File(
           '${temporaryDirectory.path}${Platform.pathSeparator}novels'
@@ -46,9 +42,20 @@ class NasNovelBackupCoordinator {
           '${entry.contentSha256}',
         );
         await target.parent.create(recursive: true);
+        final digestOutput = _BackupDigestSink();
+        final digestInput = sha256.startChunkedConversion(digestOutput);
+        var copiedBytes = 0;
         final sink = target.openWrite(mode: FileMode.writeOnly);
         try {
-          await sink.addStream(source.openRead());
+          await sink.addStream(source.openRead().map((bytes) {
+            digestInput.add(bytes);
+            copiedBytes += bytes.length;
+            return bytes;
+          }));
+          digestInput.close();
+          if (copiedBytes != entry.sizeBytes || digestOutput.value?.toString() != entry.contentSha256) {
+            throw StateError('Novel source content failed backup validation');
+          }
           await sink.flush();
         } finally {
           await sink.close();
@@ -96,4 +103,12 @@ class NasNovelBackupCoordinator {
       throw StateError('Novel backup copy has an invalid digest.');
     }
   }
+}
+
+class _BackupDigestSink implements Sink<Digest> {
+  Digest? value;
+  @override
+  void add(Digest data) => value = data;
+  @override
+  void close() {}
 }
