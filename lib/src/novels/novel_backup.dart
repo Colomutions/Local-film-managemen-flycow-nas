@@ -13,11 +13,18 @@ class NasNovelBackupCoordinator {
     required this.repository,
     required this.storage,
     required this.writeBarrier,
+    this.backgroundRead,
   });
 
   final NasNovelRepository repository;
   final NasNovelStorage storage;
   final NasNovelWriteBarrier writeBarrier;
+  final Stream<List<int>> Function(Stream<List<int>> source)? backgroundRead;
+
+  Stream<List<int>> _read(File file) {
+    final source = file.openRead();
+    return backgroundRead?.call(source) ?? source;
+  }
 
   Future<NasPreparedBackupContribution> prepare({
     required String backupId,
@@ -47,7 +54,7 @@ class NasNovelBackupCoordinator {
         var copiedBytes = 0;
         final sink = target.openWrite(mode: FileMode.writeOnly);
         try {
-          await sink.addStream(source.openRead().map((bytes) {
+          await sink.addStream(_read(source).map((bytes) {
             digestInput.add(bytes);
             copiedBytes += bytes.length;
             return bytes;
@@ -98,7 +105,7 @@ class NasNovelBackupCoordinator {
     if (await file.length() != entry.sizeBytes) {
       throw StateError('Novel backup copy has an invalid size.');
     }
-    final digest = await sha256.bind(file.openRead()).first;
+    final digest = await sha256.bind(_read(file)).first;
     if (digest.toString() != entry.contentSha256) {
       throw StateError('Novel backup copy has an invalid digest.');
     }

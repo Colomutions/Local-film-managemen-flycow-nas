@@ -85,6 +85,7 @@ class NasBackupService {
   Future<NasBackupRecord> create({
     required Future<void> Function(File target) databaseSnapshot,
     NasBackupContributionPreparer? prepareContribution,
+    Stream<List<int>> Function(Stream<List<int>> source)? backgroundRead,
   }) async {
     final id = newUuidV4();
     final createdAt = DateTime.now().toUtc();
@@ -129,6 +130,7 @@ class NasBackupService {
             '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters'),
         Directory(
             '${temporary.path}${Platform.pathSeparator}artwork${Platform.pathSeparator}posters'),
+        backgroundRead: backgroundRead,
       );
       final record = NasBackupRecord(
         id: id,
@@ -364,7 +366,9 @@ class NasBackupService {
       normalized.contains('secret');
 
   Future<void> _copyDirectoryIfExists(
-      Directory source, Directory target) async {
+      Directory source, Directory target, {
+      Stream<List<int>> Function(Stream<List<int>> source)? backgroundRead,
+      }) async {
     if (!await source.exists()) return;
     await target.create(recursive: true);
     await for (final entity
@@ -373,7 +377,11 @@ class NasBackupService {
       final relativePath = entity.path.substring(source.path.length + 1);
       final copy = File('${target.path}${Platform.pathSeparator}$relativePath');
       await copy.parent.create(recursive: true);
-      await entity.copy(copy.path);
+      if (backgroundRead == null) {
+        await entity.copy(copy.path);
+      } else {
+        await backgroundRead(entity.openRead()).pipe(copy.openWrite());
+      }
     }
   }
 

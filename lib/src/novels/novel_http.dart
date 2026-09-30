@@ -8,9 +8,10 @@ import 'novel_service.dart';
 import 'novel_storage.dart';
 
 class NasNovelHttpApi {
-  NasNovelHttpApi(this.service);
+  NasNovelHttpApi(this.service, {this.backgroundRead});
 
   final NasNovelService service;
+  final Stream<List<int>> Function(Stream<List<int>> source)? backgroundRead;
 
   bool get isReady => service.isReady;
   String? get unavailableReason => service.unavailableReason;
@@ -127,7 +128,10 @@ class NasNovelHttpApi {
         );
       }
       if (request.method == 'GET' && length > 0) {
-        await request.response.addStream(file.openRead(start, end + 1));
+        final source = file.openRead(start, end + 1);
+        await request.response.addStream(
+          backgroundRead?.call(source) ?? source,
+        );
       }
       await request.response.close();
     } catch (error) {

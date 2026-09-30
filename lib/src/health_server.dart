@@ -223,12 +223,16 @@ class NasHealthServer {
         uploadRequestsPerMinute: config.novelUploadRequestsPerMinute,
       );
       await novelService.initialize();
-      _novelApi = NasNovelHttpApi(novelService);
+      _novelApi = NasNovelHttpApi(
+        novelService,
+        backgroundRead: _diskWork.read,
+      );
       if (novelService.isReady) {
         _novelBackupCoordinator = NasNovelBackupCoordinator(
           repository: novelService.repository,
           storage: novelService.storage,
           writeBarrier: novelService.writeBarrier,
+          backgroundRead: _diskWork.read,
           );
       }
     }
@@ -242,7 +246,9 @@ class NasHealthServer {
         rootPath: comicDir,
         maxUploadBytes: config.maxComicUploadBytes,
         maxChunkBytes: config.maxComicChunkBytes,
+        backgroundRead: _diskWork.read,
         quotaBytes: config.comicQuotaBytes,
+        paceRead: _diskWork.pace,
       );
       await api.initialize();
       _comicApi = api;
@@ -4152,6 +4158,7 @@ class NasHealthServer {
       final pending = _pendingBackup ??= _diskWork.run('backup', () => _backupService.create(
         databaseSnapshot: _libraryDatabase.createBackupSnapshot,
         prepareContribution: _novelBackupCoordinator?.prepare,
+        backgroundRead: _diskWork.read,
       ));
       final NasBackupRecord backup;
       try { backup = await pending; } finally { if (identical(pending, _pendingBackup)) _pendingBackup = null; }

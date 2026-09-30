@@ -19,7 +19,9 @@ class ComicHttpApi {
       {required this.rootPath,
       required this.maxUploadBytes,
       required this.maxChunkBytes,
-      required this.quotaBytes})
+      required this.quotaBytes,
+      this.backgroundRead,
+      this.paceRead})
       : files = ComicFiles(rootPath, maxUploadBytes),
         catalog = ComicCatalog(rootPath) {
     sessions = ComicSessions(rootPath, files, maxChunkBytes, maxUploadBytes);
@@ -27,6 +29,8 @@ class ComicHttpApi {
   final String rootPath;
   final int maxUploadBytes, maxChunkBytes;
   final int? quotaBytes;
+  final Stream<List<int>> Function(Stream<List<int>> source)? backgroundRead;
+  final Future<void> Function(int bytes)? paceRead;
   final ComicFiles files;
   final ComicCatalog catalog;
   late final ComicSessions sessions;
@@ -247,6 +251,7 @@ class ComicHttpApi {
       }
       var remaining = end - start + 1;
       while (remaining > 0) {
+        await paceRead?.call(remaining < 64 * 1024 ? remaining : 64 * 1024);
         List<int> data;
         try {
           data =
@@ -258,6 +263,7 @@ class ComicHttpApi {
           rethrow;
         }
         response.add(data);
+        await response.flush();
         remaining -= data.length;
       }
       await response.close();
@@ -560,7 +566,11 @@ class ComicHttpApi {
       final file = files.sessionFile(id);
       try {
         if (!session.verified) {
-          final digest = (await sha256.bind(file.openRead()).first).toString();
+          final source = file.openRead();
+          final digest = (await sha256
+                  .bind(backgroundRead?.call(source) ?? source)
+                  .first)
+              .toString();
           if (digest != session.metadata['contentSha256'])
             throw const ComicFailure('content_hash_mismatch');
         }
