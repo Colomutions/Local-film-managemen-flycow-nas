@@ -11,3 +11,4 @@ export 'src/library_database.dart';
 export 'src/metadata_probe.dart';
 export 'src/persistent_state.dart';
 export 'src/range.dart';
+export 'src/scrape_service.dart';

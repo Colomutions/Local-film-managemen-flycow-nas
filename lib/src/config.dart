@@ -16,6 +16,8 @@ class NasConfig {
     required this.timezone,
     this.mdcngDataDir,
     this.mdcngSourceId = 'default',
+    this.scraperScript = '/app/scraper/worker.mjs',
+    this.scraperNode = 'node',
     this.logLevel = 'INFO',
     this.diagnosticMode = false,
     this.logMaxBytes = 2 * 1024 * 1024,
@@ -60,6 +62,8 @@ class NasConfig {
       timezone: _value(environment, 'MUJING_TIMEZONE', 'Asia/Shanghai'),
       mdcngDataDir: _absoluteDirectory(environment, 'MUJING_MDCNG_DATA_DIR'),
       mdcngSourceId: _value(environment, 'MUJING_MDCNG_SOURCE_ID', 'default'),
+      scraperScript: _value(environment, 'MUJING_SCRAPER_SCRIPT', '/app/scraper/worker.mjs'),
+      scraperNode: _value(environment, 'MUJING_SCRAPER_NODE', 'node'),
       logLevel: _logLevel(environment),
       diagnosticMode: _boolValue(environment, 'MUJING_DIAGNOSTIC_MODE', false),
       logMaxBytes:
@@ -121,6 +125,8 @@ class NasConfig {
   /// A stable, administrator-selected identifier for the current MDCNG/Emby
   /// installation. It scopes imported Emby person ids across installations.
   final String mdcngSourceId;
+  final String scraperScript;
+  final String scraperNode;
   final String logLevel;
   final bool diagnosticMode;
   final int logMaxBytes;

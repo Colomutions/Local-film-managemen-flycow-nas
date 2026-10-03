@@ -29,6 +29,7 @@ import 'novels/restore_activation.dart';
 import 'comics/comic_http.dart';
 import 'persistent_state.dart';
 import 'range.dart';
+import 'scrape_service.dart';
 
 String? _nullableTrimmed(String? value) {
   final normalized = value?.trim();
@@ -94,6 +95,7 @@ class NasHealthServer {
     NasDiagnosticLogger? logger,
     NasAiMetadataClient? aiMetadataClient,
     NasMdcngActorSource? mdcngActorSource,
+    NasScrapeWorker? scrapeWorker,
   })  : _stateStore = stateStore ?? NasPersistentStateStore(config.dataDir),
         _library = library ?? NasFixtureLibrary(),
         _mediaService = mediaService ??
@@ -106,6 +108,7 @@ class NasHealthServer {
         _artworkService = artworkService ?? NasArtworkService(config.dataDir),
         _backupService = backupService ?? NasBackupService(config.dataDir),
         _logger = logger ?? NasDiagnosticLogger(),
+        _scrapeWorker = scrapeWorker ?? NasProcessScrapeWorker(script:config.scraperScript,dataDir:'${config.dataDir}/scraper',node:config.scraperNode),
         _aiMetadataClient =
             aiMetadataClient ?? const NasDisabledAiMetadataClient(),
         _mdcngActorSource = mdcngActorSource ??
@@ -123,6 +126,8 @@ class NasHealthServer {
   final NasDiagnosticLogger _logger;
   final NasAiMetadataClient _aiMetadataClient;
   final NasMdcngActorSource? _mdcngActorSource;
+  final NasScrapeWorker _scrapeWorker;
+  NasScrapeService? _scraper;
   Future<NasMdcngActorSourceAvailability>? _mdcngAvailabilityProbe;
   DateTime? _mdcngAvailabilityCheckedAt;
   NasNovelHttpApi? _novelApi;
@@ -170,6 +175,7 @@ class NasHealthServer {
       await _restoreActivation!.recoverIncompleteActivation();
     }
     await _libraryDatabase.open();
+    _scraper = NasScrapeService(_libraryDatabase,_artworkService,_scrapeWorker,cacheDir:'${config.dataDir}/scraper',logger:_logger)..start();
     await _backupService.recoverIncomplete();
     await _initializeNovelServices();
     await _initializeComicServices();
@@ -277,6 +283,7 @@ class NasHealthServer {
         restoredDirectory: isolated,
         enterMaintenance: () async {
           _maintenance = true;
+          await _scraper?.close();
           _diskWork.accepting = false;
           await _activeMdcngBatchTask;
           await _diskWork.drain();
@@ -284,7 +291,7 @@ class NasHealthServer {
             await Future<void>.delayed(const Duration(milliseconds: 5));
           }
         },
-        leaveMaintenance: () async { _maintenance = false; _diskWork.accepting = true; },
+        leaveMaintenance: () async { _maintenance = false; _diskWork.accepting = true; _scraper?.start(); },
         closeDatabase: () async {
           await _libraryDatabase.checkpointAndClose();
           _novelApi = null;
@@ -324,6 +331,8 @@ class NasHealthServer {
         job.cancelled = true;
     }
     await _activeMdcngBatchTask;
+    await _scraper?.close();
+    _scraper = null;
     await _diskWork.drain();
     _mdcngBatchJobs.clear();
     await server?.close(force: true);
@@ -409,6 +418,9 @@ class NasHealthServer {
       }
       if (request.method == 'GET' && path == '/api/v1/cinema-home') {
         return await _cinemaHome(request);
+      }
+      if (path == '/api/v1/admin/scraping' || path.startsWith('/api/v1/admin/scraping/')) {
+        return await _scrapingRequest(request);
       }
       if (request.method == 'POST' && RegExp(r'^/api/v1/playback/sessions/[^/]+/finish$').hasMatch(path)) {
         return await _finishPlayback(request, tokenHash);
@@ -649,6 +661,10 @@ class NasHealthServer {
       if (request.method == 'PUT' &&
           path == '/api/v1/admin/mdcng-actor-imports/decision') {
         return await _setMdcngActorImportDecision(request);
+      }
+      if (request.method == 'POST' &&
+          path == '/api/v1/admin/mdcng-actor-imports/reset') {
+        return await _resetMdcngActors(request);
       }
       if (request.method == 'POST' &&
           path == '/api/v1/admin/mdcng-actor-imports/preview') {
@@ -1008,6 +1024,7 @@ class NasHealthServer {
         'series': true,
         'tags': true,
         'mdcngNfo': true,
+        'builtinScraping': _scraper?.available ?? false,
         'mdcngNfoBatch': true,
         'mdcngActors': mdcngActorAvailability.isAvailable,
         'profilePackages': true,
@@ -2938,6 +2955,8 @@ class NasHealthServer {
       'originalName': publisher.originalName,
       'countryRegion': publisher.countryRegion,
       'foundedDate': publisher.foundedDate,
+      'organizationRoles': _libraryDatabase.companyRoles(publisher.id),
+      'sourceProfiles': _libraryDatabase.scrapeProfiles('company',publisher.id),
       'logoAsset': logo == null ? null : _managedAssetPayload(logo),
       'movieCount': publisher.movieCount,
       'seriesCount': publisher.seriesCount,
@@ -2995,6 +3014,7 @@ class NasHealthServer {
     return {
       'id': actor.id,
       'stageName': actor.stageName,
+      'sourceProfiles': _libraryDatabase.scrapeProfiles('actor',actor.id),
       'originalName': actor.originalName,
       'translatedName': actor.translatedName,
       'aliases': actor.aliases,
@@ -3522,6 +3542,8 @@ class NasHealthServer {
     final resumeTarget = _libraryDatabase.resumeTargetForMovie(movie.id);
     return {
       ..._databaseSummary(movie),
+      'organizations': _libraryDatabase.movieCompanies(movie.id),
+      'sourceMetadata': _libraryDatabase.scrapeMovieProfile(movie.id),
       'actors':
           movie.actors.map(_movieActorDetailsPayload).toList(growable: false),
       'summary': movie.summary,
@@ -3583,18 +3605,7 @@ class NasHealthServer {
         },
       );
 
-  Future<void> _adminCategories(HttpRequest request) => _writeJson(
-        request.response,
-        HttpStatus.ok,
-        {
-          'data': {
-            'items': _libraryDatabase
-                .listCategories()
-                .map(_categoryPayload)
-                .toList(growable: false),
-          },
-        },
-      );
+  Future<void> _adminCategories(HttpRequest request) => _categories(request);
 
   Future<void> _exportAdminCategoryTaxonomy(HttpRequest request) async {
     final conflicts = _libraryDatabase.categoryTaxonomyViolations();
@@ -3630,18 +3641,37 @@ class NasHealthServer {
     }
   }
 
-  Future<void> _categories(HttpRequest request) => _writeJson(
+  Future<void> _categories(HttpRequest request) async {
+    final sort = request.uri.queryParameters['sort'] ?? 'name';
+    if (!const {'name', 'movieCount', 'directory'}.contains(sort)) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final categories = _libraryDatabase.listCategories();
+    String directory(NasLibraryCategory category) => category.mediaSources.isEmpty
+        ? category.mediaRelativePath ?? '尚未绑定 NAS 目录'
+        : category.mediaSources.map((source) =>
+            '${source.sourceName} · ${source.relativePath.split('/').last}').join('；');
+    if (sort != 'name') {
+      categories.sort((a, b) {
+        final compared = sort == 'movieCount'
+            ? b.movieCount.compareTo(a.movieCount) : directory(a).compareTo(directory(b));
+        if (compared != 0) return compared;
+        final nameOrder = a.name.compareTo(b.name);
+        return nameOrder == 0 ? a.id.compareTo(b.id) : nameOrder;
+      });
+    }
+    await _writeJson(
         request.response,
         HttpStatus.ok,
         {
           'data': {
-            'items': _libraryDatabase
-                .listCategories()
+            'items': categories
                 .map(_categoryPayload)
                 .toList(growable: false),
           },
         },
       );
+  }
 
   Future<void> _createAdminCategory(HttpRequest request) async {
     if (_activeMdcngBatchTask != null) {
@@ -3708,6 +3738,10 @@ class NasHealthServer {
     }
     final directoryChanged =
         hasSources && !_sameCategorySources(previous.mediaSources, sources!);
+    if (directoryChanged && _scanJobs.values.any((job) =>
+        job.categoryId == categoryId && (job.status == 'queued' || job.status == 'running'))) {
+      return _error(request, HttpStatus.conflict, 'scan_running');
+    }
     final category = _libraryDatabase.updateCategory(
       categoryId,
       name: name,
@@ -3740,11 +3774,24 @@ class NasHealthServer {
     if (_activeMdcngBatchTask != null) {
       return _error(request, HttpStatus.conflict, 'mdcng_batch_running');
     }
-    if (!_libraryDatabase.deleteCategory(
-      request.uri.pathSegments.last,
+    final categoryId = request.uri.pathSegments.last;
+    if (_scanJobs.values.any((job) =>
+        (job.categoryId == null || job.categoryId == categoryId) &&
+        (job.status == 'queued' || job.status == 'running'))) {
+      return _error(request, HttpStatus.conflict, 'scan_running');
+    }
+    final removed = _libraryDatabase.deleteCategoryWithIndexes(
+      categoryId,
       deleteMovies: config.managedCategoryLibrary,
-    )) {
+    );
+    if (removed == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    for (final movie in removed) {
+      await _artworkService.deletePoster(movie.posterFileName);
+      for (final fileName in movie.carouselFileNames) {
+        await _artworkService.deleteCarouselImage(fileName);
+      }
     }
     request.response.statusCode = HttpStatus.noContent;
     await request.response.close();
@@ -5326,7 +5373,6 @@ class NasHealthServer {
   Future<void> _listMdcngActorImports(HttpRequest request) async {
     final records = await _readMdcngActorRecords(request);
     if (records == null) return;
-    final actorCandidates = _libraryDatabase.listActors(includeArchived: true);
     final deferred = _libraryDatabase.mdcngDeferredEmbyIdsForSource(
       config.mdcngSourceId,
     );
@@ -5336,13 +5382,6 @@ class NasHealthServer {
         embyId: record.embyId,
       );
       final isDeferred = deferred.contains(record.embyId);
-      final similar = linked == null && !isDeferred
-          ? _libraryDatabase.findSimilarActors(
-              stageName: record.profile?.name,
-              aliases: [record.sourceName, ...?record.profile?.aliases],
-              candidates: actorCandidates,
-            )
-          : const <NasActor>[];
       return {
         'taskId': record.taskId,
         'embyId': record.embyId,
@@ -5353,16 +5392,16 @@ class NasHealthServer {
         'completedAt': record.completedAt,
         'year': record.year,
         'imageCount': record.images.length,
+        'sourceHasPhoto': record.hasPhoto,
+        'sourceHasBackdrop': record.hasBackdrop,
         'hasPhoto': record.photo != null,
         'hasBackdrop': record.backdrop != null,
-        'syncState': linked != null
-            ? 'linked'
-            : isDeferred
-                ? 'deferred'
-                : similar.isEmpty
-                    ? 'new'
-                    : 'needs_resolution',
-        'similarActors': similar.map(_actorPayload).toList(growable: false),
+        'syncState': isDeferred
+            ? 'deferred'
+            : linked != null
+                ? 'linked'
+                : 'new',
+        'similarActors': const <Map<String, Object?>>[],
       };
     }).toList(growable: false);
     await _writeJson(request.response, HttpStatus.ok, {
@@ -5392,15 +5431,6 @@ class NasHealthServer {
     if (record == null) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    if (deferred &&
-        _libraryDatabase.findActorByMdcngSource(
-              sourceId: config.mdcngSourceId,
-              embyId: record.embyId,
-            ) !=
-            null) {
-      return _error(
-          request, HttpStatus.conflict, 'mdcng_actor_already_imported');
-    }
     _libraryDatabase.setMdcngActorDeferred(
       sourceId: config.mdcngSourceId,
       embyId: record.embyId,
@@ -5411,20 +5441,36 @@ class NasHealthServer {
     });
   }
 
-  /// Previews only the records that are safe to write without any additional
-  /// decision.  This deliberately leaves unresolved profile mappings and
-  /// similar existing actors out of the batch confirmation set.
+  Future<void> _resetMdcngActors(HttpRequest request) async {
+    final body = await _readJsonBody(request);
+    if (body == null || body.isNotEmpty) {
+      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final reset = _libraryDatabase.clearAllMdcngActors();
+    var deletedImages = 0;
+    for (final asset in reset.assets) {
+      await _deleteManagedAsset(asset);
+      deletedImages++;
+    }
+    await _writeJson(request.response, HttpStatus.ok, {
+      'data': {
+        'deletedActors': reset.deletedActors,
+        'unlinkedMovieLinks': reset.unlinkedMovieLinks,
+        'deletedImages': deletedImages,
+      },
+    });
+  }
+
+  /// Previews completed MDCNG records against their existing source links.
   Future<void> _previewMdcngActorBatchImport(HttpRequest request) async {
     final records = await _readMdcngActorRecords(request);
     if (records == null) return;
-    final actorCandidates = _libraryDatabase.listActors(includeArchived: true);
     final deferred = _libraryDatabase.mdcngDeferredEmbyIdsForSource(
       config.mdcngSourceId,
     );
     final plans = records
         .map((record) => _planMdcngActorBatchImport(
               record,
-              actorCandidates: actorCandidates,
               deferredEmbyIds: deferred,
             ))
         .toList(growable: false);
@@ -5522,6 +5568,7 @@ class NasHealthServer {
         failures.add({'taskId': record.taskId, 'code': outcome});
       }
     }
+    if (created + updated > 0) _libraryDatabase.reconcileScrapeActorMovies();
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {
         'created': created,
@@ -5535,8 +5582,7 @@ class NasHealthServer {
 
   _MdcngActorBatchPlan _planMdcngActorBatchImport(
       NasMdcngActorSourceRecord record,
-      {List<NasActor>? actorCandidates,
-      Set<String>? deferredEmbyIds}) {
+      {Set<String>? deferredEmbyIds}) {
     if (deferredEmbyIds?.contains(record.embyId) ??
         _libraryDatabase.isMdcngActorDeferred(
           sourceId: config.mdcngSourceId,
@@ -5544,52 +5590,49 @@ class NasHealthServer {
         )) {
       return _MdcngActorBatchPlan(record: record, status: 'deferred');
     }
-    if (record.profile == null || record.profileResolution != 'matched') {
+    if (record.profileResolution != 'matched' &&
+        record.profileResolution != 'raw') {
       return _MdcngActorBatchPlan(
           record: record, status: 'needs_profile_resolution');
-    }
-    final previous = _libraryDatabase.findMdcngActorImport(
-      sourceId: config.mdcngSourceId,
-      taskId: record.taskId,
-      sourceFingerprint: record.fingerprint,
-    );
-    if (previous != null) {
-      return _MdcngActorBatchPlan(record: record, status: 'already_imported');
     }
     final linked = _libraryDatabase.findActorByMdcngSource(
       sourceId: config.mdcngSourceId,
       embyId: record.embyId,
     );
-    if (linked == null) {
-      final similar = _libraryDatabase.findSimilarActors(
-        stageName: record.profile!.name,
-        aliases: [record.sourceName, ...record.profile!.aliases],
-        candidates: actorCandidates,
-      );
-      if (similar.isNotEmpty) {
-        return _MdcngActorBatchPlan(
-          record: record,
-          status: 'needs_target_resolution',
-        );
-      }
+    final matches = linked == null ? _mdcngExactActors(record) : <NasActor>[];
+    if (matches.length > 1 || (matches.length == 1 &&
+        _libraryDatabase.actorHasOtherMdcngIdentity(matches.single.id, config.mdcngSourceId, record.embyId))) {
+      return _MdcngActorBatchPlan(record: record, status: 'needs_target_resolution');
     }
-    final fields = _mdcngActorFieldDiffs(record, linked)
+    final target = linked ?? matches.firstOrNull;
+    if (target?.archivedAt != null) {
+      return _MdcngActorBatchPlan(
+          record: record, status: 'needs_target_resolution');
+    }
+    final fields = _mdcngActorFieldDiffs(record, target)
         .where(
             (diff) => diff['isAvailable'] == true && diff['status'] == 'fill')
         .map((diff) => diff['key'] as String)
         .toSet();
-    if (fields.isEmpty) {
+    if (fields.isEmpty && linked != null) {
+      final imported = target != null &&
+          _libraryDatabase.findMdcngActorImport(
+                sourceId: config.mdcngSourceId,
+                taskId: record.taskId,
+                sourceFingerprint: record.fingerprint,
+              ) !=
+              null;
       return _MdcngActorBatchPlan(
         record: record,
-        status: 'no_safe_changes',
-        target: linked,
+        status: imported ? 'already_imported' : 'no_safe_changes',
+        target: target,
       );
     }
     return _MdcngActorBatchPlan(
       record: record,
-      status: linked == null ? 'eligible_create' : 'eligible_update',
-      target: linked,
+      status: target == null ? 'eligible_create' : 'eligible_update',
       fields: fields,
+      target: target,
     );
   }
 
@@ -5622,6 +5665,14 @@ class NasHealthServer {
             },
           )
           .toList(growable: false);
+
+  /// 姓名和别名只用于首次唯一匹配，已有来源绑定始终优先。
+  List<NasActor> _mdcngExactActors(NasMdcngActorSourceRecord record) =>
+      _libraryDatabase.findActorsByExactNames([
+        record.sourceName,
+        if (record.profile != null) record.profile!.name,
+        ...?record.profile?.aliases,
+      ], includeArchived: true);
 
   Future<void> _previewMdcngActorImport(HttpRequest request) async {
     final body = await _readJsonBody(request);
@@ -5659,10 +5710,6 @@ class NasHealthServer {
     )) {
       return _error(request, HttpStatus.conflict, 'mdcng_actor_deferred');
     }
-    final linked = _libraryDatabase.findActorByMdcngSource(
-      sourceId: config.mdcngSourceId,
-      embyId: record.embyId,
-    );
     final selectedTarget = targetActorId == null
         ? null
         : _libraryDatabase.findActor(targetActorId);
@@ -5670,18 +5717,26 @@ class NasHealthServer {
         (selectedTarget == null || selectedTarget.archivedAt != null)) {
       return _error(request, HttpStatus.notFound, 'resource_not_found');
     }
-    if (linked != null &&
-        selectedTarget != null &&
-        selectedTarget.id != linked.id) {
-      return _error(request, HttpStatus.badRequest, 'invalid_request');
+    final linked = _libraryDatabase.findActorByMdcngSource(
+      sourceId: config.mdcngSourceId,
+      embyId: record.embyId,
+    );
+    if (linked?.archivedAt != null ||
+        (linked != null &&
+            selectedTarget != null &&
+            selectedTarget.id != linked.id)) {
+      return _error(request, HttpStatus.conflict,
+          'mdcng_actor_target_resolution_required');
     }
-    final comparisonActor = selectedTarget ?? linked;
-    final similar = linked == null
-        ? _libraryDatabase.findSimilarActors(
-            stageName: record.profile?.name,
-            aliases: [record.sourceName, ...?record.profile?.aliases],
-          )
-        : const <NasActor>[];
+    final matches = linked == null ? _mdcngExactActors(record) : <NasActor>[];
+    final automaticTarget = matches.length == 1 && matches.single.archivedAt == null &&
+        !_libraryDatabase.actorHasOtherMdcngIdentity(matches.single.id, config.mdcngSourceId, record.embyId)
+        ? matches.single : null;
+    final comparisonActor = selectedTarget ?? linked ?? automaticTarget;
+    if (comparisonActor == null && matches.isNotEmpty &&
+        matches.every((actor) => actor.archivedAt != null)) {
+      return _error(request, HttpStatus.conflict, 'mdcng_actor_target_resolution_required');
+    }
     await _writeJson(request.response, HttpStatus.ok, {
       'data': {
         'schemaVersion': 1,
@@ -5698,14 +5753,13 @@ class NasHealthServer {
         'profileResolution': record.profileResolution,
         'candidates': _mdcngActorCandidatePayloads(record),
         'proposed': _mdcngActorProposedPayload(record),
-        'current': linked == null ? null : _actorPayload(linked),
+        'current': linked != null ? _actorPayload(linked)
+            : selectedTarget == null && automaticTarget != null ? _actorPayload(automaticTarget) : null,
         'comparisonActorId': comparisonActor?.id,
-        'similarActors': similar.map(_actorPayload).toList(growable: false),
-        'recommendedAction': linked != null
-            ? 'update'
-            : similar.isEmpty
-                ? 'create'
-                : 'resolve',
+        'similarActors': matches.where((actor) => actor.archivedAt == null)
+            .map(_actorPayload).toList(growable: false),
+        'recommendedAction': comparisonActor != null ? 'update'
+            : matches.isEmpty ? 'create' : 'resolve',
         'fieldDiffs': _mdcngActorFieldDiffs(record, comparisonActor),
       },
     });
@@ -5759,9 +5813,9 @@ class NasHealthServer {
   ) {
     final profile = record.profile;
     return {
-      'stageName': profile == null ? null : record.sourceName,
+      'stageName': record.sourceName,
       'originalName': profile?.name,
-      'translatedName': profile == null ? null : record.sourceName,
+      'translatedName': record.sourceName,
       'aliases': profile?.aliases ?? const <String>[],
       'gender': profile == null ? null : 'female',
       'romanizedName': profile?.roma,
@@ -5792,9 +5846,9 @@ class NasHealthServer {
     NasActor? current,
   ) {
     final proposed = <String, Object?>{
-      'stageName': record.profile == null ? null : record.sourceName,
+      'stageName': record.sourceName,
       'originalName': record.profile?.name,
-      'translatedName': record.profile == null ? null : record.sourceName,
+      'translatedName': record.sourceName,
       'aliases': record.profile?.aliases,
       'gender': record.profile == null ? null : 'female',
       'romanizedName': record.profile?.roma,
@@ -5902,8 +5956,7 @@ class NasHealthServer {
     return value;
   }
 
-  /// Re-reads the MDCNG source before writing.  A stale preview, ambiguous
-  /// source profile, or accidental similar-name merge is always rejected.
+  /// Re-reads the MDCNG source before writing and reuses a linked actor.
   Future<void> _applyMdcngActorImport(HttpRequest request) async {
     final body = await _readJsonBody(request);
     final taskId = body?['taskId'];
@@ -5991,38 +6044,45 @@ class NasHealthServer {
     if (record.fingerprint != fingerprint) {
       return _error(request, HttpStatus.conflict, 'mdcng_actor_preview_stale');
     }
-    if (record.profile == null || record.profileResolution != 'matched') {
+    if (record.profileResolution != 'matched' &&
+        record.profileResolution != 'raw') {
       return _error(
         request,
         HttpStatus.conflict,
         'mdcng_actor_profile_resolution_required',
       );
     }
-    final profile = record.profile!;
-    final sourceActor = _libraryDatabase.findActorByMdcngSource(
+    final profile = record.profile;
+    final linked = _libraryDatabase.findActorByMdcngSource(
       sourceId: config.mdcngSourceId,
       embyId: record.embyId,
     );
-    NasActor? target;
-    if (sourceActor != null) {
-      if (createNew ||
-          (targetActorId != null && targetActorId != sourceActor.id)) {
-        return _error(request, HttpStatus.badRequest, 'invalid_request');
-      }
-      target = sourceActor;
-    } else if (targetActorId != null) {
-      if (createNew)
-        return _error(request, HttpStatus.badRequest, 'invalid_request');
+    if (linked?.archivedAt != null ||
+        (linked != null &&
+            targetActorId != null &&
+            targetActorId != linked.id)) {
+      return _error(request, HttpStatus.conflict,
+          'mdcng_actor_target_resolution_required');
+    }
+    NasActor? target = linked;
+    if (target == null && !createNew && targetActorId != null) {
       target = _libraryDatabase.findActor(targetActorId);
       if (target == null || target.archivedAt != null) {
         return _error(request, HttpStatus.notFound, 'resource_not_found');
       }
-    } else if (!createNew) {
-      return _error(
-        request,
-        HttpStatus.conflict,
-        'mdcng_actor_target_resolution_required',
-      );
+    }
+    if (target == null) {
+      final matches = _mdcngExactActors(record);
+      if (matches.isNotEmpty && matches.every((actor) => actor.archivedAt != null)) {
+        return _error(request, HttpStatus.conflict, 'mdcng_actor_target_resolution_required');
+      }
+      if (matches.length == 1 && matches.single.archivedAt == null &&
+          !_libraryDatabase.actorHasOtherMdcngIdentity(matches.single.id, config.mdcngSourceId, record.embyId)) {
+        target = matches.single;
+      } else if (matches.isNotEmpty && !createNew) {
+        return _error(request, HttpStatus.conflict,
+            'mdcng_actor_target_resolution_required');
+      }
     }
     if (target == null && !fields.contains('stageName')) {
       return _error(
@@ -6032,23 +6092,6 @@ class NasHealthServer {
     if (unavailable.isNotEmpty) {
       return _error(
           request, HttpStatus.badRequest, 'invalid_mdcng_actor_selection');
-    }
-
-    final previousImport = _libraryDatabase.findMdcngActorImport(
-      sourceId: config.mdcngSourceId,
-      taskId: record.taskId,
-      sourceFingerprint: record.fingerprint,
-    );
-    if (previousImport != null) {
-      return _writeJson(request.response, HttpStatus.ok, {
-        'data': {
-          'status': 'no_changes',
-          'actor': _actorPayload(
-              _libraryDatabase.findActor(previousImport.actorId)!),
-          'appliedFields': const <String>[],
-          'skippedAlreadyImported': fieldKeys,
-        },
-      });
     }
 
     final proposed = _mdcngActorProposedValues(record);
@@ -6111,10 +6154,27 @@ class NasHealthServer {
         await _error(request, HttpStatus.conflict, 'mdcng_actor_deferred');
         return;
       }
+      final currentLink = _libraryDatabase.findActorByMdcngSource(
+        sourceId: config.mdcngSourceId,
+        embyId: record.embyId,
+      );
+      final latestTarget = target == null ? null : _libraryDatabase.findActor(target.id);
+      final targetChanged = target != null && (latestTarget == null ||
+          latestTarget.archivedAt != null ||
+          fields.any((field) => !_mdcngActorValuesEqual(field,
+              _mdcngActorCurrentValue(target!, field),
+              _mdcngActorCurrentValue(latestTarget, field))));
+      if (currentLink?.id != linked?.id || targetChanged ||
+          (target == null && !createNew && _mdcngExactActors(record).isNotEmpty)) {
+        await _deleteManagedAsset(newPhoto);
+        await _deleteManagedAsset(newBackdrop);
+        await _error(request, HttpStatus.conflict, 'mdcng_actor_preview_stale');
+        return;
+      }
       final aliases = fields.contains('aliases')
           ? [
               ...?target?.aliases,
-              ...profile.aliases,
+              ...?profile?.aliases,
             ]
               .map((value) => value.trim())
               .where((value) => value.isNotEmpty)
@@ -6131,7 +6191,7 @@ class NasHealthServer {
       if (target == null) {
         actor = _libraryDatabase.createActor(
           profileIdentity:
-              'mdcng:${config.mdcngSourceId}:emby:${record.embyId}',
+              'mdcng:${config.mdcngSourceId}:task:${record.taskId}:${newUuidV4()}',
           stageName: values['stage_name'] as String?,
           originalName: values['original_name'] as String?,
           translatedName: values['translated_name'] as String?,
@@ -6162,7 +6222,7 @@ class NasHealthServer {
         embyId: record.embyId,
         actorId: actor.id,
         sourceName: record.sourceName,
-        profileKey: profile.key,
+        profileKey: profile?.key ?? '',
       );
       final audit = _libraryDatabase.addMdcngActorImport(
         actorId: actor.id,
@@ -6178,7 +6238,7 @@ class NasHealthServer {
       await _writeJson(request.response, HttpStatus.ok, {
         'data': {
           'status': 'applied',
-          'actor': _actorPayload(actor),
+          'actor': _actorPayload(_libraryDatabase.findActor(actor.id)!),
           'appliedFields': fieldKeys,
           'importRecord': {
             'id': audit.id,
@@ -6203,30 +6263,20 @@ class NasHealthServer {
     }
   }
 
-  /// Batch writes only values that are currently blank.  It intentionally does
-  /// not accept a target actor or overwrite list, so a bulk operation can
-  /// never merge similar actors or replace manually maintained data.
+  /// Batch creates new source records and fills blank fields on linked actors.
   Future<String> _applyMdcngActorBatchPlan(
     _MdcngActorBatchPlan plan,
   ) async {
     final record = plan.record;
     final profile = record.profile;
     final target = plan.target;
-    if (profile == null || !plan.isEligible || plan.fields.isEmpty) {
+    if (!plan.isEligible) {
       return 'skipped';
     }
     if (_libraryDatabase.isMdcngActorDeferred(
       sourceId: config.mdcngSourceId,
       embyId: record.embyId,
     )) {
-      return 'skipped';
-    }
-    if (_libraryDatabase.findMdcngActorImport(
-          sourceId: config.mdcngSourceId,
-          taskId: record.taskId,
-          sourceFingerprint: record.fingerprint,
-        ) !=
-        null) {
       return 'skipped';
     }
     NasManagedAsset? newPhoto;
@@ -6249,10 +6299,16 @@ class NasHealthServer {
       )) {
         return 'skipped';
       }
+      final currentPlan = _planMdcngActorBatchImport(record);
+      if (!currentPlan.isEligible ||
+          currentPlan.target?.id != target?.id ||
+          !currentPlan.fields.containsAll(plan.fields)) {
+        return 'skipped';
+      }
       final aliases = plan.fields.contains('aliases')
           ? [
               ...?target?.aliases,
-              ...profile.aliases,
+              ...?profile?.aliases,
             ]
               .map((value) => value.trim())
               .where((value) => value.isNotEmpty)
@@ -6269,7 +6325,7 @@ class NasHealthServer {
       if (target == null) {
         actor = _libraryDatabase.createActor(
           profileIdentity:
-              'mdcng:${config.mdcngSourceId}:emby:${record.embyId}',
+              'mdcng:${config.mdcngSourceId}:task:${record.taskId}:${newUuidV4()}',
           stageName: values['stage_name'] as String?,
           originalName: values['original_name'] as String?,
           translatedName: values['translated_name'] as String?,
@@ -6300,7 +6356,8 @@ class NasHealthServer {
         embyId: record.embyId,
         actorId: actor.id,
         sourceName: record.sourceName,
-        profileKey: profile.key,
+        profileKey: profile?.key ?? '',
+        reconcileMovies: false,
       );
       _libraryDatabase.addMdcngActorImport(
         actorId: actor.id,
@@ -6341,23 +6398,23 @@ class NasHealthServer {
   Map<String, Object?> _mdcngActorProposedValues(
     NasMdcngActorSourceRecord record,
   ) {
-    final profile = record.profile!;
+    final profile = record.profile;
     return {
       // Emby's task name is the Chinese name familiar to the local library;
       // Actress.db provides the native-language debut name and its romanization.
       'stageName': record.sourceName,
-      'originalName': profile.name,
+      'originalName': profile?.name,
       'translatedName': record.sourceName,
-      'aliases': profile.aliases,
-      'gender': 'female',
-      'romanizedName': profile.roma,
-      'birthDate': profile.birthday,
-      'birthMonth': profile.birthMonth,
-      'heightCm': profile.heightCm,
-      'measurements': profile.measurements,
-      'country': profile.country,
-      'debutMonth': profile.debutMonth,
-      'debutDescription': profile.debutWork,
+      'aliases': profile?.aliases ?? const <String>[],
+      'gender': profile == null ? null : 'female',
+      'romanizedName': profile?.roma,
+      'birthDate': profile?.birthday,
+      'birthMonth': profile?.birthMonth,
+      'heightCm': profile?.heightCm,
+      'measurements': profile?.measurements,
+      'country': profile?.country,
+      'debutMonth': profile?.debutMonth,
+      'debutDescription': profile?.debutWork,
       'photo': record.photo?.fileName,
       'backdrop': record.backdrop?.fileName,
     };
@@ -6767,9 +6824,19 @@ class NasHealthServer {
               mediaRootId: job.mediaRootId,
               mediaService: _mediaService,
             );
+      for (final removed in result.removedMovieIndexes) {
+        if (removed.posterFileName != null) {
+          await _artworkService.deletePoster(removed.posterFileName!);
+        }
+        for (final fileName in removed.carouselFileNames) {
+          await _artworkService.deleteCarouselImage(fileName);
+        }
+      }
       job.status = 'succeeded';
       job.scannedFiles = result.scannedFiles;
       job.availableEpisodes = result.availableEpisodes;
+      job.removedEpisodes = result.removedEpisodes;
+      job.removedMovies = result.removedMovieIndexes.length;
       job.conflicts = result.conflicts;
       _logger.event('scan.end', fields: {
         'component': 'nas.scan',
@@ -6817,6 +6884,7 @@ class NasHealthServer {
   Map<String, Object?> _categoryPayload(NasLibraryCategory category) => {
         'id': category.id,
         'name': category.name,
+        'movieCount': category.movieCount,
         'color': category.color,
         // 旧字段保留首个来源，正式客户端应使用 sources。
         'directoryKey': category.mediaSources.isEmpty
@@ -6997,21 +7065,29 @@ class NasHealthServer {
     List<NasCategoryMediaSourceInput> sources, {
     String? excludingCategoryId,
   }) async {
+    // /media 下的 disk1 和 /media/disk1 下的子目录虽根 ID 不同，仍可能重叠。
+    final roots = {
+      for (final root in _libraryDatabase.listMediaRoots()) root.id: root,
+    };
+    String? sourcePath(String rootId, String relativePath) {
+      final root = roots[rootId];
+      if (root == null) return null;
+      final rootPath = root.containerPath.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), '');
+      return '$rootPath/$relativePath';
+    }
+    bool overlaps(String left, String right) => left == right ||
+        left.startsWith('$right/') || right.startsWith('$left/');
+    final paths = <String>[];
     for (final source in sources) {
-      if (_libraryDatabase.findMediaRoot(source.mediaRootId) == null)
-        return false;
+      final path = sourcePath(source.mediaRootId, source.relativePath);
+      if (path == null || paths.any((other) => overlaps(path, other))) return false;
+      paths.add(path);
     }
     for (final category in _libraryDatabase.listCategories()) {
       if (category.id == excludingCategoryId) continue;
       for (final other in category.mediaSources) {
-        for (final source in sources) {
-          if (source.mediaRootId != other.mediaRootId) continue;
-          if (source.relativePath == other.relativePath ||
-              source.relativePath.startsWith('${other.relativePath}/') ||
-              other.relativePath.startsWith('${source.relativePath}/')) {
-            return false;
-          }
-        }
+        final otherPath = sourcePath(other.mediaRootId, other.relativePath);
+        if (otherPath == null || paths.any((path) => overlaps(path, otherPath))) return false;
       }
     }
     return true;
@@ -7037,6 +7113,8 @@ class NasHealthServer {
         'status': job.status,
         'scannedFiles': job.scannedFiles,
         'availableEpisodes': job.availableEpisodes,
+        'removedEpisodes': job.removedEpisodes,
+        'removedMovies': job.removedMovies,
         'conflicts': job.conflicts,
         'createdAt': job.createdAt.toIso8601String(),
         'startedAt': job.startedAt?.toIso8601String(),
@@ -7880,6 +7958,49 @@ class NasHealthServer {
     return session?.tokenHash == tokenHash ? session : null;
   }
 
+  Future<void> _scrapingRequest(HttpRequest request) async {
+    final service=_scraper;
+    if(service==null)return _error(request,HttpStatus.serviceUnavailable,'scraping_unavailable');
+    final path=request.uri.pathSegments.skip(4).toList();
+    final offset=int.tryParse(request.uri.queryParameters['offset']??'0')??-1;
+    if(offset<0||offset>1000000)return _error(request,HttpStatus.badRequest,'invalid_request');
+    try {
+      Object? result;
+      var status=HttpStatus.ok;
+      if(request.method=='GET'&&path.isEmpty){
+        result=service.snapshot(offset:offset);
+      }else if(request.method=='POST'&&path.length==1&&path.first=='jobs'){
+        final body=await _readJsonBody(request);
+        if(body==null)throw ArgumentError('请求无效');
+        result=service.create(body);status=HttpStatus.accepted;
+      }else if(request.method=='GET'&&path.length==2&&path.first=='jobs'){
+        result=_libraryDatabase.scrapeJob(path[1],offset:offset);
+        if(result==null)return await _error(request,HttpStatus.notFound,'resource_not_found');
+      }else if(request.method=='POST'&&path.length==3&&path.first=='jobs'){
+        await service.control(path[1],path[2]);result={'ok':true};
+      }else if(request.method=='POST'&&path.length==1&&path.first=='settings'){
+        service.configure(await _readJsonBody(request)??{});result=_libraryDatabase.scrapeSettings;
+      }else if(request.method=='POST'&&path.length==1&&path.first=='resume-source'){
+        await service.resumeSource();result={'ok':true};
+      }else if(request.method=='POST'&&path.length==3&&path.first=='tasks'&&path.last=='resolve'){
+        final body=await _readJsonBody(request),fields=body?['fields'];
+        if(fields is! List||fields.any((v)=>v is! String))throw ArgumentError('审核字段无效');
+        final mappings = body?['actorMappings'] ?? const <String, String>{};
+        if (mappings is! Map || mappings.length > 1000 ||
+            mappings.entries.any((entry) => entry.key is! String || entry.value is! String)) {
+          throw ArgumentError('演员身份选择无效');
+        }
+        result=await service.resolve(path[1],List<String>.from(fields),
+            actorMappings: Map<String, String>.from(mappings));
+      }else{return await _error(request,HttpStatus.notFound,'resource_not_found');}
+      await _writeJson(request.response,status,{'data':result});
+    }on ArgumentError catch(error){
+      await _writeJson(request.response,HttpStatus.badRequest,{'error':{'code':'invalid_request','message':error.message.toString()}});
+    }on NasScrapeException catch(error){
+      await _writeJson(request.response,HttpStatus.serviceUnavailable,{'error':{'code':'scraping_${error.code}','message':error.message}});
+    }
+  }
+
   Future<Map<String, dynamic>?> _readJsonBody(HttpRequest request) async {
     try {
       final value = jsonDecode(await utf8.decoder.bind(request).join());
@@ -8041,14 +8162,14 @@ class _MdcngActorBatchPlan {
   const _MdcngActorBatchPlan({
     required this.record,
     required this.status,
-    this.target,
     this.fields = const {},
+    this.target,
   });
 
   final NasMdcngActorSourceRecord record;
   final String status;
-  final NasActor? target;
   final Set<String> fields;
+  final NasActor? target;
 
   bool get isEligible =>
       status == 'eligible_create' || status == 'eligible_update';
@@ -8157,6 +8278,8 @@ class _ScanJob {
   String status = 'queued';
   int? scannedFiles;
   int? availableEpisodes;
+  int? removedEpisodes;
+  int? removedMovies;
   List<String> conflicts = const [];
   DateTime? startedAt;
   DateTime? finishedAt;

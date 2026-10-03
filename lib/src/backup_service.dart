@@ -127,9 +127,9 @@ class NasBackupService {
       );
       await _copyDirectoryIfExists(
         Directory(
-            '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}posters'),
+            '$dataDir${Platform.pathSeparator}artwork'),
         Directory(
-            '${temporary.path}${Platform.pathSeparator}artwork${Platform.pathSeparator}posters'),
+            '${temporary.path}${Platform.pathSeparator}artwork'),
         backgroundRead: backgroundRead,
       );
       final record = NasBackupRecord(

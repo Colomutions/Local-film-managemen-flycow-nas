@@ -21,6 +21,22 @@ Future<void> main() async {
         .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
     await File('${photos.path}${Platform.pathSeparator}涼森れな-big-old.jpg')
         .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    await File('${photos.path}${Platform.pathSeparator}涼森れむ子.jpg')
+        .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    await File('${photos.path}${Platform.pathSeparator}AI-Fix-凉森玲梦-old.jpg')
+        .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    await File(
+            '${photos.path}${Platform.pathSeparator}AI-Fix-Abigaile Johnson.jpg')
+        .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    await File('${photos.path}${Platform.pathSeparator}柏木こなつ.jpg')
+        .writeAsBytes(const [0xff, 0xd8, 0xff, 0xd9]);
+    final mappingFile =
+        File('${data.path}${Platform.pathSeparator}mapping_actor.xml');
+    await mappingFile.writeAsString('''
+<actor>
+  <a zh_cn="凉森玲梦" zh_tw="涼森玲夢" jp="涼森れむ" keyword=",凉森玲梦,涼森れむ,"/>
+</actor>
+''');
     final profiles = sqlite3.open(
       '${data.path}${Platform.pathSeparator}Actress.db',
     );
@@ -36,8 +52,12 @@ Future<void> main() async {
     final source = NasMdcngActorSource(data.path);
     final records = await source.readCompletedActors();
     _expect(records.length == 1, 'only completed actor tasks are returned');
-    _expect(records.single.profileResolution == 'unresolved',
-        'does not auto-match translated and native spellings');
+    _expect(records.single.profileResolution == 'raw',
+        'imports translated task names without requiring a profile match');
+    _expect(records.single.profile == null,
+        'keeps optional Actress.db fields empty without a match');
+    _expect(records.single.photo?.fileName == 'AI-Fix-凉森玲梦-old.jpg',
+        'finds AI-repaired images by the raw MDCNG task name');
     final candidate = records.single.candidates
         .where((candidate) => candidate.name == '涼森れむ')
         .single;
@@ -76,12 +96,25 @@ Future<void> main() async {
         record.profile?.measurements == 'B87 / W58 / H85', 'maps measurements');
     _expect(record.profile?.debutMonth == '2019-03', 'derives debut month');
     _expect(record.photo?.fileName == '涼森れむ-old.jpg', 'finds portrait image');
+    _expect(!record.images.any((image) => image.fileName == '涼森れむ子.jpg'),
+        'does not assign a longer actor name as this actor portrait');
     _expect(
       record.backdrop?.fileName == '涼森れむ-big-old.jpg',
       'finds backdrop image',
     );
     _expect(record.fingerprint.length == 64,
         'returns a stable preview fingerprint');
+    final otherCandidate = records.single.candidates
+        .where((candidate) => candidate.name == '涼森れな')
+        .single;
+    final manuallyChanged = (await source.readCompletedActors(
+      selectedProfileKeys: {'1': otherCandidate.key},
+    ))
+        .single;
+    _expect(manuallyChanged.photo == null,
+        'manual choice of another profile does not borrow task portrait');
+    _expect(manuallyChanged.backdrop?.fileName == '涼森れな-big-old.jpg',
+        'manual choice still uses its own image');
     await File('${photos.path}${Platform.pathSeparator}涼森れむ-old.jpg')
         .writeAsBytes(const [0], mode: FileMode.append);
     final cached = await source.readCompletedActors(
@@ -96,12 +129,74 @@ Future<void> main() async {
     _expect(refreshed.single.fingerprint != record.fingerprint,
         'apply refreshes the source fingerprint after an image changes');
 
+    await File('${photos.path}${Platform.pathSeparator}AI-Fix-凉森玲梦-old.jpg')
+        .delete();
+    final mapped =
+        (await source.readCompletedActors(forceRefresh: true)).single;
+    _expect(mapped.profileResolution == 'raw',
+        'image mapping does not force a profile choice');
+    _expect(mapped.photo?.fileName == '涼森れむ-old.jpg',
+        'MDCNG name mapping finds the Japanese-named portrait');
+    await mappingFile.writeAsString('''
+<actor>
+  <a zh_cn="凉森玲梦" jp="涼森れむ" keyword=",凉森玲梦,"/>
+  <a zh_cn="凉森玲梦" jp="别的演员" keyword=",凉森玲梦,"/>
+</actor>
+''');
+    final ambiguous =
+        (await source.readCompletedActors(forceRefresh: true)).single;
+    _expect(ambiguous.photo == null,
+        'ambiguous source name cannot borrow another actor portrait');
+
+    final tasksWithEnglishName = sqlite3.open(
+      '${data.path}${Platform.pathSeparator}mdc_ng.db',
+    );
+    try {
+      tasksWithEnglishName.execute('''
+        INSERT INTO actress_task(id, name, status, stage, emby_id, has_pic)
+        VALUES (2002, 'Abigaile Johnson', 2, 1000, 'english-actor', 1)
+      ''');
+    } finally {
+      tasksWithEnglishName.dispose();
+    }
+    final englishName = (await source.readCompletedActors(forceRefresh: true))
+        .where((item) => item.taskId == '2002')
+        .single;
+    _expect(englishName.photo?.fileName == 'AI-Fix-Abigaile Johnson.jpg',
+        'a name containing big is still classified as a portrait');
+    _expect(englishName.backdrop == null,
+        'an English name does not create a false backdrop');
+
+    await mappingFile.writeAsString('''
+<actor>
+  <a zh_cn="柏木小夏" jp="柏木こなつ" keyword=",柏木小夏,柏木こなつ,"/>
+  <a zh_cn="柏木こなつ" jp="柏木こなつ" keyword=",柏木こなつ,"/>
+</actor>
+''');
+    final taskWithSharedCanonicalName = sqlite3.open(
+      '${data.path}${Platform.pathSeparator}mdc_ng.db',
+    );
+    try {
+      taskWithSharedCanonicalName.execute('''
+        INSERT INTO actress_task(id, name, status, stage, emby_id, has_pic)
+        VALUES (2003, '柏木小夏', 2, 1000, 'canonical-actor', 1)
+      ''');
+    } finally {
+      taskWithSharedCanonicalName.dispose();
+    }
+    final sharedCanonical =
+        (await source.readCompletedActors(forceRefresh: true))
+            .where((item) => item.taskId == '2003')
+            .single;
+    _expect(sharedCanonical.photo?.fileName == '柏木こなつ.jpg',
+        'reuses a shared canonical Japanese name without sharing aliases');
+
     _addManyActors(data.path, 1000);
     final largeRead = Stopwatch()..start();
     final manyRecords = await source.readCompletedActors(forceRefresh: true);
     largeRead.stop();
     _expect(
-        manyRecords.length == 1001, 'reads over a thousand completed actors');
+        manyRecords.length == 1003, 'reads over a thousand completed actors');
     _expect(
         manyRecords
                 .where((item) => item.taskId == '500')
@@ -110,8 +205,26 @@ Future<void> main() async {
                 ?.name ==
             '测试演员500',
         'resolves a profile in the large indexed source');
+    final tasks = sqlite3.open(
+      '${data.path}${Platform.pathSeparator}mdc_ng.db',
+    );
+    try {
+      tasks.execute(
+        'UPDATE actress_task SET overview = ? WHERE id = 1',
+        ['Twitter: https://example.invalid/social'],
+      );
+    } finally {
+      tasks.dispose();
+    }
+    final linkedByUrl = (await source.readCompletedActors(forceRefresh: true))
+        .where((item) => item.taskId == '1')
+        .single;
+    _expect(linkedByUrl.profile?.name == '涼森れむ',
+        'a unique external profile URL links a translated task name');
+    _expect(linkedByUrl.photo?.fileName == '涼森れむ-old.jpg',
+        'a linked profile contributes its native-name portrait');
     stdout.writeln(
-        '1001 actor source records: ${largeRead.elapsedMilliseconds} ms');
+        '1003 actor source records: ${largeRead.elapsedMilliseconds} ms');
   } finally {
     await directory.delete(recursive: true);
   }
@@ -131,6 +244,7 @@ void _createTaskDatabase(String path) {
         year INTEGER,
         has_pic INTEGER NOT NULL DEFAULT 0,
         has_backdrop INTEGER NOT NULL DEFAULT 0,
+        overview TEXT,
         end_at TEXT
       );
       INSERT INTO actress_task(

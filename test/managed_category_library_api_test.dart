@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -27,7 +28,8 @@ Future<void> main() async {
     mediaDir: mediaRoot.path,
     timezone: 'Asia/Shanghai',
   );
-  final server = NasHealthServer(config);
+  final database = _ControlledScanDatabase(config.dataDir);
+  final server = NasHealthServer(config, libraryDatabase: database);
 
   try {
     await server.start();
@@ -205,6 +207,28 @@ Future<void> main() async {
     _expect(resume['episodeId'] == episode['id'], '详情返回最后续播的分集');
     _expect(resume['positionMs'] == 4, '详情返回最后续播的位置');
 
+    await Directory('${mediaRoot.path}${Platform.pathSeparator}disk1${Platform.pathSeparator}并发目录')
+        .create(recursive: true);
+    database.gate = Completer<void>();
+    database.started = Completer<void>();
+    final running = await _request(base, 'POST', '/api/v1/admin/scan-jobs',
+        token: adminToken, body: {'categoryId': category['id']});
+    await database.started!.future.timeout(const Duration(seconds: 5));
+    final blockedRebind = await _request(base, 'PATCH', '/api/v1/admin/categories/${category['id']}',
+        token: adminToken, body: {'name': '测试分类', 'directoryKey': 'disk1/并发目录'});
+    _expect(blockedRebind.statusCode == HttpStatus.conflict &&
+        blockedRebind.json['error']['code'] == 'scan_running', '扫描期间不能替换来源绑定');
+    _expect(database.findCategory(category['id'] as String)!.mediaSources.single.relativePath == '原目录',
+        '拒绝改绑时原分类范围保持不变');
+    final blockedDelete = await _request(base, 'DELETE', '/api/v1/admin/categories/${category['id']}',
+        token: adminToken);
+    _expect(blockedDelete.statusCode == HttpStatus.conflict &&
+        blockedDelete.json['error']['code'] == 'scan_running', '扫描期间不能删除分类');
+    database.gate!.complete();
+    await _waitForFinishedJob(base, running.json['data']['id'] as String, adminToken);
+    database.gate = null;
+    database.started = null;
+
     await originalVideo.parent.delete(recursive: true);
     final replacementVideo = File(
       '${mediaRoot.path}${Platform.pathSeparator}disk1${Platform.pathSeparator}新目录${Platform.pathSeparator}new.mp4',
@@ -229,10 +253,12 @@ Future<void> main() async {
     );
     _expect(reboundFinished['status'] == 'succeeded', '新目录扫描成功');
     _expect(reboundFinished['availableEpisodes'] == 1, '新目录视频已建立索引');
+    _expect(reboundFinished['removedEpisodes'] == 1 && reboundFinished['removedMovies'] == 1,
+        '重绑后扫描报告移除旧来源索引');
     await _expectMovieTitles(
       base,
       viewerToken,
-      const ['new', 'old', '同类目标影集', '异类目标影集'],
+      const ['new', '同类目标影集', '异类目标影集'],
     );
 
     final refreshedMovies = await _request(
@@ -531,4 +557,27 @@ class _ByteResponse {
 
 void _expect(bool condition, String message) {
   if (!condition) throw StateError('断言失败：$message');
+}
+
+class _ControlledScanDatabase extends NasLibraryDatabase {
+  _ControlledScanDatabase(super.dataDir);
+  Completer<void>? gate;
+  Completer<void>? started;
+
+  @override
+  Future<NasScanResult> scanCategory({
+    required String categoryId,
+    Future<void> Function()? beforeFile,
+    required String mediaRootId,
+    required NasMediaService mediaService,
+    NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
+  }) async {
+    final pending = gate;
+    if (pending != null) {
+      started?.complete();
+      await pending.future;
+    }
+    return super.scanCategory(categoryId: categoryId, beforeFile: beforeFile,
+        mediaRootId: mediaRootId, mediaService: mediaService, metadataProbe: metadataProbe);
+  }
 }

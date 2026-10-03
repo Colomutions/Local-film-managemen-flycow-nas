@@ -41,9 +41,18 @@ Future<void> main() async {
     mdcngDataDir: mdcngData.path,
     mdcngSourceId: 'test-emby',
   );
-  final server = NasHealthServer(config);
+  final library = NasLibraryDatabase(config.dataDir);
+  final server = NasHealthServer(config, libraryDatabase: library);
   try {
     await server.start();
+    await File('${media.path}/ABC-001.mp4').writeAsBytes([0, 1, 2]);
+    await library.scanConfiguredRoot(
+        rootName: '测试盘', containerPath: media.path,
+        mediaService: NasMediaService(mediaDir: media.path, fixtureRelativePath: null),
+        metadataProbe: NasMediaMetadataProbe(runner: (command, args) async =>
+            ProcessResult(1, 0, '{"streams":[],"format":{}}', '')));
+    final movieId = library.listMovies().single.id;
+    library.saveScrapeMovieProfile(movieId, {'actors': [{'name': '凉森玲梦'}]});
     final base = Uri.parse('http://127.0.0.1:${server.port}');
     final info = await _request(base, 'GET', '/api/v1/server-info');
     final serverId =
@@ -76,6 +85,8 @@ Future<void> main() async {
     final item = listedItems.where((item) => item['taskId'] == '1').single;
     _expect(item['profileName'] == null,
         'translated task does not auto-resolve an actress profile');
+    _expect(item['sourceHasPhoto'] == true && item['hasPhoto'] == false,
+        'separates MDCNG photo flags from locally matched image files');
     final candidate = ((item['candidates'] as List<dynamic>)
         .cast<Map<String, dynamic>>()
         .where((candidate) => candidate['name'] == '涼森れむ')).single;
@@ -144,8 +155,8 @@ Future<void> main() async {
     _expect((deferredData['summary'] as Map<String, dynamic>)['deferred'] == 1,
         'batch preview counts deferred actors');
     _expect(
-        (deferredData['summary'] as Map<String, dynamic>)['eligibleTotal'] == 0,
-        'deferred actors cannot enter the batch confirmation');
+        (deferredData['summary'] as Map<String, dynamic>)['eligibleTotal'] == 1,
+        'deferred actors stay out while other raw records remain eligible');
     final restored = await _request(
       base,
       'PUT',
@@ -155,6 +166,28 @@ Future<void> main() async {
     );
     _expect(restored.statusCode == HttpStatus.ok,
         'admin can restore an actor for later import');
+
+    final existingActor = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/actors',
+      token: admin,
+      body: {'stageName': '高橋しょう子'},
+    );
+    _expect(existingActor.statusCode == HttpStatus.created,
+        'creates an existing actor with the same MDCNG name');
+
+    final duplicate = library.createActor(stageName: '重名测试演员', aliases: ['高橋しょう子']);
+    final ambiguous = await _request(base, 'GET', '/api/v1/admin/mdcng-actor-imports/batch-preview', token: admin);
+    _expect(((ambiguous.json['data']['items'] as List).cast<Map>()
+        .singleWhere((row) => row['taskId'] == '2'))['status'] == 'needs_target_resolution',
+        'batch leaves ambiguous identities for explicit review');
+    final ambiguousPreview = await _request(base, 'POST', '/api/v1/admin/mdcng-actor-imports/preview',
+        token: admin, body: {'taskId': '2'});
+    _expect(ambiguousPreview.json['data']['current'] == null &&
+        (ambiguousPreview.json['data']['similarActors'] as List).length == 2,
+        'single preview exposes both candidates without choosing one');
+    library.deleteActor(duplicate.id);
 
     final batchPreview = await _request(
       base,
@@ -166,16 +199,16 @@ Future<void> main() async {
         'admin can preview safe batch actor imports');
     final batchData = batchPreview.json['data'] as Map<String, dynamic>;
     final batchSummary = batchData['summary'] as Map<String, dynamic>;
-    _expect(batchSummary['eligibleCreate'] == 1,
-        'only the direct profile match is batch-eligible');
-    _expect(batchSummary['needsProfileResolution'] == 1,
-        'translated name is kept for manual profile selection');
+    _expect(batchSummary['eligibleCreate'] == 1 && batchSummary['eligibleUpdate'] == 1,
+        'unique exact match enriches an existing actor instead of duplicating it');
+    _expect(batchSummary['needsProfileResolution'] == 0,
+        'a missing Actress.db match no longer blocks batch import');
     final batchItem = (batchData['items'] as List<dynamic>)
         .cast<Map<String, dynamic>>()
         .where((item) => item['taskId'] == '2')
         .single;
-    _expect(batchItem['status'] == 'eligible_create',
-        'unique source profile is eligible for a safe create');
+    _expect(batchItem['status'] == 'eligible_update',
+        'unique source profile reuses the existing actor');
 
     await _request(
       base,
@@ -225,8 +258,111 @@ Future<void> main() async {
     _expect(batchApplied.statusCode == HttpStatus.ok,
         'admin can apply the reviewed safe batch items');
     final batchResult = batchApplied.json['data'] as Map<String, dynamic>;
-    _expect(batchResult['created'] == 1 && batchResult['failed'] == 0,
-        'batch imports one directly resolved actress');
+    _expect(batchResult['updated'] == 1 && batchResult['created'] == 0 && batchResult['failed'] == 0,
+        'batch fills the existing actor without creating a duplicate');
+    final importedPreview = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/preview',
+      token: admin,
+      body: {'taskId': '2'},
+    );
+    final importedData = importedPreview.json['data'] as Map<String, dynamic>;
+    final batchActorId =
+        (importedData['current'] as Map<String, dynamic>)['id'] as String;
+    _expect(batchActorId == existingActor.json['data']['actor']['id'],
+        'cross-source import preserves the canonical actor ID');
+    _expect(importedData['recommendedAction'] == 'update',
+        'single preview finds the actor already bound to this source');
+    final secondBatchPreview = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/mdcng-actor-imports/batch-preview',
+      token: admin,
+    );
+    final secondBatchData =
+        secondBatchPreview.json['data'] as Map<String, dynamic>;
+    final importedBatchItem = (secondBatchData['items'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .where((item) => item['taskId'] == '2')
+        .single;
+    _expect(importedBatchItem['status'] == 'already_imported',
+        'second batch preview does not offer the same task as a new actor');
+    final repeatedBatch = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/batch-apply',
+      token: admin,
+      body: {
+        'items': [
+          {
+            'taskId': batchItem['taskId'],
+            'fingerprint': batchItem['fingerprint']
+          }
+        ]
+      },
+    );
+    final repeatedBatchResult =
+        repeatedBatch.json['data'] as Map<String, dynamic>;
+    _expect(
+        repeatedBatchResult['created'] == 0 &&
+            repeatedBatchResult['skipped'] == 1,
+        'reapplying a stale batch selection cannot duplicate a linked actor');
+    final editedBatchActor = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/actors/$batchActorId',
+      token: admin,
+      body: {'stageName': '自定义名字', 'romanizedName': null},
+    );
+    _expect(editedBatchActor.statusCode == HttpStatus.ok,
+        'sets up one missing field and a manually edited field');
+    final updateBatchPreview = await _request(
+      base,
+      'GET',
+      '/api/v1/admin/mdcng-actor-imports/batch-preview',
+      token: admin,
+    );
+    final updateBatchItem = ((updateBatchPreview.json['data']
+            as Map<String, dynamic>)['items'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .where((item) => item['taskId'] == '2')
+        .single;
+    _expect(
+        updateBatchItem['status'] == 'eligible_update' &&
+            updateBatchItem['fieldCount'] == 1,
+        'second preview offers only the missing field on the linked actor');
+    final batchUpdated = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/batch-apply',
+      token: admin,
+      body: {
+        'items': [
+          {
+            'taskId': updateBatchItem['taskId'],
+            'fingerprint': updateBatchItem['fingerprint']
+          }
+        ]
+      },
+    );
+    final updateResult = batchUpdated.json['data'] as Map<String, dynamic>;
+    _expect(updateResult['created'] == 0 && updateResult['updated'] == 1,
+        'batch fills the linked actor instead of creating a copy');
+    final updatedPreview = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/preview',
+      token: admin,
+      body: {'taskId': '2'},
+    );
+    final updatedActor =
+        (updatedPreview.json['data']['current'] as Map<String, dynamic>);
+    _expect(
+        updatedActor['id'] == batchActorId &&
+            updatedActor['stageName'] == '自定义名字' &&
+            updatedActor['romanizedName'] == 'Takahashi Shoko',
+        'batch update preserves edited fields and restores missing data');
     final importedDecision = await _request(
       base,
       'PUT',
@@ -234,8 +370,8 @@ Future<void> main() async {
       token: admin,
       body: {'taskId': '2', 'deferred': true},
     );
-    _expect(importedDecision.statusCode == HttpStatus.conflict,
-        'an imported actor cannot be relabeled as not imported');
+    _expect(importedDecision.statusCode == HttpStatus.ok,
+        'an imported actor can be imported again later');
 
     final preview = await _request(
       base,
@@ -250,8 +386,8 @@ Future<void> main() async {
         'preview does not leak NAS paths');
     _expect(
         (preview.json['data'] as Map<String, dynamic>)['profileResolution'] ==
-            'unresolved',
-        'unselected candidate cannot be imported');
+            'raw',
+        'unselected candidate still imports using the raw MDCNG record');
 
     final selectedPreview = await _request(
       base,
@@ -383,6 +519,9 @@ Future<void> main() async {
     final actor = appliedData['actor'] as Map<String, dynamic>;
     _expect(actor['id'] == mergeTargetId,
         'confirmed fields merge into the selected actor');
+    _expect(library.actorsForMovie(movieId).single.id == mergeTargetId &&
+        actor['movieCount'] == 1,
+        'import backfills saved movie credits and returns the updated count');
     _expect(actor['stageName'] == '凉森玲梦',
         'writes the library Chinese common name as the display name');
     _expect(actor['originalName'] == '涼森れむ',
@@ -397,6 +536,15 @@ Future<void> main() async {
     _expect(
         actor['backdropAsset'] != null, 'copies backdrop into managed assets');
 
+    final clearedMergeField = await _request(
+      base,
+      'PATCH',
+      '/api/v1/admin/actors/$mergeTargetId',
+      token: admin,
+      body: {'romanizedName': null},
+    );
+    _expect(clearedMergeField.statusCode == HttpStatus.ok,
+        'clears one field on the linked actor');
     final repeated = await _request(
       base,
       'POST',
@@ -405,17 +553,44 @@ Future<void> main() async {
       body: {
         'taskId': source['taskId'],
         'fingerprint': fingerprint,
-        'fieldKeys': fields,
+        'fieldKeys': ['romanizedName'],
         'overwriteFieldKeys': const [],
         'targetActorId': null,
-        'createNew': false,
+        'createNew': true,
         'selectedProfileKey': candidate['key'],
       },
     );
+    _expect(repeated.statusCode == HttpStatus.ok,
+        'same source snapshot can fill an existing actor field');
+    final repeatedActor =
+        repeated.json['data']['actor'] as Map<String, dynamic>;
+    _expect(repeatedActor['id'] == actor['id'],
+        'repeated import updates the actor bound to the MDCNG source');
+
+    final reset = await _request(
+      base,
+      'POST',
+      '/api/v1/admin/mdcng-actor-imports/reset',
+      token: admin,
+      body: const <String, dynamic>{},
+    );
+    _expect(reset.statusCode == HttpStatus.ok,
+        'admin can clear all MDCNG actors for a fresh import');
+    final resetData = reset.json['data'] as Map<String, dynamic>;
+    _expect((resetData['deletedActors'] as int) == 2,
+        'reset deletes every existing actor record');
+    _expect((resetData['deletedImages'] as int) >= 2,
+        'reset deletes imported actor images');
+    final actorsAfterReset = await _request(
+      base,
+      'GET',
+      '/api/v1/actors',
+      token: admin,
+    );
     _expect(
-      repeated.statusCode == HttpStatus.ok &&
-          repeated.json['data']['status'] == 'no_changes',
-      'same source snapshot is never imported twice',
+      ((actorsAfterReset.json['data'] as Map<String, dynamic>)['items'] as List)
+          .isEmpty,
+      'reset removes all actors from the library',
     );
   } finally {
     await server.stop();

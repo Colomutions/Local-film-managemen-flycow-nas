@@ -163,6 +163,14 @@ MDCNG NFO 可导入单视频影片或包含多个视频的影集。预览会列�
 
 分类管理的批量 MDCNG 导入由 NAS 后台逐部串行执行，扫描和批量导入不会同时启动。预览仅统计已扫描影片，不遍历 NFO。批量操作补全空字段、更新之前由 MDCNG 导入的文本字段，保留人工修改的字段；扫描默认标题可被 NFO 标题替换。既有海报或画廊图片不会被批量覆盖。无法精确匹配的演员、标签会列为待核对，其他字段继续导入。没有 NFO 或解析失败的影片列为失败，可在任务完成后重试。任务进度在服务运行期间保留；服务重启后可重新运行同一分类，已导入的来源摘要避免重复写入。二次媒体扫描不会自动重读 NFO。
 
+分类查询接口（`GET /api/v1/categories`、`GET /api/v1/admin/categories`）返回 NAS 全量 `movieCount`，支持 `sort=name|movieCount|directory`（默认名称，影片数量降序）。数量与影片墙按逻辑条目统计：影集按一部计，排除已归并来源和没有分集的单片，离线影片仍计入。手动空影集计入分类总数，但不参与 MDCNG 批量导入。修复分类数量受 Windows 已加载分页影响的问题，需同时更新 NAS 和 Windows；无需清库或重新导入。
+
+正式受管理模式下删除分类，会在同一数据库事务中删除分类及目录绑定、其下影片（含空影集和隐藏归并来源）、分集索引、影片元数据与关联、收藏、进度、历史和 MDCNG 导入审计；先解除归并及审计限制引用，避免外键错误导致 HTTP 500。提交后清理 NAS 内部的影片海报和画廊副本。演员、标签、发行商、系列等公共资料及其他分类保留；源媒体目录内的视频、NFO、图片不删除。相关扫描排队或执行期间、MDCNG 批量导入期间拒绝删除。重新建分类并绑定原目录扫描可重建索引，但不自动恢复已删除的人工资料和观看记录。本次删除修复仅需更新 NAS。
+
+分类路径被主动移除或改绑后，分类扫描完成时会清理已退出全部绑定范围的分集索引；没有剩余分集的相关影片也会移出索引，不再出现在影片墙、搜索和关联数量中。旧版本已经移除路径的分类，更新 NAS 后重新扫描一次即可清理。仍然绑定但临时离线的硬盘继续保留记录。跨盘影集保留其他来源的分集、影集 ID、资料和收藏；手动创建的空影集不受影响。扫描期间不能改绑该分类路径。
+
+上述清理不删除源视频，但会删除被移除分集的进度、历史及 NFO 导入审计；整部影片退出索引时也会移除其元数据、收藏和关联。影片搬到新盘或新目录按新文件建索引，不根据同名自动迁移旧资料或播放历史。重新绑定旧来源并扫描可重新建档。扫描结果另返回 `removedEpisodes`、`removedMovies` 供核对清理数量。
+
 管理员接口：`POST /api/v1/admin/mdcng-imports/preview` 接受 `movieId` 和可选的 `episodeId`；`POST /api/v1/admin/mdcng-imports/apply` 使用预览返回的 `episodeId` 与 `nfoContentHash`。批量接口为 `GET /api/v1/admin/mdcng-import-jobs/preview?categoryId=...`、`POST /api/v1/admin/mdcng-import-jobs`、`GET /api/v1/admin/mdcng-import-jobs?categoryId=...`、`GET /api/v1/admin/mdcng-import-jobs/{id}`，以及 `POST /api/v1/admin/mdcng-import-jobs/{id}/retry` 或 `/cancel`。
 
 `capabilities` 是 NAS 端实际功能清单，而不是 token 权限的替代品。当前包含 `movies`、`playback`、`watchHistory`、`management`、`categories`、`actors`、`publishers`、`series`、`tags`、`mdcngNfo`、`mdcngActors`、`profilePackages`、`sourceRename`、`transcoding`、`novels`、`novelUpload`、`novelProgress`、`novelUploadResume`、`novelFormats`、`comics`、`comicUpload`、`comicUploadResume` 和 `comicFormats`。小说或漫画目录不可用时对应能力为 `false`，原因由 `capabilityStatus` 返回。Windows 和 Android 会先按能力清单启用页面和操作，再按 viewer/admin scope 授权；旧档案重新连接一次即可获得清单。`capabilityStatus.mdcngActors` 也只返回不含路径的状态码，用于区分未配置、目录不可达、数据库缺失或不可读。
@@ -261,3 +269,6 @@ docker-compose.media.mdcng-actors.yml  单盘只读 + MDCNG 演员审核卷
 docker-compose.media-writable.yml  单盘可写媒体卷
 docker-compose.media-writable.mdcng-actors.yml  单盘可写 + MDCNG 演员审核卷
 ```
+## 内置刮削更新
+
+WhatsAV 已作为内置资料来源集成到同一个 NAS 镜像，MDCNG 保留为可选导入。Windows 支持全库、当前分类、多选影片、单部影片及网站作品数前 1000 位演员的刮削入口；扫描和刮削是独立任务。部署与使用说明见 [内置刮削](docs/内置刮削.md)。

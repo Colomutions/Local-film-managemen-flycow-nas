@@ -11,6 +11,9 @@ import 'metadata_probe.dart';
 import 'movie_actor.dart';
 import 'novels/novel_repository.dart';
 
+part 'library/scrape_database.dart';
+part 'library/supplement_database.dart';
+
 String _normalizeCatalogNumber(String value) =>
     value.trim().toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
 
@@ -218,6 +221,7 @@ class NasLibraryCategory {
     required this.createdAt,
     required this.updatedAt,
     this.mediaSources = const [],
+    this.movieCount = 0,
   });
 
   final String id;
@@ -227,6 +231,7 @@ class NasLibraryCategory {
   final String createdAt;
   final String updatedAt;
   final List<NasCategoryMediaSource> mediaSources;
+  final int movieCount;
 }
 
 class NasEpisodePage {
@@ -541,10 +546,14 @@ class NasScanResult {
     required this.scannedFiles,
     required this.availableEpisodes,
     this.conflicts = const [],
+    this.removedEpisodes = 0,
+    this.removedMovieIndexes = const [],
   });
 
   final int scannedFiles;
   final int availableEpisodes;
+  final int removedEpisodes;
+  final List<NasRemovedMovieIndex> removedMovieIndexes;
 
   /// 已跳过的嵌套影集范围，仅返回安全的相对目录标识。
   final List<String> conflicts;
@@ -644,6 +653,18 @@ class NasManagedAsset {
   final String fileName;
   final String mimeType;
   final String createdAt;
+}
+
+class NasMdcngActorReset {
+  const NasMdcngActorReset({
+    required this.deletedActors,
+    required this.unlinkedMovieLinks,
+    required this.assets,
+  });
+
+  final int deletedActors;
+  final int unlinkedMovieLinks;
+  final List<NasManagedAsset> assets;
 }
 
 /// 由共同影片关系推导出的合作演员，不能手工写入。
@@ -1005,7 +1026,7 @@ class NasMdcngMetadataApply {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 32;
+  static const currentSchemaVersion = 33;
   static const _metadataFieldKeys = {
     'title',
     'originalTitle',
@@ -1045,6 +1066,7 @@ class NasLibraryDatabase {
       database.execute('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
       _database = database;
       _migrate();
+      initializeScraping();
       _initializeRevisions();
     } catch (_) {
       database.dispose();
@@ -1903,6 +1925,43 @@ class NasLibraryDatabase {
         [32, _now()],
       );
     }
+    if (current < 33) {
+      // Distinct MDCNG tasks may create actors with the same name. Keep every
+      // import audit row, including later updates from the same task.
+      _db.execute('PRAGMA foreign_keys = OFF');
+      try {
+        _db.execute('''
+          CREATE TABLE mdcng_actor_import_records_v33 (
+            id TEXT PRIMARY KEY,
+            actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
+            source_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            emby_id TEXT NOT NULL,
+            source_fingerprint TEXT NOT NULL,
+            applied_fields_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO mdcng_actor_import_records_v33(
+            id, actor_id, source_id, task_id, emby_id, source_fingerprint,
+            applied_fields_json, created_at
+          )
+          SELECT id, actor_id, source_id, task_id, emby_id, source_fingerprint,
+                 applied_fields_json, created_at
+          FROM mdcng_actor_import_records;
+          DROP TABLE mdcng_actor_import_records;
+          ALTER TABLE mdcng_actor_import_records_v33
+            RENAME TO mdcng_actor_import_records;
+          CREATE INDEX mdcng_actor_import_records_actor_created_idx
+            ON mdcng_actor_import_records(actor_id, created_at DESC, id DESC);
+        ''');
+      } finally {
+        _db.execute('PRAGMA foreign_keys = ON');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [33, _now()],
+      );
+    }
   }
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -2145,12 +2204,63 @@ class NasLibraryDatabase {
       availableEpisodes += result.availableEpisodes;
       conflicts.addAll(result.conflicts);
     }
+    // 扫描期间绑定被直接修改时不执行清理，防止旧扫描误删新范围的索引。
+    final currentSources = mediaSourcesForCategory(categoryId);
+    final scannedScope = sources.map((source) =>
+        '${source.mediaRootId}:${source.relativePath}').toSet();
+    final currentScope = currentSources.map((source) =>
+        '${source.mediaRootId}:${source.relativePath}').toSet();
+    if (scannedScope.length != currentScope.length ||
+        !scannedScope.containsAll(currentScope)) {
+      throw StateError('分类目录在扫描期间已变更，请重新扫描');
+    }
+    final removed = _removeUnboundCategoryIndexes(categoryId);
     return NasScanResult(
       scannedFiles: scannedFiles,
       availableEpisodes: availableEpisodes,
       conflicts: conflicts,
+      removedEpisodes: removed.episodes,
+      removedMovieIndexes: removed.movies,
     );
   }
+
+  /// 主动取消绑定才移除索引；不检查硬盘是否在线，也不删除任何源文件。
+  ({int episodes, List<NasRemovedMovieIndex> movies})
+      _removeUnboundCategoryIndexes(String categoryId) => transaction(() {
+    final stale = _db.select('''
+      SELECT e.id, e.movie_id FROM episodes e JOIN movies m ON m.id=e.movie_id
+      WHERE m.category_id=? AND m.lifecycle_state='active'
+        AND NOT EXISTS (
+          SELECT 1 FROM category_media_sources s
+          WHERE s.category_id=m.category_id AND s.media_root_id=e.media_root_id
+            AND (e.relative_path=s.relative_path OR
+              substr(e.relative_path,1,length(s.relative_path)+1)=s.relative_path || '/')
+        )
+    ''', [categoryId]);
+    final affectedMovies = stale.map((row) => row['movie_id'] as String).toSet();
+    final removedMovies = <NasRemovedMovieIndex>[];
+    for (final row in stale) {
+      // NFO 审计对分集使用限制删除；保留影片字段值，解除已退出来源的审计引用。
+      _db.execute('DELETE FROM mdcng_import_records WHERE episode_id=?', [row['id']]);
+      _db.execute('DELETE FROM episodes WHERE id=?', [row['id']]);
+    }
+    for (final movieId in affectedMovies) {
+      if (_db.select('SELECT 1 FROM episodes WHERE movie_id=? LIMIT 1', [movieId]).isNotEmpty) {
+        _db.execute('UPDATE movies SET updated_at=? WHERE id=?', [_now(), movieId]);
+        continue;
+      }
+      final movie = findMovieForAdmin(movieId)!;
+      removedMovies.add(NasRemovedMovieIndex(
+        posterFileName: movie.posterFileName,
+        carouselFileNames: carouselImagesForMovie(movieId).map((image) => image.fileName).toList(),
+      ));
+      // 旧归并条目仍保持隐藏，只解除指向已移除目标的外键引用。
+      _db.execute('UPDATE movies SET merged_into_movie_id=NULL WHERE merged_into_movie_id=?', [movieId]);
+      _db.execute('DELETE FROM movies WHERE id=?', [movieId]);
+      _db.execute("DELETE FROM scrape_fields WHERE kind='movie' AND entity_id=?", [movieId]);
+    }
+    return (episodes: stale.length, movies: removedMovies);
+  });
 
   /// 分类扫描在单一物理来源盘内完成；盘不可读时绝不改写既有分集可用性。
   Future<NasScanResult> _scanCategorySource({
@@ -2733,7 +2843,12 @@ class NasLibraryDatabase {
 
     addIdSetClause('m.category_id', filter.effectiveCategoryIds);
     addIdSetClause('m.series_id', filter.seriesIds);
-    addIdSetClause('m.publisher_id', filter.publisherIds);
+    if(filter.publisherIds.isNotEmpty){
+      final ids=filter.publisherIds.toList()..sort();
+      final placeholders=List.filled(ids.length,'?').join(',');
+      clauses.add('(m.publisher_id IN ($placeholders) OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id IN ($placeholders)))');
+      whereValues.addAll([...ids,...ids]);
+    }
     if (filter.actorIds.isNotEmpty) {
       final actorIds = filter.actorIds.toList()..sort();
       clauses.add('''EXISTS (
@@ -2866,11 +2981,11 @@ class NasLibraryDatabase {
              p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
              p.archived_at,
               (SELECT COUNT(*) FROM movies m
-                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active') AS movie_count,
+                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active') AS movie_count,
              (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
              (SELECT SUM(COALESCE(e.duration_ms, 0))
                 FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active'
+                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active'
                   AND e.is_available = 1) AS duration_ms
       FROM publishers p
       WHERE (? = 1 OR p.archived_at IS NULL)
@@ -2887,11 +3002,11 @@ class NasLibraryDatabase {
              p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
              p.archived_at,
               (SELECT COUNT(*) FROM movies m
-                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active') AS movie_count,
+                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active') AS movie_count,
              (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
              (SELECT SUM(COALESCE(e.duration_ms, 0))
                 FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE m.publisher_id = p.id AND m.lifecycle_state = 'active'
+                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active'
                   AND e.is_available = 1) AS duration_ms
       FROM publishers p WHERE p.id = ?
     ''', [publisherId]);
@@ -2952,6 +3067,7 @@ class NasLibraryDatabase {
       String publisherId, Map<String, Object?> values) {
     if (findPublisher(publisherId) == null) return null;
     if (values.isEmpty) return findPublisher(publisherId);
+    markScrapeManual('company', publisherId, values.keys);
     final assignments = <String>[];
     final parameters = <Object?>[];
     values.forEach((key, value) {
@@ -2980,7 +3096,8 @@ class NasLibraryDatabase {
       WHERE publisher_id = ? AND lifecycle_state = 'active')
        OR EXISTS(SELECT 1 FROM series WHERE publisher_id = ?)
        OR EXISTS(SELECT 1 FROM actor_publisher_links WHERE publisher_id = ?)
-  ''', [publisherId, publisherId, publisherId]).isNotEmpty;
+       OR EXISTS(SELECT 1 FROM movie_company_links WHERE company_id = ?)
+  ''', [publisherId, publisherId, publisherId,publisherId]).isNotEmpty;
 
   bool deletePublisher(String publisherId) {
     if (findPublisher(publisherId) == null ||
@@ -3127,7 +3244,7 @@ class NasLibraryDatabase {
   List<NasLibraryMovie> moviesForPublisher(String publisherId,
           {String query = ''}) =>
       listMovies(query: query)
-          .where((movie) => movie.publisherId == publisherId)
+          .where((movie) => movie.publisherId == publisherId || movieCompanies(movie.id).any((company)=>company['id']==publisherId))
           .toList(growable: false);
 
   List<NasLibraryMovie> moviesForSeries(String seriesId, {String query = ''}) =>
@@ -3140,8 +3257,8 @@ class NasLibraryDatabase {
           .toList(growable: false);
 
   List<NasLibraryTag> tagsForPublisher(String publisherId) => _tagsForRelation(
-        'm.publisher_id = ?',
-        [publisherId],
+        '(m.publisher_id = ? OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=?))',
+        [publisherId,publisherId],
       );
 
   List<NasLibraryTag> tagsForSeries(String seriesId) => _tagsForRelation(
@@ -3150,7 +3267,7 @@ class NasLibraryDatabase {
       );
 
   List<NasRelatedActor> actorsForPublisher(String publisherId) =>
-      _relatedActorsForMovies('m.publisher_id = ?', [publisherId]);
+      _relatedActorsForMovies('(m.publisher_id = ? OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=?))', [publisherId,publisherId]);
 
   List<NasRelatedActor> actorsForSeries(String seriesId) =>
       _relatedActorsForMovies('m.series_id = ?', [seriesId]);
@@ -3323,19 +3440,32 @@ class NasLibraryDatabase {
 
   /// 仅接受与任一已保存演员名称完全相等的活动演员，模糊候选必须人工处理。
   NasActor? findActiveActorByExactName(String name) {
-    final normalized = name.trim().toLowerCase();
-    if (normalized.isEmpty) return null;
-    final matches = listActors().where((actor) {
+    final matches = findActorsByExactNames([name]);
+    return matches.length == 1 ? matches.single : null;
+  }
+
+  /// 同时核对所有姓名和别名；不同名字指向多位演员时必须人工选择。
+  List<NasActor> findActorsByExactNames(Iterable<String> names,
+      {bool includeArchived = false}) {
+    final normalized = names.map((name) => name.trim().toLowerCase())
+        .where((name) => name.isNotEmpty).toSet();
+    if (normalized.isEmpty) return const [];
+    final sourceNames = <String, List<String>>{};
+    for (final row in _db.select('SELECT actor_id,source_name FROM mdcng_actor_source_links')) {
+      sourceNames.putIfAbsent(row['actor_id'] as String, () => [])
+          .add(row['source_name'] as String);
+    }
+    return listActors(includeArchived: includeArchived).where((actor) {
       final names = <String?>[
         actor.stageName,
         actor.originalName,
         actor.translatedName,
         ...actor.aliases,
+        ...?sourceNames[actor.id],
       ];
       return names
-          .any((candidate) => candidate?.trim().toLowerCase() == normalized);
+          .any((candidate) => normalized.contains(candidate?.trim().toLowerCase()));
     }).toList(growable: false);
-    return matches.length == 1 ? matches.single : null;
   }
 
   List<NasActor> actorsForMovie(String movieId) {
@@ -3481,6 +3611,7 @@ class NasLibraryDatabase {
   NasActor? updateActor(String actorId, Map<String, Object?> values) {
     if (findActor(actorId) == null) return null;
     if (values.isEmpty) return findActor(actorId);
+    markScrapeManual('actor', actorId, values.keys);
     final assignments = <String>[];
     final parameters = <Object?>[];
     values.forEach((key, value) {
@@ -3576,6 +3707,7 @@ class NasLibraryDatabase {
     required String actorId,
     required String sourceName,
     required String profileKey,
+    bool reconcileMovies = true,
   }) {
     _db.execute('''
       INSERT INTO mdcng_actor_source_links(
@@ -3587,7 +3719,13 @@ class NasLibraryDatabase {
         profile_key = excluded.profile_key,
         updated_at = excluded.updated_at
     ''', [sourceId, embyId, actorId, sourceName.trim(), profileKey, _now()]);
+    if (reconcileMovies) reconcileScrapeActorMovies(actorId);
   }
+
+  bool actorHasOtherMdcngIdentity(String actorId, String sourceId, String embyId) =>
+      _db.select('''SELECT 1 FROM mdcng_actor_source_links
+        WHERE actor_id=? AND source_id=? AND emby_id!=? LIMIT 1''',
+        [actorId, sourceId, embyId]).isNotEmpty;
 
   NasMdcngActorImportRecord addMdcngActorImport({
     required String actorId,
@@ -3647,6 +3785,48 @@ class NasLibraryDatabase {
     ''', [actorId]);
     _db.execute('DELETE FROM actors WHERE id = ?', [actorId]);
     return true;
+  }
+
+  /// Removes the current MDCNG actor import state in one transaction. All
+  /// actor-to-movie links are removed first so every actor can be deleted,
+  /// including actors that are currently used by active movies.
+  NasMdcngActorReset clearAllMdcngActors() {
+    final actorRows = _db.select('''
+      SELECT photo_asset_id, backdrop_asset_id FROM actors
+    ''');
+    final assetIds = actorRows
+        .expand((row) => [row['photo_asset_id'], row['backdrop_asset_id']])
+        .whereType<String>()
+        .toSet();
+    final assets = assetIds
+        .map(findManagedAsset)
+        .whereType<NasManagedAsset>()
+        .toList(growable: false);
+    final actorCount = (_db
+            .select('SELECT COUNT(*) AS count FROM actors')
+            .single['count'] as int? ??
+        0);
+    final movieLinkCount = (_db
+            .select('SELECT COUNT(*) AS count FROM movie_actor_links')
+            .single['count'] as int? ??
+        0);
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      _db.execute('DELETE FROM movie_actor_links');
+      _db.execute('DELETE FROM mdcng_actor_source_links');
+      _db.execute('DELETE FROM mdcng_actor_import_records');
+      _db.execute('DELETE FROM mdcng_actor_deferred');
+      _db.execute('DELETE FROM actors');
+      _db.execute('COMMIT');
+    } on Object {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+    return NasMdcngActorReset(
+      deletedActors: actorCount,
+      unlinkedMovieLinks: movieLinkCount,
+      assets: assets,
+    );
   }
 
   bool setMovieActorIds({
@@ -3911,6 +4091,12 @@ class NasLibraryDatabase {
   NasRemovedMovieIndex? removeMovieFromIndex(String movieId) {
     final movie = findMovie(movieId);
     if (movie == null) return null;
+    return transaction(() => _removeMovieIndex(movie));
+  }
+
+  /// 调用方负责事务；先解除限制删除的引用，再级联清理影片关联。
+  NasRemovedMovieIndex _removeMovieIndex(NasLibraryMovie movie) {
+    final movieId = movie.id;
     final carouselFileNames = _db
         .select(
           'SELECT file_name FROM movie_carousel_images WHERE movie_id = ?',
@@ -3918,6 +4104,11 @@ class NasLibraryDatabase {
         )
         .map((row) => row['file_name'] as String)
         .toList(growable: false);
+    _db.execute('''DELETE FROM mdcng_import_records WHERE movie_id = ? OR
+      episode_id IN (SELECT id FROM episodes WHERE movie_id = ?)''', [movieId, movieId]);
+    _db.execute('UPDATE movies SET merged_into_movie_id=NULL WHERE merged_into_movie_id=?', [movieId]);
+    _db.execute("DELETE FROM scrape_fields WHERE kind='movie' AND entity_id=?", [movieId]);
+    _db.execute("DELETE FROM scrape_sources WHERE kind='movie' AND entity_id=?", [movieId]);
     _db.execute('DELETE FROM movies WHERE id = ?', [movieId]);
     return NasRemovedMovieIndex(
       posterFileName: movie.posterFileName,
@@ -4519,17 +4710,24 @@ class NasLibraryDatabase {
 
   List<NasLibraryCategory> listCategories() => _db
       .select(
-          'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories ORDER BY name COLLATE NOCASE')
+          '''SELECT c.*, ($_categoryMovieCountSql) AS movie_count
+             FROM library_categories c ORDER BY c.name COLLATE NOCASE, c.id''')
       .map(_mapCategoryWithSources)
       .toList(growable: false);
 
   NasLibraryCategory? findCategory(String categoryId) {
     final rows = _db.select(
-      'SELECT id, name, color, media_relative_path, created_at, updated_at FROM library_categories WHERE id = ?',
+      '''SELECT c.*, ($_categoryMovieCountSql) AS movie_count
+         FROM library_categories c WHERE c.id = ?''',
       [categoryId],
     );
     return rows.isEmpty ? null : _mapCategoryWithSources(rows.single);
   }
+
+  // 与影片墙一致：按逻辑影片统计，影集只算一部；离线记录仍保留，归并来源不计入。
+  static const _categoryMovieCountSql = '''SELECT COUNT(*) FROM movies m
+    WHERE m.category_id=c.id AND m.lifecycle_state='active'
+      AND (m.entry_type='series' OR EXISTS(SELECT 1 FROM episodes e WHERE e.movie_id=m.id))''';
 
   List<NasCategoryMediaSource> mediaSourcesForCategory(String categoryId) {
     final rows = _db.select('''
@@ -4676,7 +4874,7 @@ class NasLibraryDatabase {
     if (hasCategoryName(name, excludingId: categoryId)) {
       throw ArgumentError.value(name, 'name', 'already exists');
     }
-    // 改绑目录绝不删除影片或人工资料；后续扫描仅更新该来源确认缺失的分集。
+    // 保存绑定不立即清理；分类扫描完成后统一移除退出扫描范围的旧索引。
     _db.execute(
       updateMediaRelativePath
           ? 'UPDATE library_categories SET name = ?, color = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
@@ -4712,17 +4910,24 @@ class NasLibraryDatabase {
     return findCategory(categoryId);
   }
 
-  bool deleteCategory(String categoryId, {bool deleteMovies = false}) {
-    if (findCategory(categoryId) == null) return false;
+  bool deleteCategory(String categoryId, {bool deleteMovies = false}) =>
+      deleteCategoryWithIndexes(categoryId, deleteMovies: deleteMovies) != null;
+
+  /// 原子删除分类和索引，返回仅供清理 NAS 内部图片副本的信息。
+  List<NasRemovedMovieIndex>? deleteCategoryWithIndexes(String categoryId,
+      {bool deleteMovies = false}) => transaction(() {
+    if (findCategory(categoryId) == null) return null;
+    final removed = <NasRemovedMovieIndex>[];
     if (deleteMovies) {
-      _db.execute(
-        "DELETE FROM movies WHERE category_id = ? AND lifecycle_state = 'active'",
-        [categoryId],
-      );
+      // 隐藏的归并来源也属于本分类，不能留下无分类的旧记录。
+      final ids = _db.select('SELECT id FROM movies WHERE category_id=?', [categoryId]);
+      for (final row in ids) {
+        removed.add(_removeMovieIndex(findMovieForAdmin(row['id'] as String)!));
+      }
     }
     _db.execute('DELETE FROM library_categories WHERE id = ?', [categoryId]);
-    return true;
-  }
+    return removed;
+  });
 
   NasCategoryTaxonomyTransfer exportCategoryTaxonomy() {
     final conflicts = categoryTaxonomyViolations();
@@ -5663,11 +5868,10 @@ class NasLibraryDatabase {
 
   NasLibraryCategory? categoryForMovie(String movieId) {
     final rows = _db.select('''
-      SELECT c.id, c.name, c.media_relative_path, c.created_at, c.updated_at
-      FROM movies m JOIN library_categories c ON c.id = m.category_id
-      WHERE m.id = ?
+      SELECT category_id FROM movies WHERE id = ?
     ''', [movieId]);
-    return rows.isEmpty ? null : _mapCategory(rows.single);
+    final id = rows.isEmpty ? null : rows.single['category_id'] as String?;
+    return id == null ? null : findCategory(id);
   }
 
   /// Batch the current page's associations; load tag ancestry only once.
@@ -5965,10 +6169,12 @@ class NasLibraryDatabase {
         record.createdAt,
       ]);
       if (input.fanartFileName != null) {
+        final imageId = newUuidV4();
         _db.execute('''
           INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at)
           VALUES (?, ?, ?, ?)
-        ''', [newUuidV4(), input.movieId, input.fanartFileName, timestamp]);
+        ''', [imageId, input.movieId, input.fanartFileName, timestamp]);
+        recordGalleryOrigin(imageId, 'mdcng_cover');
       }
       for (final fieldKey in fields) {
         _db.execute('''
@@ -6680,6 +6886,7 @@ class NasLibraryDatabase {
       createdAt: category.createdAt,
       updatedAt: category.updatedAt,
       mediaSources: mediaSourcesForCategory(category.id),
+      movieCount: row['movie_count'] as int,
     );
   }
 
