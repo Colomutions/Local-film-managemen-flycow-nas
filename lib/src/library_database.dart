@@ -5,6 +5,7 @@ import 'dart:math';
 import 'package:sqlite3/sqlite3.dart';
 
 import 'auth.dart';
+import 'content_file_names.dart';
 import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
@@ -1026,7 +1027,7 @@ class NasMdcngMetadataApply {
 }
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 33;
+  static const currentSchemaVersion = 34;
   static const _metadataFieldKeys = {
     'title',
     'originalTitle',
@@ -1960,6 +1961,13 @@ class NasLibraryDatabase {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [33, _now()],
+      );
+    }
+    if (current < 34) {
+      ContentFileNames.createSchema(_db);
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [34, _now()],
       );
     }
   }

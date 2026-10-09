@@ -6,6 +6,7 @@ import 'package:archive/archive_io.dart';
 import 'package:crypto/crypto.dart';
 
 import '../auth.dart';
+import '../content_file_names.dart';
 import '../novels/novel_metadata.dart';
 import 'comic_catalog.dart';
 
@@ -64,7 +65,7 @@ Map<String, Object?> parseComicMetadata(Object? decoded,
   if (rawName != null && rawName is! String)
     throw const ComicFailure('invalid_metadata');
   final fileName = rawName == null
-      ? comicFileName(title, rawSha, format)
+      ? comicFileName(title, format)
       : normalizeNovelText(rawName);
   if (fileName.isEmpty ||
       fileName.runes.length > 256 ||
@@ -77,8 +78,6 @@ Map<String, Object?> parseComicMetadata(Object? decoded,
   final policy = replace ? 'reject' : decoded['conflictPolicy'] ?? 'reject';
   if (policy != 'reject' && policy != 'keep_both')
     throw const ComicFailure('invalid_metadata');
-  if (policy == 'keep_both' && !admin)
-    throw const ComicFailure('insufficient_scope');
   return {
     'title': title,
     'author': author == null || author.isEmpty ? null : author,
@@ -91,15 +90,15 @@ Map<String, Object?> parseComicMetadata(Object? decoded,
   };
 }
 
-String comicFileName(String title, String sha, String format) {
+String comicFileName(String title, String format) {
   var base = normalizeNovelText(title)
       .replaceAll(_badFileName, '_')
       .replaceAll(RegExp(r'[. ]+$'), '');
   if (base.isEmpty) base = '漫画';
-  base = String.fromCharCodes(base.runes.take(100))
+  base = String.fromCharCodes(base.runes.take(252))
       .replaceAll(RegExp(r'[. ]+$'), '');
   if (base.isEmpty) base = '漫画';
-  return '$base-$sha.$format';
+  return '$base.$format';
 }
 
 class ComicTemporaryFile {
@@ -113,6 +112,7 @@ class ComicFiles {
   ComicFiles(this.rootPath, this.maxUploadBytes);
   final String rootPath;
   final int maxUploadBytes;
+  ContentFileNames? fileNames;
   Directory get objects =>
       Directory('$rootPath${Platform.pathSeparator}objects');
   Directory get temporary =>
@@ -120,7 +120,8 @@ class ComicFiles {
   File object(String digest) {
     if (!_shaPattern.hasMatch(digest))
       throw const ComicFailure('invalid_request');
-    return File('${objects.path}${Platform.pathSeparator}$digest');
+    final name = fileNames?.resolve(digest) ?? digest;
+    return File('${objects.path}${Platform.pathSeparator}$name');
   }
 
   File sessionFile(String id) =>
@@ -196,7 +197,10 @@ class ComicFiles {
     await _verifyZip(content.file);
   }
 
-  Future<void> publish(ComicTemporaryFile content) async {
+  Future<void> publish(ComicTemporaryFile content, {String? fileName}) async {
+    if (fileName != null) {
+      await fileNames!.reserve(content.digest, fileName, objects);
+    }
     final dest = object(content.digest);
     if (await dest.exists()) {
       if (await dest.length() != content.sizeBytes)

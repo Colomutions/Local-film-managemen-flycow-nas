@@ -2,6 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
+import 'package:sqlite3/sqlite3.dart';
+
+import '../content_file_names.dart';
 
 class NasRestoreActivationService {
   NasRestoreActivationService({
@@ -60,16 +63,18 @@ class NasRestoreActivationService {
     if (!await restoredDatabase.exists()) {
       throw StateError('Restored SQLite database is missing.');
     }
-    await _publishNovelObjects(restoredDirectory);
     await _databaseDirectory.create(recursive: true);
     await _copyFileDurably(restoredDatabase, _stagingDatabase);
-    await _writeJournal('prepared');
 
     var maintenanceEntered = false;
     var databaseClosed = false;
     try {
       await enterMaintenance();
       maintenanceEntered = true;
+      // Uploads must be drained before reserving human-readable names against
+      // the live directory; their catalog is independent of the staged one.
+      await _publishNovelObjects(restoredDirectory);
+      await _writeJournal('prepared');
       await closeDatabase();
       databaseClosed = true;
       await _deleteIfExists(_rollbackDatabase);
@@ -131,36 +136,62 @@ class NasRestoreActivationService {
         Directory('$novelDir${Platform.pathSeparator}.tmp');
     await objectDirectory.create(recursive: true);
     await temporaryDirectory.create(recursive: true);
-    final handled = <String>{};
-    for (final raw in novels['items'] as List) {
-      if (raw is! Map || raw['sha256'] is! String || raw['sizeBytes'] is! int) {
-        throw StateError('Novel backup entry is invalid.');
+    final database = sqlite3.open(_stagingDatabase.path);
+    try {
+      // Reallocate in the staged catalog: live files from a later upload may
+      // already use a backed-up name. Never overwrite those rollback files.
+      database.execute('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;');
+      ContentFileNames.createSchema(database);
+      database.execute('DELETE FROM reading_content_file_names');
+      final names = ContentFileNames(database);
+      final handled = <String>{};
+      for (final raw in novels['items'] as List) {
+        if (raw is! Map ||
+            raw['sha256'] is! String ||
+            raw['sizeBytes'] is! int) {
+          throw StateError('Novel backup entry is invalid.');
+        }
+        final digest = raw['sha256'] as String;
+        final sizeBytes = raw['sizeBytes'] as int;
+        if (!handled.add(digest)) continue;
+        final source = File(
+          '${restoredDirectory.path}${Platform.pathSeparator}novels'
+          '${Platform.pathSeparator}objects${Platform.pathSeparator}$digest',
+        );
+        final rows = database.select(
+          'SELECT file_name FROM novels WHERE content_sha256 = ? ORDER BY id LIMIT 1',
+          [digest],
+        );
+        if (rows.isEmpty)
+          throw StateError('Restored novel catalog is incomplete');
+        final name = await names.reserve(
+          digest,
+          rows.single['file_name'] as String,
+          objectDirectory,
+          reuseExisting: (file) async =>
+              await file.length() == sizeBytes &&
+              (await sha256.bind(file.openRead()).first).toString() == digest,
+        );
+        final destination =
+            File('${objectDirectory.path}${Platform.pathSeparator}$name');
+        if (await destination.exists()) {
+          continue;
+        }
+        final temporary = File(
+          '${temporaryDirectory.path}${Platform.pathSeparator}restore-$digest',
+        );
+        await _copyFileDurably(source, temporary);
+        await _verifyObject(temporary, digest, sizeBytes);
+        try {
+          await temporary.rename(destination.path);
+        } on FileSystemException {
+          if (!await destination.exists()) rethrow;
+          await _verifyObject(destination, digest, sizeBytes);
+          await _deleteIfExists(temporary);
+        }
       }
-      final digest = raw['sha256'] as String;
-      final sizeBytes = raw['sizeBytes'] as int;
-      if (!handled.add(digest)) continue;
-      final source = File(
-        '${restoredDirectory.path}${Platform.pathSeparator}novels'
-        '${Platform.pathSeparator}objects${Platform.pathSeparator}$digest',
-      );
-      final destination =
-          File('${objectDirectory.path}${Platform.pathSeparator}$digest');
-      if (await destination.exists()) {
-        await _verifyObject(destination, digest, sizeBytes);
-        continue;
-      }
-      final temporary = File(
-        '${temporaryDirectory.path}${Platform.pathSeparator}restore-$digest',
-      );
-      await _copyFileDurably(source, temporary);
-      await _verifyObject(temporary, digest, sizeBytes);
-      try {
-        await temporary.rename(destination.path);
-      } on FileSystemException {
-        if (!await destination.exists()) rethrow;
-        await _verifyObject(destination, digest, sizeBytes);
-        await _deleteIfExists(temporary);
-      }
+    } finally {
+      database.dispose();
     }
   }
 

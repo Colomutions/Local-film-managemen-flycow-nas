@@ -48,6 +48,7 @@ class ComicHttpApi {
       }
       await files.initialize();
       await catalog.open();
+      files.fileNames = catalog.fileNames;
       catalog.cleanupExpiredIdempotency();
       await sessions.open();
       for (final session in sessions.all.where((value) =>
@@ -326,7 +327,7 @@ class ComicHttpApi {
         } else {
           catalog.preflightReplace(replaceId, revision!, metadata, quotaBytes);
         }
-        await files.publish(content!);
+        await files.publish(content!, fileName: metadata['fileName'] as String);
         final committed = replaceId == null
             ? catalog.commitCreate(
                 metadata: metadata,
@@ -567,10 +568,9 @@ class ComicHttpApi {
       try {
         if (!session.verified) {
           final source = file.openRead();
-          final digest = (await sha256
-                  .bind(backgroundRead?.call(source) ?? source)
-                  .first)
-              .toString();
+          final digest =
+              (await sha256.bind(backgroundRead?.call(source) ?? source).first)
+                  .toString();
           if (digest != session.metadata['contentSha256'])
             throw const ComicFailure('content_hash_mismatch');
         }
@@ -581,7 +581,8 @@ class ComicHttpApi {
           sessions.setVerified(id);
         }
         catalog.preflightCreate(session.metadata, quotaBytes);
-        await files.publish(content);
+        await files.publish(content,
+            fileName: session.metadata['fileName'] as String);
         final metadata = session.metadata;
         final semantic = _semanticDigest('comic-upload-v1\n', metadata);
         final committed = catalog.commitCreate(

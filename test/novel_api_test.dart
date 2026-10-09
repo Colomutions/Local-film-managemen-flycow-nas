@@ -80,6 +80,10 @@ Future<void> main() async {
     final createdNovel = (created.json['data'] as Map<String, dynamic>)['novel']
         as Map<String, dynamic>;
     final novelId = createdNovel['id'] as String;
+    _expect(
+        await File('${config.novelDir}/objects/接口测试小说.txt').readAsString() ==
+            utf8.decode(content),
+        'uploaded TXT keeps its readable name and bytes');
     _expect(createdNovel['coverUrl'] == null, 'cover remains null');
     _expect(
       created.headers['x-mujing-trace-id']?.isNotEmpty == true &&
@@ -355,6 +359,9 @@ Future<void> main() async {
     );
     _expectError(goneReplay, 410, 'idempotency_result_gone');
 
+    // A later file can occupy a backup's old name. Restore must not overwrite it.
+    final occupiedName = File('${config.novelDir}/objects/接口测试小说.txt');
+    await occupiedName.writeAsString('另一份文件', flush: true);
     await server.restoreBackup(backupId);
     final restoredDetail = await _request(
       base,
@@ -378,6 +385,38 @@ Future<void> main() async {
       restoredContent.bytes.toString() == content.toString(),
       'activated backup restores original TXT content',
     );
+    _expect(await File('${config.novelDir}/objects/接口测试小说-1.txt').exists(),
+        'restore allocates a suffix when the old name is occupied');
+
+    final secondContent = utf8.encode('同名小说的另一份正文');
+    final sameName = await _upload(base, '/api/v1/novels',
+        token: viewer.token,
+        idempotencyKey: '10000000-0000-4000-8000-000000000009',
+        metadata: {
+          ...metadata,
+          'conflictPolicy': 'keep_both',
+          'sizeBytes': secondContent.length,
+          'contentSha256': _sha256ForTest(secondContent)
+        },
+        content: secondContent);
+    _expect(sameName.statusCode == 201,
+        'viewer can retain different content with the same name');
+    final sameNameNovel = (sameName.json['data'] as Map)['novel'] as Map;
+    _expect(
+        sameNameNovel['title'] == createdNovel['title'] &&
+            sameNameNovel['fileName'] == createdNovel['fileName'],
+        'collision suffix is not exposed in display or download names');
+    await server.stop();
+    await server.start();
+    final afterRestart = await _request(
+        Uri.parse('http://127.0.0.1:${server.port}'),
+        'GET',
+        '/api/v1/novels/${sameNameNovel['id']}/content',
+        token: viewer.token);
+    _expect(
+        afterRestart.statusCode == 200 &&
+            afterRestart.bytes.toString() == secondContent.toString(),
+        'same-name novel downloads correctly after restart');
   } finally {
     await server.stop();
     await temporary.delete(recursive: true);

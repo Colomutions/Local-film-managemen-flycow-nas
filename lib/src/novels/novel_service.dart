@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../content_file_names.dart';
 import 'novel_metadata.dart';
 import 'novel_models.dart';
 import 'novel_multipart.dart';
@@ -112,6 +113,7 @@ class NasNovelService {
 
   Future<void> initialize() async {
     try {
+      storage.fileNames = ContentFileNames(repository.database);
       await storage.initialize();
       repository.cleanupRuntimeState();
       for (final novel in repository.allIncludingUnhealthy()) {
@@ -165,7 +167,7 @@ class NasNovelService {
         request,
         storage: storage,
         allowConflictPolicy: true,
-        allowKeepBoth: isAdmin,
+        allowKeepBoth: true,
       );
       final digest = postNovelSemanticDigest(payload.metadata);
       scope = NasNovelIdempotencyScope(
@@ -185,7 +187,8 @@ class NasNovelService {
       }
       ownerNonce = acquisition.ownerNonce!;
       final committed = await writeBarrier.runMutation(() async {
-        await storage.publish(payload!.content);
+        await storage.publish(payload!.content,
+            fileName: '${payload.metadata.title}.txt');
         return repository.commitPost(
           scope: scope!,
           ownerNonce: ownerNonce!,
@@ -260,7 +263,10 @@ class NasNovelService {
       final changesContent =
           current.contentSha256 != payload.metadata.contentSha256;
       final committed = await writeBarrier.runMutation(() async {
-        if (changesContent) await storage.publish(payload!.content);
+        if (changesContent) {
+          await storage.publish(payload!.content,
+              fileName: '${payload.metadata.title}.txt');
+        }
         return repository.commitPut(
           scope: scope!,
           ownerNonce: ownerNonce!,

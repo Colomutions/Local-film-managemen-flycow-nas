@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:sqlite3/sqlite3.dart';
 
 import '../auth.dart';
+import '../content_file_names.dart';
 
 class ComicFailure implements Exception {
   const ComicFailure(this.code, [this.details]);
@@ -79,6 +80,7 @@ class ComicCatalog {
   final String rootPath;
   Database? _database;
   Database get db => _database ?? (throw StateError('Comic catalog is closed'));
+  ContentFileNames get fileNames => ContentFileNames(db);
   File get file => File('$rootPath${Platform.pathSeparator}catalog.sqlite');
 
   Future<void> open() async {
@@ -117,6 +119,7 @@ class ComicCatalog {
         );
         CREATE INDEX IF NOT EXISTS comic_idem_expiry ON comic_idempotency(expires_at);
       ''');
+      ContentFileNames.createSchema(database);
       final integrity =
           database.select('PRAGMA quick_check').single.values.first;
       if (integrity != 'ok') throw StateError('Comic catalog integrity failed');

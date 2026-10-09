@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import '../auth.dart';
+import '../content_file_names.dart';
 
 class NasNovelStorageException implements Exception {
   const NasNovelStorageException(this.code, this.message, [this.cause]);
@@ -47,6 +48,7 @@ class NasNovelStorage {
 
   final String rootPath;
   final int maxUploadBytes;
+  ContentFileNames? fileNames;
   Future<void> _publicationQueue = Future.value();
 
   Directory get root => Directory(rootPath);
@@ -178,16 +180,18 @@ class NasNovelStorage {
 
   File objectFile(String digest) {
     _validateDigest(digest);
-    return File('${objectDirectory.path}${Platform.pathSeparator}$digest');
+    final name = fileNames?.resolve(digest) ?? digest;
+    return File('${objectDirectory.path}${Platform.pathSeparator}$name');
   }
 
   Future<NasNovelPublishedContent> publish(
-    NasNovelTemporaryContent temporary,
-  ) {
+    NasNovelTemporaryContent temporary, {
+    String? fileName,
+  }) {
     final completer = Completer<NasNovelPublishedContent>();
     _publicationQueue = _publicationQueue.catchError((_) {}).then((_) async {
       try {
-        completer.complete(await _publishSerially(temporary));
+        completer.complete(await _publishSerially(temporary, fileName));
       } catch (error, stackTrace) {
         completer.completeError(error, stackTrace);
       }
@@ -197,7 +201,11 @@ class NasNovelStorage {
 
   Future<NasNovelPublishedContent> _publishSerially(
     NasNovelTemporaryContent temporary,
+    String? fileName,
   ) async {
+    if (fileName != null) {
+      await fileNames!.reserve(temporary.sha256, fileName, objectDirectory);
+    }
     final destination = objectFile(temporary.sha256);
     if (await destination.exists()) {
       await verifyObject(
@@ -279,10 +287,13 @@ class NasNovelStorage {
 
   Future<void> quarantineOrphans(Set<String> referencedDigests) async {
     if (!await objectDirectory.exists()) return;
+    final referencedNames = referencedDigests
+        .map((digest) => fileNames?.resolve(digest) ?? digest)
+        .toSet();
     await for (final entity in objectDirectory.list(followLinks: false)) {
       if (entity is! File) continue;
       final name = entity.path.split(Platform.pathSeparator).last;
-      if (referencedDigests.contains(name)) continue;
+      if (referencedNames.contains(name)) continue;
       final target = File(
         '${quarantineDirectory.path}${Platform.pathSeparator}'
         '${DateTime.now().toUtc().microsecondsSinceEpoch}-$name',

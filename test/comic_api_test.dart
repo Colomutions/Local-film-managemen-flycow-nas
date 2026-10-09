@@ -56,6 +56,12 @@ Future<void> main() async {
     check(created.status == 201, 'ZIP upload: ${created.text}');
     final comic = ((created.json['data'] as Map)['comic'] as Map);
     final id = comic['id'] as String;
+    check(
+        await File('${config.comicDir}/objects/漫画一.zip')
+                .readAsBytes()
+                .then((bytes) => sha256.convert(bytes).toString()) ==
+            sha,
+        'ZIP keeps its readable filename and original bytes');
     final list = await send(base, 'GET', '/api/v1/comics', token: viewer);
     check(((list.json['data'] as Map)['items'] as List).length == 1, 'list');
     final range = await send(base, 'GET', '/api/v1/comics/$id/content',
@@ -191,7 +197,7 @@ Future<void> main() async {
     check(replaced.status == 200, 'admin replace: ${replaced.text}');
     check(
         !await File(
-                '${config.comicDir}${Platform.pathSeparator}objects${Platform.pathSeparator}$pdfSha')
+                '${config.comicDir}${Platform.pathSeparator}objects${Platform.pathSeparator}PDF 漫画.pdf')
             .exists(),
         'replaced unreferenced PDF object is reclaimed');
     final conflictZip = ZipEncoder().encode(
@@ -233,7 +239,7 @@ Future<void> main() async {
     check(deleted.status == 204, 'admin delete');
     check(
         !await File(
-                '${config.comicDir}${Platform.pathSeparator}objects${Platform.pathSeparator}$sha')
+                '${config.comicDir}${Platform.pathSeparator}objects${Platform.pathSeparator}漫画一.zip')
             .exists(),
         'deleted unreferenced ZIP object is reclaimed');
     final retry = await send(
@@ -241,6 +247,68 @@ Future<void> main() async {
         token: viewer);
     check(retry.status == 201,
         'complete succeeds after resolving conflict: ${retry.text}');
+    final sameName = await upload(
+        base,
+        viewer,
+        {...metadata, 'conflictPolicy': 'keep_both'},
+        zip,
+        'application/zip',
+        '10000000-0000-4000-8000-000000000006');
+    check(sameName.status == 201, 'viewer keeps both on a complete upload');
+    final secondComic = (sameName.json['data'] as Map)['comic'] as Map;
+    final firstComic = (retry.json['data'] as Map)['comic'] as Map;
+    check(
+        secondComic['title'] == firstComic['title'] &&
+            secondComic['fileName'] == firstComic['fileName'],
+        'display names do not expose collision suffixes');
+    final thirdZip = ZipEncoder().encode(
+        Archive()..addFile(ArchiveFile('003.jpg', 4, [255, 216, 2, 217])))!;
+    final thirdSha = sha256.convert(thirdZip).toString();
+    final sameNameSession = await send(
+        base, 'POST', '/api/v1/comics/upload-sessions',
+        token: viewer,
+        jsonBody: {
+          ...metadata,
+          'conflictPolicy': 'keep_both',
+          'sizeBytes': thirdZip.length,
+          'contentSha256': thirdSha
+        },
+        headers: {
+          'Idempotency-Key': '10000000-0000-4000-8000-000000000007'
+        });
+    check(sameNameSession.status == 201, 'viewer creates same-name session');
+    final sameNameUploadId = (sameNameSession.json['data'] as Map)['uploadId'];
+    final thirdPatch = await send(
+        base, 'PATCH', '/api/v1/comics/upload-sessions/$sameNameUploadId',
+        token: viewer,
+        body: thirdZip,
+        headers: {
+          'Content-Range': 'bytes 0-${thirdZip.length - 1}/${thirdZip.length}'
+        });
+    check(thirdPatch.status == 204, 'same-name session patch');
+    final thirdComplete = await send(base, 'POST',
+        '/api/v1/comics/upload-sessions/$sameNameUploadId/complete',
+        token: viewer);
+    check(thirdComplete.status == 201, 'same-name session completes');
+    final thirdId = ((thirdComplete.json['data'] as Map)['comic'] as Map)['id'];
+    for (final entry in {
+      '漫画一.zip': sha,
+      '漫画一-1.zip': sha256.convert(conflictZip).toString(),
+      '漫画一-2.zip': thirdSha
+    }.entries) {
+      check(
+          sha256
+                  .convert(await File('${config.comicDir}/objects/${entry.key}')
+                      .readAsBytes())
+                  .toString() ==
+              entry.value,
+          'collision preserves bytes: ${entry.key}');
+    }
+    final thirdReplay = await send(base, 'POST',
+        '/api/v1/comics/upload-sessions/$sameNameUploadId/complete',
+        token: viewer);
+    check(thirdReplay.text == thirdComplete.text,
+        'completion retry preserves the same record');
     await server.restoreBackup(backupId);
     final restored =
         await send(base, 'GET', '/api/v1/comics/$pdfId', token: viewer);
@@ -259,15 +327,21 @@ Future<void> main() async {
     final afterDataLoss =
         await send(base, 'GET', '/api/v1/comics/$pdfId', token: newViewer);
     check(afterDataLoss.status == 200, 'comic catalog survives /data loss');
+    final namedDownload = await send(
+        base, 'GET', '/api/v1/comics/$thirdId/content',
+        token: newViewer);
+    check(
+        namedDownload.status == 200 &&
+            sha256.convert(namedDownload.bytes).toString() == thirdSha,
+        'named object mapping survives restart, system restore and /data loss');
     final deletedAfterDataLoss =
         await send(base, 'GET', '/api/v1/comics/$id', token: newViewer);
     check(deletedAfterDataLoss.status == 404,
         'deletion tombstone survives /data loss');
     final newAdmin = await pair(
         base, (newInfo.json['data'] as Map)['serverId'] as String, 'admin');
-    final currentSha = sha256.convert(revisedPdf).toString();
     final damaged = File(
-        '${config.comicDir}${Platform.pathSeparator}objects${Platform.pathSeparator}$currentSha');
+        '${config.comicDir}${Platform.pathSeparator}objects${Platform.pathSeparator}PDF 漫画-1.pdf');
     await damaged.writeAsBytes([1], flush: true);
     final badDownload = await send(base, 'GET', '/api/v1/comics/$pdfId/content',
         token: newViewer);
