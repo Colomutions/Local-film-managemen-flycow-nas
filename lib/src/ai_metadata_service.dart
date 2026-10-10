@@ -1,4 +1,4 @@
-import 'library_database.dart';
+import 'library_models.dart';
 import 'persistent_state.dart';
 
 /// NAS 内部的影视元数据生成适配器；客户端永远不会接触 AI 密钥。

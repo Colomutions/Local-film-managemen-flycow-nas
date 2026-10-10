@@ -5,7 +5,6 @@ import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
 import '../lib/mujing_nas.dart';
 import '../lib/src/disk_work_queue.dart';
-import '../lib/src/diagnostic_log.dart';
 
 void check(bool value, String message) {
   if (!value) throw StateError(message);

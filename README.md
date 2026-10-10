@@ -262,7 +262,11 @@ dart run test/backups_api_test.dart
 
 ```text
 bin/                  进程入口
-lib/src/              配置和健康服务
+lib/src/              配置、HTTP 服务和业务模块
+lib/src/library_models.dart    影片库模型；不依赖 SQLite 或文件访问
+lib/src/library_database.dart  SQLite 连接、事务和资源版本；兼容原有影片库调用入口
+lib/src/library/*_repository.dart  独立的迁移、扫描、查询、资料、分类、播放等存储职责
+lib/src/library/library_values.dart  共用值处理；不访问数据库或文件
 test/                 不依赖第三方包的本地测试
 docker-compose.yml    最小服务与持久数据卷
 bin/mujing-compose    唯一部署入口；由 .env 选择一个完整布局

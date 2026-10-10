@@ -1,1048 +1,111 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:sqlite3/sqlite3.dart';
 
 import 'auth.dart';
-import 'content_file_names.dart';
+import 'library_models.dart';
+import 'library/assets_repository.dart';
+import 'library/collections_repository.dart';
+import 'library/library_values.dart';
+import 'library/metadata_repository.dart';
+import 'library/movies_repository.dart';
+import 'library/playback_repository.dart';
+import 'library/profiles_repository.dart';
+import 'library/queries_repository.dart';
+import 'library/scan_repository.dart';
+import 'library/schema_repository.dart';
+import 'library/taxonomy_repository.dart';
 import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
-import 'movie_actor.dart';
 import 'novels/novel_repository.dart';
+
+// Preserve existing database imports while allowing model-only dependencies.
+export 'library_models.dart';
 
 part 'library/scrape_database.dart';
 part 'library/supplement_database.dart';
 
-String _normalizeCatalogNumber(String value) =>
-    value.trim().toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
-
-const _importCategoryColorOptions = [
-  '#1677FF',
-  '#8B5CF6',
-  '#0FAF8F',
-  '#E86A33',
-  '#E5484D',
-  '#D89B16',
-];
-
-const _importTagColorOptions = [
-  '#ffc266',
-  '#58d5ff',
-  '#73d8a4',
-  '#b59aff',
-  '#ff8eaa',
-];
-
-final _importColorRandom = Random();
-
-/// 导入文件没有声明颜色时，由 NAS 统一生成并持久化随机主题色。
-String _randomImportColor(List<String> options) =>
-    options[_importColorRandom.nextInt(options.length)];
-
-String? _nullableTrimmed(String? value) {
-  final normalized = value?.trim();
-  return normalized == null || normalized.isEmpty ? null : normalized;
-}
-
-String _tagLevelName(int level) => switch (level) {
-      1 => '一级',
-      2 => '二级',
-      3 => '三级',
-      _ => '未知',
-    };
-
-class NasLibraryMovie {
-  const NasLibraryMovie({
-    required this.id,
-    required this.title,
-    this.originalTitle,
-    this.catalogNumber,
-    this.publisherId,
-    this.publisherName,
-    this.seriesId,
-    this.seriesName,
-    required this.summary,
-    required this.actors,
-    required this.posterFileName,
-    required this.episodeCount,
-    required this.durationMs,
-    required this.entryType,
-    required this.playCount,
-    required this.isFavorite,
-    required this.updatedAt,
-    this.categoryId,
-    this.categoryName,
-    this.videoWidth,
-    this.videoHeight,
-    this.resolutionLabel,
-  });
-
-  final String id;
-  final String title;
-  final String? originalTitle;
-  final String? catalogNumber;
-  final String? publisherId;
-  final String? publisherName;
-  final String? seriesId;
-  final String? seriesName;
-  final String summary;
-  final List<NasMovieActor> actors;
-  final String? posterFileName;
-  final int episodeCount;
-  final int? durationMs;
-
-  /// `single` 表示普通影片，`series` 表示可包含零到多集的影集。
-  final String entryType;
-  final int playCount;
-  final bool isFavorite;
-  final String updatedAt;
-  final String? categoryId;
-  final String? categoryName;
-  final int? videoWidth;
-  final int? videoHeight;
-  final String? resolutionLabel;
-}
-
-class NasLibraryEpisode {
-  const NasLibraryEpisode({
-    required this.id,
-    required this.movieId,
-    required this.mediaRootId,
-    required this.title,
-    required this.relativePath,
-    required this.fileSize,
-    required this.isAvailable,
-    required this.updatedAt,
-    required this.sourceName,
-    required this.sourceOnline,
-    this.durationMs,
-    this.videoWidth,
-    this.videoHeight,
-    this.resolutionLabel,
-    this.mediaModifiedAt,
-  });
-
-  final String id;
-  final String movieId;
-  final String mediaRootId;
-  final String title;
-  final String relativePath;
-  final int fileSize;
-  final bool isAvailable;
-  final String updatedAt;
-
-  /// 仅供客户端展示的来源盘名称，绝不包含 NAS 宿主机路径。
-  final String sourceName;
-  final bool sourceOnline;
-  final int? durationMs;
-  final int? videoWidth;
-  final int? videoHeight;
-  final String? resolutionLabel;
-  final int? mediaModifiedAt;
-}
-
-class NasRemovedMovieIndex {
-  const NasRemovedMovieIndex({
-    this.posterFileName,
-    this.carouselFileNames = const [],
-  });
-
-  final String? posterFileName;
-  final List<String> carouselFileNames;
-}
-
-class NasMediaRoot {
-  const NasMediaRoot({
-    required this.id,
-    required this.name,
-    this.color,
-    required this.containerPath,
-    required this.readOnly,
-    required this.enabled,
-    required this.createdAt,
-    required this.updatedAt,
-    required this.lastScannedAt,
-    required this.isOnline,
-  });
-
-  final String id;
-  final String name;
-  final String? color;
-  final String containerPath;
-  final bool readOnly;
-  final bool enabled;
-  final String createdAt;
-  final String updatedAt;
-  final String? lastScannedAt;
-  final bool isOnline;
-}
-
-/// 一个逻辑分类绑定到某块物理来源盘中的一个目录。
-class NasCategoryMediaSource {
-  const NasCategoryMediaSource({
-    required this.id,
-    required this.categoryId,
-    required this.mediaRootId,
-    required this.sourceName,
-    required this.relativePath,
-    required this.isOnline,
-    this.lastScannedAt,
-  });
-
-  final String id;
-  final String categoryId;
-  final String mediaRootId;
-  final String sourceName;
-  final String relativePath;
-  final bool isOnline;
-  final String? lastScannedAt;
-
-  /// 面向 API 的安全目录键；不携带容器或宿主机绝对路径。
-  String get directoryKey => '$sourceName/$relativePath';
-}
-
-class NasCategoryMediaSourceInput {
-  const NasCategoryMediaSourceInput({
-    required this.mediaRootId,
-    required this.relativePath,
-  });
-
-  final String mediaRootId;
-  final String relativePath;
-}
-
-class NasLibraryCategory {
-  const NasLibraryCategory({
-    required this.id,
-    required this.name,
-    this.color,
-    this.mediaRelativePath,
-    required this.createdAt,
-    required this.updatedAt,
-    this.mediaSources = const [],
-    this.movieCount = 0,
-  });
-
-  final String id;
-  final String name;
-  final String? color;
-  final String? mediaRelativePath;
-  final String createdAt;
-  final String updatedAt;
-  final List<NasCategoryMediaSource> mediaSources;
-  final int movieCount;
-}
-
-class NasEpisodePage {
-  const NasEpisodePage({
-    required this.items,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-  });
-
-  final List<NasLibraryEpisode> items;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-}
-
-class NasScannedMediaFile {
-  const NasScannedMediaFile({
-    required this.episode,
-    required this.movieId,
-    required this.movieTitle,
-    required this.entryType,
-    required this.categoryId,
-  });
-
-  final NasLibraryEpisode episode;
-  final String movieId;
-  final String movieTitle;
-  final String entryType;
-  final String? categoryId;
-}
-
-class NasScannedMediaFilePage {
-  const NasScannedMediaFilePage({
-    required this.items,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-  });
-
-  final List<NasScannedMediaFile> items;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-}
-
-class NasCollectionMigrationCandidate {
-  const NasCollectionMigrationCandidate({
-    required this.key,
-    required this.categoryId,
-    required this.title,
-    required this.episodeIds,
-    required this.sourceMovieIds,
-    required this.requiresMetadataChoice,
-  });
-
-  final String key;
-  final String categoryId;
-  final String title;
-  final List<String> episodeIds;
-  final List<String> sourceMovieIds;
-  final bool requiresMetadataChoice;
-}
-
-class NasLibraryTag {
-  const NasLibraryTag({
-    required this.id,
-    required this.name,
-    required this.level,
-    this.description = '',
-    this.color,
-    required this.createdAt,
-    required this.updatedAt,
-    this.archivedAt,
-  });
-
-  final String id;
-  final String name;
-  final int level;
-  final String description;
-  final String? color;
-  final String createdAt;
-  final String updatedAt;
-  final String? archivedAt;
-}
-
-class NasTagPath {
-  const NasTagPath({
-    required this.placementId,
-    required this.tagId,
-    required this.tagName,
-    required this.names,
-  });
-
-  final String placementId;
-  final String tagId;
-  final String tagName;
-  final List<String> names;
-}
-
-class NasTagOverview {
-  const NasTagOverview({
-    required this.total,
-    required this.levelOne,
-    required this.levelTwo,
-    required this.levelThree,
-    required this.movieLinks,
-  });
-
-  final int total;
-  final int levelOne;
-  final int levelTwo;
-  final int levelThree;
-  final int movieLinks;
-}
-
-class NasTagDirectoryRoot {
-  const NasTagDirectoryRoot({
-    required this.tag,
-    required this.movieCount,
-    required this.children,
-  });
-
-  final NasLibraryTag tag;
-  final int movieCount;
-  final List<NasTagDirectoryChild> children;
-}
-
-class NasTagDirectoryChild {
-  const NasTagDirectoryChild({required this.tag, required this.movieCount});
-
-  final NasLibraryTag tag;
-  final int movieCount;
-}
-
-class NasTagDetails {
-  const NasTagDetails({
-    required this.tag,
-    required this.parents,
-    required this.directChildCount,
-    required this.movieCount,
-    required this.path,
-  });
-
-  final NasLibraryTag tag;
-  final List<NasLibraryTag> parents;
-  final int directChildCount;
-  final int movieCount;
-  final List<NasLibraryTag> path;
-}
-
-class NasTagChildSummary {
-  const NasTagChildSummary({required this.tag, required this.movieCount});
-
-  final NasLibraryTag tag;
-  final int movieCount;
-}
-
-class NasTagChildPage {
-  const NasTagChildPage({
-    required this.items,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-  });
-
-  final List<NasTagChildSummary> items;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-}
-
-class NasTagMoviePage {
-  const NasTagMoviePage({
-    required this.movieIds,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-  });
-
-  final List<String> movieIds;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-}
-
-/// 结构化影片搜索在数据库内使用的一个标签范围条件。
-class NasMovieSearchTagCondition {
-  const NasMovieSearchTagCondition({
-    required this.group,
-    required this.tagId,
-    required this.includeDescendants,
-  });
-
-  final String group;
-  final String tagId;
-  final bool includeDescendants;
-}
-
-class NasMovieSearchFilter {
-  const NasMovieSearchFilter({
-    required this.query,
-    required this.categoryId,
-    this.categoryIds = const {},
-    this.seriesIds = const {},
-    this.publisherIds = const {},
-    this.actorIds = const {},
-    this.isFavorite,
-    required this.resolutions,
-    required this.watchStates,
-    required this.sort,
-    required this.order,
-    required this.page,
-    required this.pageSize,
-    required this.tagConditions,
-  });
-
-  final String query;
-  final String? categoryId;
-  final Set<String> categoryIds;
-  final Set<String> seriesIds;
-  final Set<String> publisherIds;
-  final Set<String> actorIds;
-  final bool? isFavorite;
-  final Set<String> resolutions;
-  final Set<String> watchStates;
-  final String sort;
-  final String order;
-  final int page;
-  final int pageSize;
-  final List<NasMovieSearchTagCondition> tagConditions;
-
-  Set<String> get effectiveCategoryIds => {
-        ...categoryIds,
-        if (categoryId != null) categoryId!,
-      };
-
-  bool get hasEntityConditions =>
-      effectiveCategoryIds.isNotEmpty ||
-      seriesIds.isNotEmpty ||
-      publisherIds.isNotEmpty ||
-      actorIds.isNotEmpty;
-}
-
-class NasMovieSearchPage {
-  const NasMovieSearchPage({
-    required this.items,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-  });
-
-  final List<NasLibraryMovie> items;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-}
-
-/// 只读搜索目录的一级节点，不复用含管理资料的标签管理 DTO。
-class NasMovieSearchTagDirectoryRoot {
-  const NasMovieSearchTagDirectoryRoot({
-    required this.tag,
-    required this.movieCount,
-    required this.children,
-  });
-
-  final NasLibraryTag tag;
-  final int movieCount;
-  final List<NasMovieSearchTagDirectoryChild> children;
-}
-
-class NasMovieSearchTagDirectoryChild {
-  const NasMovieSearchTagDirectoryChild({
-    required this.tag,
-    required this.movieCount,
-    required this.thirdLevelCount,
-  });
-
-  final NasLibraryTag tag;
-  final int movieCount;
-  final int thirdLevelCount;
-}
-
-class NasMovieSearchThirdLevelTagPage {
-  const NasMovieSearchThirdLevelTagPage({
-    required this.items,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-  });
-
-  final List<NasTagChildSummary> items;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-}
-
-class NasScanResult {
-  const NasScanResult({
-    required this.scannedFiles,
-    required this.availableEpisodes,
-    this.conflicts = const [],
-    this.removedEpisodes = 0,
-    this.removedMovieIndexes = const [],
-  });
-
-  final int scannedFiles;
-  final int availableEpisodes;
-  final int removedEpisodes;
-  final List<NasRemovedMovieIndex> removedMovieIndexes;
-
-  /// 已跳过的嵌套影集范围，仅返回安全的相对目录标识。
-  final List<String> conflicts;
-}
-
-class NasCarouselImage {
-  const NasCarouselImage({
-    required this.id,
-    required this.movieId,
-    required this.fileName,
-    required this.createdAt,
-  });
-
-  final String id;
-  final String movieId;
-  final String fileName;
-  final String createdAt;
-}
-
-/// NAS 原生演员资料，不依赖任何客户端本地数据库或路径。
-class NasActor {
-  const NasActor({
-    required this.id,
-    required this.profileIdentity,
-    required this.stageName,
-    this.originalName,
-    this.translatedName,
-    required this.aliases,
-    this.gender,
-    this.romanizedName,
-    this.birthDate,
-    this.birthMonth,
-    this.heightCm,
-    this.weightKg,
-    this.measurements,
-    this.bodyType,
-    this.country,
-    this.birthplace,
-    this.cup,
-    this.careerPeriod,
-    this.debutMonth,
-    this.debutDescription,
-    this.accountUrl,
-    this.officialSiteUrl,
-    this.photoAssetId,
-    this.backdropAssetId,
-    required this.publisherIds,
-    required this.movieCount,
-    required this.createdAt,
-    required this.updatedAt,
-    this.archivedAt,
-  });
-
-  final String id;
-  final String profileIdentity;
-  final String? stageName;
-  final String? originalName;
-  final String? translatedName;
-  final List<String> aliases;
-  final String? gender;
-  final String? romanizedName;
-  final String? birthDate;
-  final String? birthMonth;
-  final int? heightCm;
-  final int? weightKg;
-  final String? measurements;
-  final String? bodyType;
-  final String? country;
-  final String? birthplace;
-  final String? cup;
-  final String? careerPeriod;
-  final String? debutMonth;
-  final String? debutDescription;
-  final String? accountUrl;
-  final String? officialSiteUrl;
-  final String? photoAssetId;
-  final String? backdropAssetId;
-  final List<String> publisherIds;
-  final int movieCount;
-  final String createdAt;
-  final String updatedAt;
-  final String? archivedAt;
-}
-
-/// 由 NAS 受管理目录保存的图片资产；文件系统绝对路径从不经 API 暴露。
-class NasManagedAsset {
-  const NasManagedAsset({
-    required this.id,
-    required this.purpose,
-    required this.fileName,
-    required this.mimeType,
-    required this.createdAt,
-  });
-
-  final String id;
-  final String purpose;
-  final String fileName;
-  final String mimeType;
-  final String createdAt;
-}
-
-class NasMdcngActorReset {
-  const NasMdcngActorReset({
-    required this.deletedActors,
-    required this.unlinkedMovieLinks,
-    required this.assets,
-  });
-
-  final int deletedActors;
-  final int unlinkedMovieLinks;
-  final List<NasManagedAsset> assets;
-}
-
-/// 由共同影片关系推导出的合作演员，不能手工写入。
-class NasActorCoactor {
-  const NasActorCoactor({required this.actor, required this.movieCount});
-
-  final NasActor actor;
-  final int movieCount;
-}
-
-/// NAS 原生发行商实体；统计值始终由关联影片和系列即时聚合。
-class NasPublisher {
-  const NasPublisher({
-    required this.id,
-    required this.profileIdentity,
-    required this.displayName,
-    this.originalName,
-    this.countryRegion,
-    this.foundedDate,
-    this.logoAssetId,
-    required this.movieCount,
-    required this.seriesCount,
-    required this.durationMs,
-    required this.createdAt,
-    required this.updatedAt,
-    this.archivedAt,
-  });
-
-  final String id;
-  final String profileIdentity;
-  final String displayName;
-  final String? originalName;
-  final String? countryRegion;
-  final String? foundedDate;
-  final String? logoAssetId;
-  final int movieCount;
-  final int seriesCount;
-  final int? durationMs;
-  final String createdAt;
-  final String updatedAt;
-  final String? archivedAt;
-}
-
-/// NAS 原生系列实体；总集数和总时长不允许客户端手工覆盖。
-class NasSeries {
-  const NasSeries({
-    required this.id,
-    required this.profileIdentity,
-    required this.displayName,
-    this.originalName,
-    this.translatedName,
-    this.publisherId,
-    this.releaseDate,
-    this.posterAssetId,
-    required this.movieCount,
-    required this.episodeCount,
-    required this.durationMs,
-    required this.createdAt,
-    required this.updatedAt,
-    this.archivedAt,
-  });
-
-  final String id;
-  final String profileIdentity;
-  final String displayName;
-  final String? originalName;
-  final String? translatedName;
-
-  /// 新建阶段允许暂不归属发行商，但关联影片前必须补齐。
-  final String? publisherId;
-  final String? releaseDate;
-  final String? posterAssetId;
-  final int movieCount;
-  final int episodeCount;
-  final int? durationMs;
-  final String createdAt;
-  final String updatedAt;
-  final String? archivedAt;
-}
-
-/// 发行商或系列下演员的参演影片数，仅作聚合展示。
-class NasRelatedActor {
-  const NasRelatedActor({required this.actor, required this.movieCount});
-
-  final NasActor actor;
-  final int movieCount;
-}
-
-/// NAS 持久化的 AI 元数据任务；任务结果由 NAS 保存后再由管理员应用。
-class NasAiTask {
-  const NasAiTask({
-    required this.id,
-    required this.movieId,
-    required this.instructions,
-    required this.status,
-    required this.createdAt,
-    this.resultJson,
-    this.errorCode,
-    this.finishedAt,
-  });
-
-  final String id;
-  final String movieId;
-  final String instructions;
-  final String status;
-  final String createdAt;
-  final String? resultJson;
-  final String? errorCode;
-  final String? finishedAt;
-}
-
-/// NAS 自身持久化的播放历史；不包含任何 Windows 本地路径或客户端令牌。
-class NasPlaybackHistoryItem {
-  const NasPlaybackHistoryItem({
-    required this.id,
-    required this.movieId,
-    required this.episodeId,
-    required this.title,
-    this.originalTitle,
-    this.catalogNumber,
-    required this.posterFileName,
-    required this.startedAt,
-    required this.endedAt,
-    required this.endPositionMs,
-    required this.durationMs,
-  });
-
-  final String id;
-  final String movieId;
-  final String episodeId;
-  final String title;
-  final String? originalTitle;
-  final String? catalogNumber;
-  final String? posterFileName;
-  final String startedAt;
-  final String? endedAt;
-  final int? endPositionMs;
-  final int? durationMs;
-}
-
-/// 观影记录查询的全部筛选和排序均由 NAS 执行，客户端只保存当前条件与页码。
-class NasWatchHistoryQuery {
-  const NasWatchHistoryQuery({
-    required this.query,
-    required this.startedOnOrAfter,
-    required this.startedBefore,
-    required this.devicePlatform,
-    required this.sort,
-    required this.order,
-    required this.page,
-    required this.pageSize,
-  });
-
-  final String query;
-  final String? startedOnOrAfter;
-  final String? startedBefore;
-  final String? devicePlatform;
-  final String sort;
-  final String order;
-  final int page;
-  final int pageSize;
-}
-
-/// 一次正式播放对应一条稳定记录，始终同时保存逻辑影视和具体分集身份。
-class NasWatchHistoryRecord {
-  const NasWatchHistoryRecord({
-    required this.recordId,
-    required this.movieId,
-    required this.episodeId,
-    required this.title,
-    required this.episodeTitle,
-    required this.startedAt,
-    required this.lastReportedAt,
-    required this.watchDurationMs,
-    required this.lastPositionMs,
-    required this.durationMs,
-    required this.status,
-    required this.deviceId,
-    required this.devicePlatform,
-    this.originalTitle,
-    this.catalogNumber,
-    this.posterFileName,
-    this.sourceName,
-    this.endedAt,
-  });
-
-  final String recordId;
-  final String movieId;
-  final String episodeId;
-  final String title;
-  final String episodeTitle;
-  final String startedAt;
-  final String lastReportedAt;
-  final int watchDurationMs;
-  final int lastPositionMs;
-  final int? durationMs;
-  final String status;
-  final String deviceId;
-  final String devicePlatform;
-  final String? originalTitle;
-  final String? catalogNumber;
-  final String? posterFileName;
-  final String? sourceName;
-  final String? endedAt;
-}
-
-class NasWatchHistoryStats {
-  const NasWatchHistoryStats({
-    required this.recordCount,
-    required this.watchDurationMs,
-    required this.continueCount,
-    required this.activeDeviceCount,
-  });
-
-  final int recordCount;
-  final int watchDurationMs;
-  final int continueCount;
-  final int activeDeviceCount;
-}
-
-class NasWatchHistoryPage {
-  const NasWatchHistoryPage({
-    required this.items,
-    required this.number,
-    required this.size,
-    required this.total,
-    required this.hasMore,
-    required this.stats,
-    required this.continueItems,
-    required this.deviceCounts,
-  });
-
-  final List<NasWatchHistoryRecord> items;
-  final int number;
-  final int size;
-  final int total;
-  final bool hasMore;
-  final NasWatchHistoryStats stats;
-  final List<NasWatchHistoryRecord> continueItems;
-  final Map<String, int> deviceCounts;
-}
-
-/// NAS 为一个影视条目统一计算的续播目标，始终指向具体分集。
-class NasPlaybackResumeTarget {
-  const NasPlaybackResumeTarget({
-    required this.episodeId,
-    required this.positionMs,
-  });
-
-  final String episodeId;
-  final int positionMs;
-}
-
-/// 单个分集持久化的续播进度；位置和总时长必须成对读取，避免续播会话
-/// 使用了旧的媒体探测时长。
-class NasEpisodePlaybackProgress {
-  const NasEpisodePlaybackProgress({
-    required this.positionMs,
-    required this.durationMs,
-  });
-
-  final int positionMs;
-  final int durationMs;
-}
-
-/// 单次 MDCNG 确认导入的审计记录；不保存 NFO 原文或外部 URL。
-class NasMdcngImportRecord {
-  const NasMdcngImportRecord({
-    required this.id,
-    required this.movieId,
-    required this.episodeId,
-    required this.nfoFileName,
-    required this.nfoContentHash,
-    required this.appliedFieldKeys,
-    required this.createdAt,
-  });
-
-  final String id;
-  final String movieId;
-  final String episodeId;
-  final String nfoFileName;
-  final String nfoContentHash;
-  final List<String> appliedFieldKeys;
-  final String createdAt;
-}
-
-/// Audit entry for a single confirmed MDCNG actor import.  It stores only
-/// stable ids and field names; no source paths, credentials, or raw database
-/// content are persisted.
-class NasMdcngActorImportRecord {
-  const NasMdcngActorImportRecord({
-    required this.id,
-    required this.actorId,
-    required this.sourceId,
-    required this.taskId,
-    required this.embyId,
-    required this.sourceFingerprint,
-    required this.appliedFields,
-    required this.createdAt,
-  });
-
-  final String id;
-  final String actorId;
-  final String sourceId;
-  final String taskId;
-  final String embyId;
-  final String sourceFingerprint;
-  final List<String> appliedFields;
-  final String createdAt;
-}
-
-/// 某个影片字段最近一次确认的来源。无记录即为旧数据或来源未知。
-class NasMovieMetadataFieldSource {
-  const NasMovieMetadataFieldSource({
-    required this.fieldKey,
-    required this.sourceKind,
-    this.importRecordId,
-    this.sourceContentHash,
-    required this.updatedAt,
-  });
-
-  final String fieldKey;
-  final String sourceKind;
-  final String? importRecordId;
-  final String? sourceContentHash;
-  final String updatedAt;
-}
-
-class NasMdcngMetadataApply {
-  const NasMdcngMetadataApply({
-    required this.movieId,
-    required this.episodeId,
-    required this.nfoFileName,
-    required this.nfoContentHash,
-    required this.fieldKeys,
-    this.title,
-    this.originalTitle,
-    this.catalogNumber,
-    this.summary,
-    this.actorIds,
-    this.tagIds,
-    this.posterFileName,
-    this.fanartFileName,
-  });
-
-  final String movieId;
-  final String episodeId;
-  final String nfoFileName;
-  final String nfoContentHash;
-  final List<String> fieldKeys;
-  final String? title;
-  final String? originalTitle;
-  final String? catalogNumber;
-  final String? summary;
-  final List<String>? actorIds;
-  final List<String>? tagIds;
-  final String? posterFileName;
-  final String? fanartFileName;
-}
+String _normalizeCatalogNumber(String value) => normalizeCatalogNumber(value);
 
 class NasLibraryDatabase {
-  static const currentSchemaVersion = 34;
-  static const _metadataFieldKeys = {
-    'title',
-    'originalTitle',
-    'catalogNumber',
-    'summary',
-    'actors',
-    'tags',
-    'poster',
-    'fanart',
-    'publisher',
-    'series',
-    'category',
-  };
+  static const currentSchemaVersion = NasSchemaRepository.currentSchemaVersion;
 
   NasLibraryDatabase(this.dataDir);
+
+  late final _schema = NasSchemaRepository(() => _db);
+
+  late final _scan = NasScanRepository(
+    () => _db,
+    carouselImagesForMovie: carouselImagesForMovie,
+    findCategory: findCategory,
+    findMovieForAdmin: findMovieForAdmin,
+    mediaSourcesForCategory: mediaSourcesForCategory,
+    transaction: transaction,
+  );
+
+  late final _queries = NasQueriesRepository(
+    () => _db,
+    actorsForMovie: actorsForMovie,
+    findCategory: findCategory,
+  );
+
+  late final _profiles = NasProfilesRepository(
+    () => _db,
+    tagsForRelation: _tagsForRelation,
+    findManagedAsset: findManagedAsset,
+    findMovieForAdmin: findMovieForAdmin,
+    listMovies: listMovies,
+    markScrapeManual: (kind, id, fields) => markScrapeManual(kind, id, fields),
+    movieCompanies: (movieId) => movieCompanies(movieId),
+    reconcileScrapeActorMovies: ([actorId]) =>
+        reconcileScrapeActorMovies(actorId),
+  );
+
+  late final _assets = NasAssetsRepository(
+    () => _db,
+    findMovieForAdmin: findMovieForAdmin,
+  );
+
+  late final _metadata = NasMetadataRepository(
+    () => _db,
+    findActor: findActor,
+    findEpisode: findEpisode,
+    findMovieForAdmin: findMovieForAdmin,
+    findTag: findTag,
+    recordGalleryOrigin: (imageId, kind) => recordGalleryOrigin(imageId, kind),
+  );
+
+  late final _movies = NasMoviesRepository(
+    () => _db,
+    findEpisode: findEpisode,
+    findMovie: findMovie,
+    findMovieForAdmin: findMovieForAdmin,
+    transaction: transaction,
+  );
+
+  late final _collections = NasCollectionsRepository(
+    () => _db,
+    episodeGrouping: _episodeGrouping,
+    movieIdForScannedEpisode: _movieIdForScannedEpisode,
+    carouselImagesForMovie: carouselImagesForMovie,
+    findCategory: findCategory,
+    findMovieForAdmin: findMovieForAdmin,
+    listCategories: listCategories,
+    dataDir: dataDir,
+  );
+
+  late final _taxonomy = NasTaxonomyRepository(
+    () => _db,
+    removeMovieIndex: _removeMovieIndex,
+    findMediaRoot: findMediaRoot,
+    findMovieForAdmin: findMovieForAdmin,
+    listMediaRoots: listMediaRoots,
+    transaction: transaction,
+  );
+
+  late final _playback = NasPlaybackRepository(() => _db);
 
   final String dataDir;
   Database? _database;
@@ -1081,28 +144,37 @@ class NasLibraryDatabase {
   void _initializeRevisions() {
     _revisionEpoch = newUuidV4();
     _db.execute('PRAGMA temp_store=MEMORY');
-    _db.execute('CREATE TEMP TABLE resource_revisions (kind TEXT PRIMARY KEY, value INTEGER NOT NULL)');
+    _db.execute(
+        'CREATE TEMP TABLE resource_revisions (kind TEXT PRIMARY KEY, value INTEGER NOT NULL)');
     for (final kind in ['library', 'taxonomy', 'watch', 'artwork']) {
       _db.execute('INSERT INTO resource_revisions VALUES (?, 0)', [kind]);
     }
-    final tables = _db.select("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
+    final tables = _db.select(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
     for (final row in tables) {
       final table = row['name'] as String;
       if (!RegExp(r'^[a-z_]+$').hasMatch(table)) continue;
-      final kind = table.contains('playback') ? 'watch'
-          : table.contains('tag') || table == 'library_categories' || table == 'category_media_sources' ? 'taxonomy'
-          : table.contains('asset') || table == 'movie_carousel_images' ? 'artwork'
-          : 'library';
+      final kind = table.contains('playback')
+          ? 'watch'
+          : table.contains('tag') ||
+                  table == 'library_categories' ||
+                  table == 'category_media_sources'
+              ? 'taxonomy'
+              : table.contains('asset') || table == 'movie_carousel_images'
+                  ? 'artwork'
+                  : 'library';
       for (final operation in ['INSERT', 'UPDATE', 'DELETE']) {
-        _db.execute("CREATE TEMP TRIGGER revision_${table}_$operation AFTER $operation ON main.$table BEGIN UPDATE resource_revisions SET value=value+1 WHERE kind='$kind'; END");
+        _db.execute(
+            "CREATE TEMP TRIGGER revision_${table}_$operation AFTER $operation ON main.$table BEGIN UPDATE resource_revisions SET value=value+1 WHERE kind='$kind'; END");
       }
     }
   }
 
   Map<String, String> get revisions => {
-    for (final row in _db.select('SELECT kind, value FROM resource_revisions'))
-      row['kind'] as String: '$_revisionEpoch:${row['value']}',
-  };
+        for (final row
+            in _db.select('SELECT kind, value FROM resource_revisions'))
+          row['kind'] as String: '$_revisionEpoch:${row['value']}',
+      };
 
   T transaction<T>(T Function() action) {
     _db.execute('SAVEPOINT storage_batch');
@@ -1139,902 +211,31 @@ class NasLibraryDatabase {
     _db.execute("VACUUM INTO '$escapedPath'");
   }
 
-  void _migrate() {
-    _db.execute('''
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      );
-    ''');
-    final current = _db
-            .select('SELECT MAX(version) AS version FROM schema_migrations')
-            .first['version'] as int? ??
-        0;
-    if (current > currentSchemaVersion) {
-      throw StateError(
-        'Unsupported database schema version $current; '
-        'this service supports up to $currentSchemaVersion.',
-      );
-    }
-    if (current < 1) {
-      _db.execute('''
-      CREATE TABLE media_roots (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        container_path TEXT NOT NULL UNIQUE,
-        read_only INTEGER NOT NULL,
-        enabled INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE movies (
-        id TEXT PRIMARY KEY,
-        title TEXT NOT NULL,
-        summary TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE episodes (
-        id TEXT PRIMARY KEY,
-        movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-        media_root_id TEXT NOT NULL REFERENCES media_roots(id),
-        title TEXT NOT NULL,
-        relative_path TEXT NOT NULL,
-        duration_ms INTEGER,
-        file_size INTEGER NOT NULL,
-        is_available INTEGER NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(media_root_id, relative_path)
-      );
-      CREATE INDEX episodes_movie_id_idx ON episodes(movie_id);
-      CREATE INDEX episodes_root_path_idx ON episodes(media_root_id, relative_path);
-    ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [1, _now()],
-      );
-    }
-    if (current < 2) {
-      _db.execute('ALTER TABLE media_roots ADD COLUMN last_scanned_at TEXT');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [2, _now()],
-      );
-    }
-    if (current < 3) {
-      _db.execute('''
-        CREATE TABLE library_categories (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL UNIQUE,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        CREATE TABLE tags (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL UNIQUE,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        CREATE TABLE tag_placements (
-          id TEXT PRIMARY KEY,
-          tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-          parent_placement_id TEXT REFERENCES tag_placements(id) ON DELETE CASCADE,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE(tag_id, parent_placement_id)
-        );
-        CREATE TABLE movie_tag_placements (
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          tag_placement_id TEXT NOT NULL REFERENCES tag_placements(id) ON DELETE CASCADE,
-          PRIMARY KEY(movie_id, tag_placement_id)
-        );
-        ALTER TABLE movies ADD COLUMN category_id TEXT REFERENCES library_categories(id) ON DELETE SET NULL;
-        CREATE INDEX movies_category_id_idx ON movies(category_id);
-        CREATE INDEX tag_placements_tag_id_idx ON tag_placements(tag_id);
-        CREATE INDEX tag_placements_parent_id_idx ON tag_placements(parent_placement_id);
-        CREATE INDEX movie_tag_placements_placement_idx ON movie_tag_placements(tag_placement_id);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [3, _now()],
-      );
-    }
-    if (current < 4) {
-      _db.execute('ALTER TABLE movies ADD COLUMN poster_file_name TEXT');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [4, _now()],
-      );
-    }
-    if (current < 5) {
-      _db.execute('ALTER TABLE episodes ADD COLUMN video_width INTEGER');
-      _db.execute('ALTER TABLE episodes ADD COLUMN video_height INTEGER');
-      _db.execute('ALTER TABLE episodes ADD COLUMN resolution_label TEXT');
-      _db.execute('ALTER TABLE episodes ADD COLUMN media_modified_at INTEGER');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [5, _now()],
-      );
-    }
-    if (current < 6) {
-      _db.execute('''
-        ALTER TABLE library_categories ADD COLUMN media_relative_path TEXT;
-        CREATE UNIQUE INDEX library_categories_media_relative_path_idx
-          ON library_categories(media_relative_path)
-          WHERE media_relative_path IS NOT NULL;
-        -- The previous global-root scan has no safe category assignment.
-        -- Its metadata is intentionally reset; the read-only media mount is
-        -- never touched and categories/tags are retained.
-        DELETE FROM movies;
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [6, _now()],
-      );
-    }
-    if (current < 7) {
-      _db.execute('''
-        CREATE TABLE movie_carousel_images (
-          id TEXT PRIMARY KEY,
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          file_name TEXT NOT NULL UNIQUE,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX movie_carousel_images_movie_id_idx
-          ON movie_carousel_images(movie_id, created_at);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [7, _now()],
-      );
-    }
-    if (current < 8) {
-      _db.execute(
-        "ALTER TABLE movies ADD COLUMN actors_json TEXT NOT NULL DEFAULT '[]'",
-      );
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [8, _now()],
-      );
-    }
-    if (current < 9) {
-      _db.execute('''
-        ALTER TABLE movies ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0;
-        CREATE TABLE episode_playback_progress (
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-          position_ms INTEGER NOT NULL,
-          duration_ms INTEGER NOT NULL,
-          updated_at TEXT NOT NULL,
-          PRIMARY KEY(movie_id, episode_id)
-        );
-        CREATE INDEX episode_playback_progress_movie_idx
-          ON episode_playback_progress(movie_id, updated_at);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [9, _now()],
-      );
-    }
-    if (current < 10) {
-      _db.execute('''
-        ALTER TABLE library_categories ADD COLUMN color TEXT;
-        ALTER TABLE tags ADD COLUMN color TEXT;
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [10, _now()],
-      );
-    }
-    if (current < 11) {
-      _db.execute('''
-        CREATE TABLE playback_history (
-          id TEXT PRIMARY KEY,
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
-          started_at TEXT NOT NULL,
-          ended_at TEXT,
-          end_position_ms INTEGER,
-          duration_ms INTEGER
-        );
-        CREATE INDEX playback_history_started_idx
-          ON playback_history(started_at DESC, id DESC);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [11, _now()],
-      );
-    }
-    if (current < 12) {
-      _db.execute('''
-        ALTER TABLE movies ADD COLUMN original_title TEXT;
-        ALTER TABLE movies ADD COLUMN catalog_number TEXT;
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [12, _now()],
-      );
-    }
-    if (current < 13) {
-      // Do not interpret or rewrite the former string-only actor payload.
-      // Actors are NAS-native entities now; legacy movie payloads have no
-      // value and are deliberately left untouched.
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [13, _now()],
-      );
-    }
-    if (current < 14) {
-      _db.execute('''
-        CREATE TABLE managed_assets (
-          id TEXT PRIMARY KEY,
-          purpose TEXT NOT NULL CHECK(purpose IN ('actor_photo', 'movie_poster')),
-          file_name TEXT NOT NULL UNIQUE,
-          mime_type TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE actors (
-          id TEXT PRIMARY KEY,
-          stage_name TEXT,
-          original_name TEXT,
-          translated_name TEXT,
-          aliases_json TEXT NOT NULL DEFAULT '[]',
-          gender TEXT CHECK(gender IN ('female', 'intersex', 'male')),
-          birth_month TEXT,
-          height_cm INTEGER,
-          weight_kg INTEGER,
-          measurements TEXT,
-          body_type TEXT,
-          country TEXT,
-          debut_month TEXT,
-          debut_description TEXT,
-          photo_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
-          publisher_names_json TEXT NOT NULL DEFAULT '[]',
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          archived_at TEXT
-        );
-        CREATE TABLE movie_actor_links (
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
-          PRIMARY KEY(movie_id, actor_id)
-        );
-        CREATE INDEX actors_archived_created_idx ON actors(archived_at, created_at DESC);
-        CREATE INDEX movie_actor_links_actor_idx ON movie_actor_links(actor_id, movie_id);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [14, _now()],
-      );
-    }
-    if (current < 15) {
-      _db.execute('''
-        CREATE TABLE ai_metadata_tasks (
-          id TEXT PRIMARY KEY,
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          instructions TEXT NOT NULL DEFAULT '',
-          status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'succeeded', 'failed')),
-          result_json TEXT,
-          error_code TEXT,
-          created_at TEXT NOT NULL,
-          finished_at TEXT
-        );
-        CREATE INDEX ai_metadata_tasks_movie_created_idx
-          ON ai_metadata_tasks(movie_id, created_at DESC);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [15, _now()],
-      );
-    }
-    if (current < 16) {
-      _db.execute('''
-        ALTER TABLE movies ADD COLUMN publisher_name TEXT;
-        ALTER TABLE movies ADD COLUMN series_name TEXT;
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [16, _now()],
-      );
-    }
-    if (current < 17) {
-      // 旧版资产用途约束无法直接扩展，重建表但保留所有既有资产记录。
-      _db.execute('PRAGMA foreign_keys = OFF');
-      try {
-        _db.execute('''
-          CREATE TABLE managed_assets_v17 (
-            id TEXT PRIMARY KEY,
-            purpose TEXT NOT NULL CHECK(purpose IN (
-              'actor_photo', 'movie_poster', 'publisher_logo', 'series_poster'
-            )),
-            file_name TEXT NOT NULL UNIQUE,
-            mime_type TEXT NOT NULL,
-            created_at TEXT NOT NULL
-          );
-          INSERT INTO managed_assets_v17(id, purpose, file_name, mime_type, created_at)
-            SELECT id, purpose, file_name, mime_type, created_at FROM managed_assets;
-          DROP TABLE managed_assets;
-          ALTER TABLE managed_assets_v17 RENAME TO managed_assets;
-
-          CREATE TABLE publishers (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            original_name TEXT,
-            country_region TEXT,
-            founded_date TEXT,
-            logo_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            archived_at TEXT
-          );
-          CREATE TABLE series (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            original_name TEXT,
-            translated_name TEXT,
-            publisher_id TEXT NOT NULL REFERENCES publishers(id) ON DELETE RESTRICT,
-            release_date TEXT,
-            poster_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            archived_at TEXT
-          );
-          ALTER TABLE movies ADD COLUMN publisher_id TEXT REFERENCES publishers(id) ON DELETE SET NULL;
-          ALTER TABLE movies ADD COLUMN series_id TEXT REFERENCES series(id) ON DELETE SET NULL;
-          CREATE INDEX publishers_archived_created_idx
-            ON publishers(archived_at, created_at DESC);
-          CREATE INDEX series_publisher_archived_created_idx
-            ON series(publisher_id, archived_at, created_at DESC);
-          CREATE INDEX movies_publisher_id_idx ON movies(publisher_id);
-          CREATE INDEX movies_series_id_idx ON movies(series_id);
-
-          CREATE TRIGGER movies_series_publisher_insert
-          BEFORE INSERT ON movies
-          WHEN NEW.series_id IS NOT NULL AND (
-            NEW.publisher_id IS NULL OR
-            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
-          )
-          BEGIN
-            SELECT RAISE(ABORT, 'series_publisher_mismatch');
-          END;
-          CREATE TRIGGER movies_series_publisher_update
-          BEFORE UPDATE OF publisher_id, series_id ON movies
-          WHEN NEW.series_id IS NOT NULL AND (
-            NEW.publisher_id IS NULL OR
-            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
-          )
-          BEGIN
-            SELECT RAISE(ABORT, 'series_publisher_mismatch');
-          END;
-        ''');
-      } finally {
-        _db.execute('PRAGMA foreign_keys = ON');
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [17, _now()],
-      );
-    }
-    if (current < 18) {
-      _db.execute('''
-        CREATE TABLE actor_publisher_links (
-          actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
-          publisher_id TEXT NOT NULL REFERENCES publishers(id) ON DELETE RESTRICT,
-          PRIMARY KEY(actor_id, publisher_id)
-        );
-        CREATE INDEX actor_publisher_links_publisher_idx
-          ON actor_publisher_links(publisher_id, actor_id);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [18, _now()],
-      );
-    }
-    if (current < 19) {
-      // SQLite 不能直接移除 NOT NULL，重建系列表以支持未归属发行商的草稿系列。
-      _db.execute('PRAGMA foreign_keys = OFF');
-      try {
-        _db.execute('''
-          DROP TRIGGER IF EXISTS movies_series_publisher_insert;
-          DROP TRIGGER IF EXISTS movies_series_publisher_update;
-          CREATE TABLE series_v19 (
-            id TEXT PRIMARY KEY,
-            display_name TEXT NOT NULL,
-            original_name TEXT,
-            translated_name TEXT,
-            publisher_id TEXT REFERENCES publishers(id) ON DELETE RESTRICT,
-            release_date TEXT,
-            poster_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            archived_at TEXT
-          );
-          INSERT INTO series_v19(
-            id, display_name, original_name, translated_name, publisher_id,
-            release_date, poster_asset_id, created_at, updated_at, archived_at
-          ) SELECT
-            id, display_name, original_name, translated_name, publisher_id,
-            release_date, poster_asset_id, created_at, updated_at, archived_at
-          FROM series;
-          DROP TABLE series;
-          ALTER TABLE series_v19 RENAME TO series;
-          CREATE INDEX series_publisher_archived_created_idx
-            ON series(publisher_id, archived_at, created_at DESC);
-
-          CREATE TRIGGER movies_series_publisher_insert
-          BEFORE INSERT ON movies
-          WHEN NEW.series_id IS NOT NULL AND (
-            (SELECT publisher_id FROM series WHERE id = NEW.series_id) IS NULL OR
-            NEW.publisher_id IS NULL OR
-            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
-          )
-          BEGIN
-            SELECT RAISE(ABORT, 'series_publisher_mismatch');
-          END;
-          CREATE TRIGGER movies_series_publisher_update
-          BEFORE UPDATE OF publisher_id, series_id ON movies
-          WHEN NEW.series_id IS NOT NULL AND (
-            (SELECT publisher_id FROM series WHERE id = NEW.series_id) IS NULL OR
-            NEW.publisher_id IS NULL OR
-            NEW.publisher_id != (SELECT publisher_id FROM series WHERE id = NEW.series_id)
-          )
-          BEGIN
-            SELECT RAISE(ABORT, 'series_publisher_mismatch');
-          END;
-        ''');
-      } finally {
-        _db.execute('PRAGMA foreign_keys = ON');
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [19, _now()],
-      );
-    }
-    if (current < 20) {
-      // 已获授权：仅清理旧标签定义、路径归属和影片路径关联，绝不触及影片或媒体数据。
-      _db.execute('PRAGMA foreign_keys = OFF');
-      try {
-        _db.execute('''
-          DROP TABLE IF EXISTS movie_tag_placements;
-          DROP TABLE IF EXISTS tag_placements;
-          DROP TABLE IF EXISTS tags;
-
-          CREATE TABLE tags (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            normalized_name TEXT NOT NULL UNIQUE,
-            level INTEGER NOT NULL CHECK(level IN (1, 2, 3)),
-            description TEXT NOT NULL DEFAULT '',
-            color TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            archived_at TEXT
-          );
-          CREATE TABLE tag_parent_links (
-            child_tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
-            parent_tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY(child_tag_id, parent_tag_id),
-            CHECK(child_tag_id != parent_tag_id)
-          );
-          CREATE TABLE movie_tag_links (
-            movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-            tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
-            PRIMARY KEY(movie_id, tag_id)
-          );
-          CREATE INDEX tags_level_active_name_idx
-            ON tags(level, archived_at, name COLLATE NOCASE);
-          CREATE INDEX tag_parent_links_parent_idx
-            ON tag_parent_links(parent_tag_id, child_tag_id);
-          CREATE INDEX movie_tag_links_tag_idx
-            ON movie_tag_links(tag_id, movie_id);
-        ''');
-      } finally {
-        _db.execute('PRAGMA foreign_keys = ON');
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [20, _now()],
-      );
-    }
-    if (current < 21) {
-      // 搜索页的观看状态和首次扫描排序都在 NAS 的全库 SQL 内完成。
-      _db.execute('''
-        CREATE INDEX playback_history_movie_started_idx
-          ON playback_history(movie_id, started_at DESC, id DESC);
-        CREATE INDEX movies_created_id_idx ON movies(created_at DESC, id);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [21, _now()],
-      );
-    }
-    if (current < 22) {
-      // 影集归属和盘状态只保存在 NAS：影片条目不再绑定某个物理盘。
-      _db.execute('''
-        ALTER TABLE media_roots ADD COLUMN is_online INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE movies ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'single'
-          CHECK(entry_type IN ('single', 'series'));
-        ALTER TABLE movies ADD COLUMN collection_key TEXT;
-        ALTER TABLE episodes ADD COLUMN natural_sort_key TEXT NOT NULL DEFAULT '';
-        ALTER TABLE episodes ADD COLUMN manual_order INTEGER;
-
-        CREATE TABLE category_media_sources (
-          id TEXT PRIMARY KEY,
-          category_id TEXT NOT NULL REFERENCES library_categories(id) ON DELETE CASCADE,
-          media_root_id TEXT NOT NULL REFERENCES media_roots(id) ON DELETE RESTRICT,
-          relative_path TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE(category_id, media_root_id, relative_path)
-        );
-        CREATE UNIQUE INDEX movies_collection_key_idx
-          ON movies(collection_key) WHERE collection_key IS NOT NULL;
-        CREATE INDEX category_media_sources_category_idx
-          ON category_media_sources(category_id, media_root_id, relative_path);
-        CREATE INDEX episodes_movie_sort_idx
-          ON episodes(movie_id, manual_order, natural_sort_key, relative_path, id);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [22, _now()],
-      );
-    }
-    if (current < 23) {
-      // 归并来源保留其审计关系和旧引用，但不再参与普通影视或资料统计。
-      _db.execute('''
-        ALTER TABLE movies ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'
-          CHECK(lifecycle_state IN ('active', 'merged'));
-        ALTER TABLE movies ADD COLUMN merged_into_movie_id TEXT
-          REFERENCES movies(id) ON DELETE RESTRICT;
-        ALTER TABLE movies ADD COLUMN merged_at TEXT;
-        CREATE INDEX movies_lifecycle_state_idx
-          ON movies(lifecycle_state, category_id, entry_type);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [23, _now()],
-      );
-    }
-    if (current < 24) {
-      // 在既有 playback_history 上原地扩展，旧记录仍可读取且不产生第二套历史数据。
-      _db.execute('''
-        ALTER TABLE playback_history ADD COLUMN last_reported_at TEXT;
-        ALTER TABLE playback_history ADD COLUMN watch_duration_ms INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE playback_history ADD COLUMN last_position_ms INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE playback_history ADD COLUMN playback_status TEXT NOT NULL DEFAULT 'ended';
-        ALTER TABLE playback_history ADD COLUMN device_id TEXT NOT NULL DEFAULT 'legacy';
-        ALTER TABLE playback_history ADD COLUMN device_platform TEXT NOT NULL DEFAULT 'unknown';
-        UPDATE playback_history
-        SET last_reported_at = COALESCE(ended_at, started_at),
-            last_position_ms = COALESCE(end_position_ms, 0),
-            playback_status = CASE WHEN ended_at IS NULL THEN 'playing' ELSE 'ended' END;
-        CREATE INDEX playback_history_filter_idx
-          ON playback_history(device_platform, started_at DESC, id DESC);
-        CREATE INDEX playback_history_episode_recent_idx
-          ON playback_history(episode_id, last_reported_at DESC, id DESC);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [24, _now()],
-      );
-    }
-    if (current < 25) {
-      final hasMoviesTable = _db
-          .select(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'movies'",
-          )
-          .isNotEmpty;
-      if (hasMoviesTable) {
-        _db.execute('''
-          ALTER TABLE movies ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0;
-          CREATE INDEX movies_favorite_active_idx
-            ON movies(is_favorite, lifecycle_state, updated_at DESC, id);
-        ''');
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [25, _now()],
-      );
-    }
-    if (current < 26) {
-      _db.execute('''
-        ALTER TABLE actors ADD COLUMN profile_identity TEXT;
-        ALTER TABLE publishers ADD COLUMN profile_identity TEXT;
-        ALTER TABLE series ADD COLUMN profile_identity TEXT;
-        UPDATE actors SET profile_identity = id WHERE profile_identity IS NULL;
-        UPDATE publishers SET profile_identity = id WHERE profile_identity IS NULL;
-        UPDATE series SET profile_identity = id WHERE profile_identity IS NULL;
-        CREATE UNIQUE INDEX actors_profile_identity_idx
-          ON actors(profile_identity);
-        CREATE UNIQUE INDEX publishers_profile_identity_idx
-          ON publishers(profile_identity);
-        CREATE UNIQUE INDEX series_profile_identity_idx
-          ON series(profile_identity);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [26, _now()],
-      );
-    }
-    if (current < 27) {
-      // 只存导入审计与字段来源，不保存 NFO 原文、原始文件路径或外部链接。
-      _db.execute('''
-        CREATE TABLE mdcng_import_records (
-          id TEXT PRIMARY KEY,
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          episode_id TEXT NOT NULL REFERENCES episodes(id) ON DELETE RESTRICT,
-          nfo_file_name TEXT NOT NULL,
-          nfo_content_hash TEXT NOT NULL,
-          applied_fields_json TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        );
-        CREATE INDEX mdcng_import_records_movie_created_idx
-          ON mdcng_import_records(movie_id, created_at DESC, id DESC);
-        CREATE INDEX mdcng_import_records_episode_hash_idx
-          ON mdcng_import_records(episode_id, nfo_content_hash);
-
-        CREATE TABLE movie_metadata_field_sources (
-          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
-          field_key TEXT NOT NULL,
-          source_kind TEXT NOT NULL CHECK(source_kind IN ('manual', 'mdcng')),
-          import_record_id TEXT REFERENCES mdcng_import_records(id)
-            ON DELETE SET NULL,
-          source_content_hash TEXT,
-          updated_at TEXT NOT NULL,
-          PRIMARY KEY(movie_id, field_key)
-        );
-        CREATE INDEX movie_metadata_field_sources_record_idx
-          ON movie_metadata_field_sources(import_record_id);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [27, _now()],
-      );
-    }
-    if (current < 28) {
-      // MDCNG actor imports retain all selected actor fields in the NAS-owned
-      // database.  Source files remain read-only and are never referenced by
-      // stored actor rows after confirmation.
-      _db.execute('PRAGMA foreign_keys = OFF');
-      try {
-        _db.execute('''
-          CREATE TABLE managed_assets_v28 (
-            id TEXT PRIMARY KEY,
-            purpose TEXT NOT NULL CHECK(purpose IN (
-              'actor_photo', 'actor_backdrop', 'movie_poster',
-              'publisher_logo', 'series_poster'
-            )),
-            file_name TEXT NOT NULL UNIQUE,
-            mime_type TEXT NOT NULL,
-            created_at TEXT NOT NULL
-          );
-          INSERT INTO managed_assets_v28(id, purpose, file_name, mime_type, created_at)
-            SELECT id, purpose, file_name, mime_type, created_at FROM managed_assets;
-          DROP TABLE managed_assets;
-          ALTER TABLE managed_assets_v28 RENAME TO managed_assets;
-
-          ALTER TABLE actors ADD COLUMN romanized_name TEXT;
-          ALTER TABLE actors ADD COLUMN birth_date TEXT;
-          ALTER TABLE actors ADD COLUMN birthplace TEXT;
-          ALTER TABLE actors ADD COLUMN cup TEXT;
-          ALTER TABLE actors ADD COLUMN career_period TEXT;
-          ALTER TABLE actors ADD COLUMN account_url TEXT;
-          ALTER TABLE actors ADD COLUMN official_site_url TEXT;
-          ALTER TABLE actors ADD COLUMN backdrop_asset_id TEXT
-            REFERENCES managed_assets(id) ON DELETE SET NULL;
-
-          CREATE TABLE mdcng_actor_source_links (
-            source_id TEXT NOT NULL,
-            emby_id TEXT NOT NULL,
-            actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
-            source_name TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY(source_id, emby_id)
-          );
-          CREATE INDEX mdcng_actor_source_links_actor_idx
-            ON mdcng_actor_source_links(actor_id);
-
-          CREATE TABLE mdcng_actor_import_records (
-            id TEXT PRIMARY KEY,
-            actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
-            source_id TEXT NOT NULL,
-            task_id TEXT NOT NULL,
-            emby_id TEXT NOT NULL,
-            source_fingerprint TEXT NOT NULL,
-            applied_fields_json TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(source_id, task_id, source_fingerprint)
-          );
-          CREATE INDEX mdcng_actor_import_records_actor_created_idx
-            ON mdcng_actor_import_records(actor_id, created_at DESC, id DESC);
-        ''');
-      } finally {
-        _db.execute('PRAGMA foreign_keys = ON');
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [28, _now()],
-      );
-    }
-    if (current < 29) {
-      // A profile key is a SHA-256 derived by the NAS from MDCNG's stable
-      // Actress.db href.  It lets a user-confirmed translated/native name
-      // mapping participate in later batch runs without storing source URLs.
-      _db.execute('''
-        ALTER TABLE mdcng_actor_source_links ADD COLUMN profile_key TEXT;
-        CREATE INDEX mdcng_actor_source_links_profile_key_idx
-          ON mdcng_actor_source_links(source_id, profile_key);
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [29, _now()],
-      );
-    }
-    if (current < 30) {
-      // A failed ffprobe is still a completed attempt. Without this marker an
-      // unsupported or damaged file would be probed on every later scan.
-      final hasEpisodesTable = _db
-          .select(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'episodes'",
-          )
-          .isNotEmpty;
-      if (hasEpisodesTable) {
-        final episodeColumns = _db
-            .select('PRAGMA table_info(episodes)')
-            .map((row) => row['name'] as String)
-            .toSet();
-        _db.execute('ALTER TABLE episodes ADD COLUMN metadata_probed_at TEXT');
-        if (episodeColumns.containsAll({
-          'updated_at',
-          'duration_ms',
-          'video_width',
-          'video_height',
-        })) {
-          _db.execute('''
-            UPDATE episodes
-            SET metadata_probed_at = updated_at
-            WHERE duration_ms IS NOT NULL
-               OR video_width IS NOT NULL
-               OR video_height IS NOT NULL
-          ''');
-        }
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [30, _now()],
-      );
-    }
-    if (current < 31) {
-      migrateNovelSchema(_db);
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [31, _now()],
-      );
-    }
-    if (current < 32) {
-      _db.execute('''
-        CREATE TABLE mdcng_actor_deferred (
-          source_id TEXT NOT NULL,
-          emby_id TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          PRIMARY KEY(source_id, emby_id)
-        );
-      ''');
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [32, _now()],
-      );
-    }
-    if (current < 33) {
-      // Distinct MDCNG tasks may create actors with the same name. Keep every
-      // import audit row, including later updates from the same task.
-      _db.execute('PRAGMA foreign_keys = OFF');
-      try {
-        _db.execute('''
-          CREATE TABLE mdcng_actor_import_records_v33 (
-            id TEXT PRIMARY KEY,
-            actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE CASCADE,
-            source_id TEXT NOT NULL,
-            task_id TEXT NOT NULL,
-            emby_id TEXT NOT NULL,
-            source_fingerprint TEXT NOT NULL,
-            applied_fields_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-          );
-          INSERT INTO mdcng_actor_import_records_v33(
-            id, actor_id, source_id, task_id, emby_id, source_fingerprint,
-            applied_fields_json, created_at
-          )
-          SELECT id, actor_id, source_id, task_id, emby_id, source_fingerprint,
-                 applied_fields_json, created_at
-          FROM mdcng_actor_import_records;
-          DROP TABLE mdcng_actor_import_records;
-          ALTER TABLE mdcng_actor_import_records_v33
-            RENAME TO mdcng_actor_import_records;
-          CREATE INDEX mdcng_actor_import_records_actor_created_idx
-            ON mdcng_actor_import_records(actor_id, created_at DESC, id DESC);
-        ''');
-      } finally {
-        _db.execute('PRAGMA foreign_keys = ON');
-      }
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [33, _now()],
-      );
-    }
-    if (current < 34) {
-      ContentFileNames.createSchema(_db);
-      _db.execute(
-        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
-        [34, _now()],
-      );
-    }
-  }
+  void _migrate() => _schema.migrate();
 
   NasMediaRoot ensureConfiguredMediaRoot({
     required String rootName,
     required String containerPath,
-  }) {
-    final existing = _db.select(
-      'SELECT id FROM media_roots WHERE container_path = ?',
-      [containerPath],
-    );
-    final timestamp = _now();
-    if (existing.isEmpty) {
-      _db.execute(
-        '''INSERT INTO media_roots(
-          id, name, container_path, read_only, enabled, created_at, updated_at
-        ) VALUES (?, ?, ?, 1, 1, ?, ?)''',
-        [newUuidV4(), rootName, containerPath, timestamp, timestamp],
-      );
-    } else {
-      _db.execute(
-        '''UPDATE media_roots
-           SET name = ?, read_only = 1, enabled = 1, updated_at = ?
-           WHERE id = ?''',
-        [rootName, timestamp, existing.first['id']],
-      );
-    }
-    final root = _mediaRootForContainerPath(containerPath)!;
-    _backfillLegacyCategorySources(root.id);
-    return root;
-  }
+  }) =>
+      _scan.ensureConfiguredMediaRoot(
+          rootName: rootName, containerPath: containerPath);
 
-  List<NasMediaRoot> listMediaRoots() {
-    final rows = _db.select('''
-      SELECT id, name, container_path, read_only, enabled, created_at,
-             updated_at, last_scanned_at, is_online
-      FROM media_roots ORDER BY created_at
-    ''');
-    return rows.map(_mapMediaRoot).toList(growable: false);
-  }
+  List<NasMediaRoot> listMediaRoots() => _scan.listMediaRoots();
 
-  NasMediaRoot? findMediaRoot(String mediaRootId) {
-    final rows = _db.select('''
-      SELECT id, name, container_path, read_only, enabled, created_at,
-             updated_at, last_scanned_at, is_online
-      FROM media_roots WHERE id = ?
-    ''', [mediaRootId]);
-    return rows.isEmpty ? null : _mapMediaRoot(rows.single);
-  }
+  NasMediaRoot? findMediaRoot(String mediaRootId) =>
+      _scan.findMediaRoot(mediaRootId);
 
   Future<NasScanResult> scanConfiguredRoot({
     required String rootName,
     required String containerPath,
     required NasMediaService mediaService,
     NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
-  }) async {
-    final root = ensureConfiguredMediaRoot(
-      rootName: rootName,
-      containerPath: containerPath,
-    );
-    return scanMediaRoot(
-      mediaRootId: root.id,
-      mediaService: mediaService,
-      metadataProbe: metadataProbe,
-    );
-  }
+  }) =>
+      _scan.scanConfiguredRoot(
+          rootName: rootName,
+          containerPath: containerPath,
+          mediaService: mediaService,
+          metadataProbe: metadataProbe);
 
   Future<NasScanResult> scanMediaRoot({
     required String mediaRootId,
@@ -2042,133 +243,13 @@ class NasLibraryDatabase {
     String? categoryId,
     String? directoryRelativePath,
     NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
-  }) async {
-    final configuredRoot = findMediaRoot(mediaRootId);
-    if (configuredRoot == null || !configuredRoot.enabled) {
-      throw ArgumentError.value(mediaRootId, 'mediaRootId', 'is not enabled');
-    }
-    if (configuredRoot.containerPath != mediaService.mediaDir) {
-      throw StateError(
-          'Only the configured media service root can be scanned.');
-    }
-    if ((categoryId == null) != (directoryRelativePath == null)) {
-      throw ArgumentError(
-          'Category scan requires both category and directory.');
-    }
-    final rootId = configuredRoot.id;
-    final root = directoryRelativePath == null
-        ? Directory(configuredRoot.containerPath)
-        : (await mediaService.directoryForRelativePath(directoryRelativePath))
-            ?.directory;
-    if (root == null) {
-      _markRootOffline(rootId);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    if (!await root.exists()) {
-      _markRootOffline(rootId);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    if (categoryId == null) {
-      _db.execute(
-        'UPDATE episodes SET is_available = 0, updated_at = ? WHERE media_root_id = ?',
-        [_now(), rootId],
-      );
-    } else {
-      _db.execute('''
-        UPDATE episodes SET is_available = 0, updated_at = ?
-        WHERE movie_id IN (SELECT id FROM movies WHERE category_id = ?)
-      ''', [_now(), categoryId]);
-    }
-    // `followLinks: false` guarantees that a listed [File] is not a symbolic
-    // link. Deriving the relative path from this already-enumerated directory
-    // avoids resolving the media root and every file again, which is very
-    // expensive on a mounted NAS volume.
-    final listedRoot = root.absolute.path;
-    final prefix = listedRoot.endsWith(Platform.pathSeparator)
-        ? listedRoot
-        : '$listedRoot${Platform.pathSeparator}';
-    var scannedFiles = 0;
-    await for (final entity in root.list(recursive: true, followLinks: false)) {
-      if (entity is! File || !_isVideo(entity.path)) continue;
-      final listedFile = entity.absolute.path;
-      if (!listedFile.startsWith(prefix)) continue;
-      final scannedRelativePath = listedFile
-          .substring(prefix.length)
-          .replaceAll(Platform.pathSeparator, '/');
-      final relativePath = directoryRelativePath == null
-          ? scannedRelativePath
-          : '$directoryRelativePath/$scannedRelativePath';
-      final checkedFile = NasMediaFile(File(listedFile), relativePath);
-      final stat = await checkedFile.file.stat();
-      final mediaModifiedAt = stat.modified.microsecondsSinceEpoch;
-      final existing = _db.select(
-        'SELECT file_size, media_modified_at, duration_ms, video_width, video_height, resolution_label, metadata_probed_at FROM episodes WHERE media_root_id = ? AND relative_path = ?',
-        [rootId, relativePath],
-      );
-      final fileSize = stat.size;
-      final unchanged = existing.isNotEmpty &&
-          existing.first['file_size'] == fileSize &&
-          existing.first['media_modified_at'] == mediaModifiedAt &&
-          existing.first['metadata_probed_at'] != null;
-      NasMediaMetadata? metadata;
-      if (!unchanged) {
-        metadata = await metadataProbe.probe(checkedFile);
-      }
-      final movieId =
-          'movie-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
-      final episodeId =
-          'episode-${sha256Hex('$rootId:$relativePath').substring(0, 24)}';
-      final title = _titleFromPath(relativePath);
-      final timestamp = _now();
-      _db.execute(
-        categoryId == null
-            ? '''
-              INSERT INTO movies(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)
-              ON CONFLICT(id) DO NOTHING
-            '''
-            : '''
-              INSERT INTO movies(id, title, category_id, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?)
-              ON CONFLICT(id) DO UPDATE SET category_id = excluded.category_id
-            ''',
-        categoryId == null
-            ? [movieId, title, timestamp, timestamp]
-            : [movieId, title, categoryId, timestamp, timestamp],
-      );
-      _db.execute('''
-        INSERT INTO episodes(id, movie_id, media_root_id, title, relative_path, duration_ms, video_width, video_height, resolution_label, metadata_probed_at, media_modified_at, file_size, is_available, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-        ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
-          duration_ms = excluded.duration_ms,
-          video_width = excluded.video_width,
-          video_height = excluded.video_height,
-          resolution_label = excluded.resolution_label,
-          metadata_probed_at = excluded.metadata_probed_at,
-          media_modified_at = excluded.media_modified_at,
-          file_size = excluded.file_size, is_available = 1, updated_at = excluded.updated_at
-      ''', [
-        episodeId,
-        movieId,
-        rootId,
-        title,
-        relativePath,
-        unchanged ? existing.first['duration_ms'] : metadata?.durationMs,
-        unchanged ? existing.first['video_width'] : metadata?.width,
-        unchanged ? existing.first['video_height'] : metadata?.height,
-        unchanged
-            ? existing.first['resolution_label']
-            : metadata?.resolutionLabel,
-        unchanged ? existing.first['metadata_probed_at'] : timestamp,
-        mediaModifiedAt,
-        fileSize,
-        timestamp,
-      ]);
-      scannedFiles++;
-    }
-    _markRootScanned(rootId);
-    return NasScanResult(
-        scannedFiles: scannedFiles, availableEpisodes: scannedFiles);
-  }
+  }) =>
+      _scan.scanMediaRoot(
+          mediaRootId: mediaRootId,
+          mediaService: mediaService,
+          categoryId: categoryId,
+          directoryRelativePath: directoryRelativePath,
+          metadataProbe: metadataProbe);
 
   Future<NasScanResult> scanCategory({
     required String categoryId,
@@ -2176,416 +257,26 @@ class NasLibraryDatabase {
     required String mediaRootId,
     required NasMediaService mediaService,
     NasMediaMetadataProbe metadataProbe = const NasMediaMetadataProbe(),
-  }) async {
-    final category = findCategory(categoryId);
-    if (category == null) {
-      throw ArgumentError.value(
-          categoryId, 'categoryId', 'has no media directory');
-    }
-    final sources = mediaSourcesForCategory(categoryId);
-    if (sources.isEmpty) {
-      final directoryRelativePath = category.mediaRelativePath;
-      if (directoryRelativePath == null || directoryRelativePath.isEmpty) {
-        throw ArgumentError.value(
-            categoryId, 'categoryId', 'has no media directory');
-      }
-      return scanMediaRoot(
-        mediaRootId: mediaRootId,
-        mediaService: mediaService,
-        categoryId: categoryId,
-        directoryRelativePath: directoryRelativePath,
-        metadataProbe: metadataProbe,
-      );
-    }
-    var scannedFiles = 0;
-    var availableEpisodes = 0;
-    final conflicts = <String>[];
-    for (final source in sources) {
-      final result = await _scanCategorySource(
-        categoryId: categoryId,
-        beforeFile: beforeFile,
-        source: source,
-        mediaService: mediaService,
-        metadataProbe: metadataProbe,
-      );
-      scannedFiles += result.scannedFiles;
-      availableEpisodes += result.availableEpisodes;
-      conflicts.addAll(result.conflicts);
-    }
-    // 扫描期间绑定被直接修改时不执行清理，防止旧扫描误删新范围的索引。
-    final currentSources = mediaSourcesForCategory(categoryId);
-    final scannedScope = sources.map((source) =>
-        '${source.mediaRootId}:${source.relativePath}').toSet();
-    final currentScope = currentSources.map((source) =>
-        '${source.mediaRootId}:${source.relativePath}').toSet();
-    if (scannedScope.length != currentScope.length ||
-        !scannedScope.containsAll(currentScope)) {
-      throw StateError('分类目录在扫描期间已变更，请重新扫描');
-    }
-    final removed = _removeUnboundCategoryIndexes(categoryId);
-    return NasScanResult(
-      scannedFiles: scannedFiles,
-      availableEpisodes: availableEpisodes,
-      conflicts: conflicts,
-      removedEpisodes: removed.episodes,
-      removedMovieIndexes: removed.movies,
-    );
-  }
-
-  /// 主动取消绑定才移除索引；不检查硬盘是否在线，也不删除任何源文件。
-  ({int episodes, List<NasRemovedMovieIndex> movies})
-      _removeUnboundCategoryIndexes(String categoryId) => transaction(() {
-    final stale = _db.select('''
-      SELECT e.id, e.movie_id FROM episodes e JOIN movies m ON m.id=e.movie_id
-      WHERE m.category_id=? AND m.lifecycle_state='active'
-        AND NOT EXISTS (
-          SELECT 1 FROM category_media_sources s
-          WHERE s.category_id=m.category_id AND s.media_root_id=e.media_root_id
-            AND (e.relative_path=s.relative_path OR
-              substr(e.relative_path,1,length(s.relative_path)+1)=s.relative_path || '/')
-        )
-    ''', [categoryId]);
-    final affectedMovies = stale.map((row) => row['movie_id'] as String).toSet();
-    final removedMovies = <NasRemovedMovieIndex>[];
-    for (final row in stale) {
-      // NFO 审计对分集使用限制删除；保留影片字段值，解除已退出来源的审计引用。
-      _db.execute('DELETE FROM mdcng_import_records WHERE episode_id=?', [row['id']]);
-      _db.execute('DELETE FROM episodes WHERE id=?', [row['id']]);
-    }
-    for (final movieId in affectedMovies) {
-      if (_db.select('SELECT 1 FROM episodes WHERE movie_id=? LIMIT 1', [movieId]).isNotEmpty) {
-        _db.execute('UPDATE movies SET updated_at=? WHERE id=?', [_now(), movieId]);
-        continue;
-      }
-      final movie = findMovieForAdmin(movieId)!;
-      removedMovies.add(NasRemovedMovieIndex(
-        posterFileName: movie.posterFileName,
-        carouselFileNames: carouselImagesForMovie(movieId).map((image) => image.fileName).toList(),
-      ));
-      // 旧归并条目仍保持隐藏，只解除指向已移除目标的外键引用。
-      _db.execute('UPDATE movies SET merged_into_movie_id=NULL WHERE merged_into_movie_id=?', [movieId]);
-      _db.execute('DELETE FROM movies WHERE id=?', [movieId]);
-      _db.execute("DELETE FROM scrape_fields WHERE kind='movie' AND entity_id=?", [movieId]);
-    }
-    return (episodes: stale.length, movies: removedMovies);
-  });
-
-  /// 分类扫描在单一物理来源盘内完成；盘不可读时绝不改写既有分集可用性。
-  Future<NasScanResult> _scanCategorySource({
-    required String categoryId,
-    Future<void> Function()? beforeFile,
-    required NasCategoryMediaSource source,
-    required NasMediaService mediaService,
-    required NasMediaMetadataProbe metadataProbe,
-  }) async {
-    final mediaRoot = findMediaRoot(source.mediaRootId);
-    if (mediaRoot == null || !mediaRoot.enabled) {
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    try {
-      if (!await Directory(mediaRoot.containerPath).exists()) {
-        _markRootOffline(mediaRoot.id);
-        return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-      }
-    } on FileSystemException {
-      _markRootOffline(mediaRoot.id);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    final directory = mediaRoot.containerPath == mediaService.mediaDir
-        ? await mediaService.directoryForRelativePath(source.relativePath)
-        : await mediaService.directoryForRootRelativePath(
-            rootPath: mediaRoot.containerPath,
-            relativePath: source.relativePath,
-          );
-    if (directory == null) {
-      // 来源盘在线而已绑定目录缺失，才可以确认该来源下的文件已不存在。
-      _markUnavailableEpisodesForSource(categoryId, source);
-      _markRootScanned(mediaRoot.id);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    final files = <File>[];
-    try {
-      await for (final entity in directory.directory.list(
-        recursive: true,
-        followLinks: false,
-      )) {
-        if (entity is File && _isVideo(entity.path)) files.add(entity);
-      }
-    } on FileSystemException {
-      _markRootOffline(mediaRoot.id);
-      return const NasScanResult(scannedFiles: 0, availableEpisodes: 0);
-    }
-    final listedDirectory = directory.directory.absolute.path;
-    final prefix = listedDirectory.endsWith(Platform.pathSeparator)
-        ? listedDirectory
-        : '$listedDirectory${Platform.pathSeparator}';
-    // 成功穷举后才标记不可用，避免挂载中断导致“离线即删除”。
-    final seenPaths = <String>{};
-    final changes = <void Function()>[];
-    void flushChanges() {
-      if (changes.isEmpty) return;
-      transaction(() { for (final change in changes) { change(); } });
-      changes.clear();
-    }
-    var scannedFiles = 0;
-    final conflicts = <String>[];
-    for (final entity in files) {
-      await beforeFile?.call();
-      final listedFile = entity.absolute.path;
-      if (!listedFile.startsWith(prefix)) continue;
-      final inCategoryPath = listedFile
-          .substring(prefix.length)
-          .replaceAll(Platform.pathSeparator, '/');
-      final grouping = _episodeGrouping(inCategoryPath);
-      if (grouping.isConflict) {
-        conflicts.add(
-            '${source.sourceName}/${source.relativePath}/${grouping.conflictPath}');
-        continue;
-      }
-      final relativePath = '${source.relativePath}/$inCategoryPath';
-      seenPaths.add(relativePath);
-      final checked = NasMediaFile(File(listedFile), relativePath);
-      final stat = await checked.file.stat();
-      final existing = _db.select('''
-        SELECT e.id, e.movie_id, e.file_size, e.media_modified_at,
-               e.duration_ms, e.video_width, e.video_height, e.resolution_label,
-               e.metadata_probed_at, e.is_available,
-               m.collection_key
-        FROM episodes e JOIN movies m ON m.id = e.movie_id
-        WHERE e.media_root_id = ? AND e.relative_path = ?
-      ''', [mediaRoot.id, relativePath]);
-      final collectionKey =
-          grouping.rootPath == null ? null : '$categoryId:${grouping.rootPath}';
-      final existingCollectionKey = existing.isEmpty
-          ? null
-          : existing.single['collection_key'] as String?;
-      if (collectionKey != null &&
-          existing.isNotEmpty &&
-          existingCollectionKey != collectionKey) {
-        // 旧逐文件数据和管理员手工归组只能在预览确认后迁移。
-        _markExistingEpisodeAvailable(existing.single['id'] as String);
-        conflicts.add(
-            '${source.sourceName}/${source.relativePath}/${grouping.rootPath}');
-        continue;
-      }
-      final fileSize = stat.size;
-      final modifiedAt = stat.modified.microsecondsSinceEpoch;
-      final unchanged = existing.isNotEmpty &&
-          existing.single['file_size'] == fileSize &&
-          existing.single['media_modified_at'] == modifiedAt &&
-          existing.single['metadata_probed_at'] != null;
-      if (unchanged) {
-        if (existing.single['is_available'] != 1) {
-          final id = existing.single['id'] as String;
-          changes.add(() => _markExistingEpisodeAvailable(id));
-        }
-        scannedFiles++;
-        if (changes.length >= 100) flushChanges();
-        continue;
-      }
-      final metadata = await metadataProbe.probe(checked);
-      final movieId = existing.isNotEmpty
-          ? existing.single['movie_id'] as String
-          : _movieIdForScannedEpisode(
-              categoryId: categoryId,
-              collectionKey: collectionKey,
-              title: grouping.displayTitle ?? _titleFromPath(inCategoryPath),
-            );
-      final timestamp = _now();
-      changes.add(() => _db.execute('''
-        INSERT INTO episodes(
-          id, movie_id, media_root_id, title, relative_path, duration_ms,
-          video_width, video_height, resolution_label, metadata_probed_at,
-          media_modified_at, file_size, is_available, natural_sort_key, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-        ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
-          duration_ms = excluded.duration_ms,
-          video_width = excluded.video_width,
-          video_height = excluded.video_height,
-          resolution_label = excluded.resolution_label,
-          metadata_probed_at = excluded.metadata_probed_at,
-          media_modified_at = excluded.media_modified_at,
-          file_size = excluded.file_size,
-          is_available = 1,
-          natural_sort_key = excluded.natural_sort_key,
-          updated_at = excluded.updated_at
-      ''', [
-        newUuidV4(),
-        movieId,
-        mediaRoot.id,
-        _titleFromPath(inCategoryPath),
-        relativePath,
-        unchanged ? existing.single['duration_ms'] : metadata?.durationMs,
-        unchanged ? existing.single['video_width'] : metadata?.width,
-        unchanged ? existing.single['video_height'] : metadata?.height,
-        unchanged
-            ? existing.single['resolution_label']
-            : metadata?.resolutionLabel,
-        unchanged ? existing.single['metadata_probed_at'] : timestamp,
-        modifiedAt,
-        fileSize,
-        _naturalSortKey(inCategoryPath),
-        timestamp,
-      ]));
-      if (changes.length >= 100) flushChanges();
-      scannedFiles++;
-    }
-    flushChanges();
-    _markUnavailableEpisodesForSource(categoryId, source, seenPaths: seenPaths);
-    _markRootScanned(mediaRoot.id);
-    return NasScanResult(
-      scannedFiles: scannedFiles,
-      availableEpisodes: scannedFiles,
-      conflicts: conflicts.toSet().toList(growable: false),
-    );
-  }
-
-  void _markUnavailableEpisodesForSource(
-    String categoryId,
-    NasCategoryMediaSource source, {
-    Set<String> seenPaths = const {},
-  }) {
-    final rows = _db.select('''
-      SELECT e.id, e.relative_path FROM episodes e
-      JOIN movies m ON m.id = e.movie_id
-      WHERE m.category_id = ? AND e.media_root_id = ?
-    ''', [categoryId, source.mediaRootId]);
-    final prefix = '${source.relativePath}/';
-    final ids = rows
-        .where((row) {
-          final path = row['relative_path'] as String;
-          return !seenPaths.contains(path) && (path == source.relativePath || path.startsWith(prefix));
-        })
-        .map((row) => row['id'] as String)
-        .toList(growable: false);
-    for (var offset = 0; offset < ids.length; offset += 100) {
-      transaction(() {
-      for (final id in ids.skip(offset).take(100)) {
-      _db.execute(
-          'UPDATE episodes SET is_available = 0, updated_at = ? WHERE id = ? AND is_available != 0',
-          [_now(), id]);
-      }
-      });
-    }
-  }
-
-  void _markExistingEpisodeAvailable(String episodeId) {
-    _db.execute(
-        'UPDATE episodes SET is_available = 1, updated_at = ? WHERE id = ? AND is_available != 1',
-        [_now(), episodeId]);
-  }
+  }) =>
+      _scan.scanCategory(
+          categoryId: categoryId,
+          beforeFile: beforeFile,
+          mediaRootId: mediaRootId,
+          mediaService: mediaService,
+          metadataProbe: metadataProbe);
 
   String _movieIdForScannedEpisode({
     required String categoryId,
     required String? collectionKey,
     required String title,
-  }) {
-    if (collectionKey != null) {
-      final existing = _db.select(
-        'SELECT id FROM movies WHERE collection_key = ?',
-        [collectionKey],
-      );
-      if (existing.isNotEmpty) return existing.single['id'] as String;
-    }
-    final id = newUuidV4();
-    final timestamp = _now();
-    _db.execute('''
-      INSERT INTO movies(
-        id, title, category_id, entry_type, collection_key, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', [
-      id,
-      title,
-      categoryId,
-      collectionKey == null ? 'single' : 'series',
-      collectionKey,
-      timestamp,
-      timestamp,
-    ]);
-    return id;
-  }
+  }) =>
+      _scan.movieIdForScannedEpisode(
+          categoryId: categoryId, collectionKey: collectionKey, title: title);
 
-  _EpisodeGrouping _episodeGrouping(String path) {
-    final segments = path.split('/');
-    if (segments.length < 2) return const _EpisodeGrouping();
-    final roots = <({int index, String title})>[];
-    for (var index = 0; index < segments.length - 1; index++) {
-      final title = _collectionTitleFromDirectory(segments[index]);
-      if (title != null) roots.add((index: index, title: title));
-    }
-    if (roots.length > 1) {
-      return _EpisodeGrouping(
-        conflictPath: segments.take(roots.last.index + 1).join('/'),
-      );
-    }
-    if (roots.isEmpty) return const _EpisodeGrouping();
-    final root = roots.single;
-    return _EpisodeGrouping(
-      rootPath: segments.take(root.index + 1).join('/'),
-      displayTitle: root.title,
-    );
-  }
+  EpisodeGrouping _episodeGrouping(String path) => _scan.episodeGrouping(path);
 
-  List<NasLibraryMovie> listMovies({String query = ''}) {
-    final queryLike = '%${query.trim()}%';
-    final normalizedCatalogQuery = _normalizeCatalogNumber(query);
-    final catalogQueryLike = '%$normalizedCatalogQuery%';
-    final rows = _db.select('''
-      SELECT m.id, m.title, m.original_title, m.catalog_number,
-             m.publisher_id, p.display_name AS publisher_name,
-             m.series_id, s.display_name AS series_name,
-             m.summary, m.actors_json, m.poster_file_name, m.play_count,
-             m.is_favorite,
-             m.category_id, c.name AS category_name,
-             m.updated_at, m.entry_type, COUNT(e.id) AS episode_count,
-             SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
-      FROM movies m
-      LEFT JOIN publishers p ON p.id = m.publisher_id
-      LEFT JOIN series s ON s.id = m.series_id
-      LEFT JOIN library_categories c ON c.id = m.category_id
-      LEFT JOIN episodes e ON e.movie_id = m.id
-       WHERE m.lifecycle_state = 'active'
-         AND (m.entry_type = 'series' OR e.id IS NOT NULL) AND (
-        ? = '%%'
-        OR lower(m.title) LIKE lower(?)
-        OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
-        OR (? != '' AND lower(REPLACE(REPLACE(REPLACE(
-          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE ?)
-      )
-      GROUP BY m.id ORDER BY m.title COLLATE NOCASE
-    ''', [
-      queryLike,
-      queryLike,
-      queryLike,
-      normalizedCatalogQuery,
-      catalogQueryLike,
-    ]);
-    return rows
-        .map((row) => _withResolution(NasLibraryMovie(
-              id: row['id'] as String,
-              title: row['title'] as String,
-              originalTitle: row['original_title'] as String?,
-              catalogNumber: row['catalog_number'] as String?,
-              publisherId: row['publisher_id'] as String?,
-              publisherName: row['publisher_name'] as String?,
-              seriesId: row['series_id'] as String?,
-              seriesName: row['series_name'] as String?,
-              summary: row['summary'] as String,
-              actors: _movieActors(row['id'] as String),
-              posterFileName: row['poster_file_name'] as String?,
-              playCount: row['play_count'] as int,
-              isFavorite: (row['is_favorite'] as int) == 1,
-              episodeCount: row['episode_count'] as int,
-              durationMs: (row['duration_ms'] as int?) == 0
-                  ? null
-                  : row['duration_ms'] as int?,
-              entryType: row['entry_type'] as String,
-              updatedAt: row['updated_at'] as String,
-              categoryId: row['category_id'] as String?,
-              categoryName: row['category_name'] as String?,
-            )))
-        .toList(growable: false);
-  }
+  List<NasLibraryMovie> listMovies({String query = ''}) =>
+      _queries.listMovies(query: query);
 
   /// 影集目标选择专用的服务端分页查询，绝不借用客户端当前影片墙。
   NasMovieSearchPage searchSeries({
@@ -2593,454 +284,31 @@ class NasLibraryDatabase {
     required String categoryId,
     int page = 1,
     int pageSize = 20,
-  }) {
-    if (page < 1 ||
-        pageSize < 1 ||
-        pageSize > 100 ||
-        query.length > 120 ||
-        findCategory(categoryId) == null) {
-      throw ArgumentError('影集查询参数无效');
-    }
-    final like = '%${query.trim()}%';
-    final total = _db.select('''
-      SELECT COUNT(*) AS count FROM movies m
-      WHERE m.lifecycle_state = 'active' AND m.entry_type = 'series'
-        AND m.category_id = ?
-        AND (? = '%%' OR lower(m.title) LIKE lower(?)
-          OR lower(COALESCE(m.original_title, '')) LIKE lower(?))
-    ''', [categoryId, like, like, like]).single['count'] as int;
-    final offset = (page - 1) * pageSize;
-    final rows = _db.select('''
-      SELECT m.id, m.title, m.original_title, m.catalog_number,
-             m.publisher_id, publisher.display_name AS publisher_name,
-             m.series_id, series.display_name AS series_name,
-             m.summary, m.poster_file_name, m.play_count, m.is_favorite,
-             m.updated_at,
-             m.entry_type, m.category_id, category.name AS category_name,
-             COUNT(e.id) AS episode_count, SUM(COALESCE(e.duration_ms, 0)) AS duration_ms,
-             MAX(e.video_width) AS video_width, MAX(e.video_height) AS video_height,
-             CASE WHEN COUNT(DISTINCT NULLIF(e.resolution_label, '')) > 1
-                  THEN '多种分辨率' ELSE MAX(e.resolution_label) END AS resolution_label
-      FROM movies m
-      LEFT JOIN episodes e ON e.movie_id = m.id
-      LEFT JOIN publishers publisher ON publisher.id = m.publisher_id
-      LEFT JOIN series ON series.id = m.series_id
-      LEFT JOIN library_categories category ON category.id = m.category_id
-      WHERE m.lifecycle_state = 'active' AND m.entry_type = 'series'
-        AND m.category_id = ?
-        AND (? = '%%' OR lower(m.title) LIKE lower(?)
-          OR lower(COALESCE(m.original_title, '')) LIKE lower(?))
-      GROUP BY m.id
-      ORDER BY m.title COLLATE NOCASE, m.id
-      LIMIT ? OFFSET ?
-    ''', [categoryId, like, like, like, pageSize, offset]);
-    final items = rows.map(_mapSearchMovie).toList(growable: false);
-    return NasMovieSearchPage(
-      items: items,
-      number: page,
-      size: pageSize,
-      total: total,
-      hasMore: offset + items.length < total,
-    );
-  }
+  }) =>
+      _queries.searchSeries(
+          query: query, categoryId: categoryId, page: page, pageSize: pageSize);
 
   /// 在 SQLite 中完成搜索、三组标签条件、排序和分页，绝不回传全量影片。
-  NasMovieSearchPage searchMovies(NasMovieSearchFilter filter) {
-    if (filter.page < 1 ||
-        filter.pageSize < 1 ||
-        filter.pageSize > 100 ||
-        !const {
-          'relevance',
-          'createdAt',
-          'title',
-          'updatedAt',
-          'durationMs',
-          'recent'
-        }.contains(filter.sort) ||
-        !filter.watchStates.every(
-          const {'unwatched', 'continue'}.contains,
-        ) ||
-        !const {'asc', 'desc'}.contains(filter.order)) {
-      throw ArgumentError('影片搜索参数无效');
-    }
-    final conditions = filter.tagConditions;
-    final requestedValues = <Object?>[];
-    final requestedSql = conditions.isEmpty
-        ? '''SELECT CAST(NULL AS TEXT), CAST(NULL AS TEXT), CAST(NULL AS INTEGER)
-            WHERE 0'''
-        : 'VALUES ${conditions.map((condition) {
-            requestedValues.addAll([
-              condition.group,
-              condition.tagId,
-              condition.includeDescendants ? 1 : 0,
-            ]);
-            return '(?, ?, ?)';
-          }).join(', ')}';
-    final query = filter.query.trim();
-    final queryLike = '%$query%';
-    final queryPrefix = '$query%';
-    final normalizedCatalog = _normalizeCatalogNumber(query);
-    final catalogLike = '%$normalizedCatalog%';
-    final catalogPrefix = '$normalizedCatalog%';
-    // 权重只影响搜索结果的服务端排序；任意筛选条件仍在同一条 SQL 内完成。
-    final relevanceSql = '''CASE WHEN terms.query = '' THEN 0 ELSE
-      CASE
-        WHEN lower(m.title) = lower(terms.query) THEN 1000
-        WHEN lower(m.title) LIKE lower(terms.query_prefix) THEN 900
-        WHEN lower(m.title) LIKE lower(terms.query_like) THEN 800
-        ELSE 0
-      END +
-      CASE
-        WHEN lower(COALESCE(m.original_title, '')) = lower(terms.query) THEN 700
-        WHEN lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_prefix) THEN 650
-        WHEN lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_like) THEN 600
-        ELSE 0
-      END +
-      CASE
-        WHEN terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
-          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) = lower(terms.catalog) THEN 550
-        WHEN terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
-          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_prefix) THEN 520
-        WHEN terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
-          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_like) THEN 480
-        ELSE 0
-      END +
-      CASE
-        WHEN EXISTS (
-          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
-          WHERE mal.movie_id = m.id AND (
-            lower(COALESCE(a.stage_name, '')) = lower(terms.query)
-            OR lower(COALESCE(a.original_name, '')) = lower(terms.query)
-            OR lower(COALESCE(a.translated_name, '')) = lower(terms.query)
-          )
-        ) THEN 400
-        WHEN EXISTS (
-          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
-          WHERE mal.movie_id = m.id AND (
-            lower(COALESCE(a.stage_name, '')) LIKE lower(terms.query_prefix)
-            OR lower(COALESCE(a.original_name, '')) LIKE lower(terms.query_prefix)
-            OR lower(COALESCE(a.translated_name, '')) LIKE lower(terms.query_prefix)
-          )
-        ) THEN 360
-        WHEN EXISTS (
-          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
-          WHERE mal.movie_id = m.id AND (
-            lower(COALESCE(a.stage_name, '')) LIKE lower(terms.query_like)
-            OR lower(COALESCE(a.original_name, '')) LIKE lower(terms.query_like)
-            OR lower(COALESCE(a.translated_name, '')) LIKE lower(terms.query_like)
-          )
-        ) THEN 320
-        ELSE 0
-      END +
-      CASE
-        WHEN lower(COALESCE(series.display_name, '')) = lower(terms.query)
-          OR lower(COALESCE(series.original_name, '')) = lower(terms.query)
-          OR lower(COALESCE(series.translated_name, '')) = lower(terms.query)
-          OR lower(COALESCE(publisher.display_name, '')) = lower(terms.query)
-          OR lower(COALESCE(publisher.original_name, '')) = lower(terms.query) THEN 300
-        WHEN lower(COALESCE(series.display_name, '')) LIKE lower(terms.query_prefix)
-          OR lower(COALESCE(series.original_name, '')) LIKE lower(terms.query_prefix)
-          OR lower(COALESCE(series.translated_name, '')) LIKE lower(terms.query_prefix)
-          OR lower(COALESCE(publisher.display_name, '')) LIKE lower(terms.query_prefix)
-          OR lower(COALESCE(publisher.original_name, '')) LIKE lower(terms.query_prefix) THEN 280
-        WHEN lower(COALESCE(series.display_name, '')) LIKE lower(terms.query_like)
-          OR lower(COALESCE(series.original_name, '')) LIKE lower(terms.query_like)
-          OR lower(COALESCE(series.translated_name, '')) LIKE lower(terms.query_like)
-          OR lower(COALESCE(publisher.display_name, '')) LIKE lower(terms.query_like)
-          OR lower(COALESCE(publisher.original_name, '')) LIKE lower(terms.query_like) THEN 260
-        ELSE 0
-      END +
-      CASE
-        WHEN lower(COALESCE(category.name, '')) = lower(terms.query) THEN 240
-        WHEN lower(COALESCE(category.name, '')) LIKE lower(terms.query_prefix) THEN 220
-        WHEN lower(COALESCE(category.name, '')) LIKE lower(terms.query_like) THEN 200
-        ELSE 0
-      END +
-      CASE
-        WHEN EXISTS (
-          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
-          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
-            AND lower(t.name) = lower(terms.query)
-        ) THEN 280
-        WHEN EXISTS (
-          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
-          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
-            AND lower(t.name) LIKE lower(terms.query_prefix)
-        ) THEN 260
-        WHEN EXISTS (
-          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
-          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
-            AND lower(t.name) LIKE lower(terms.query_like)
-        ) THEN 240
-        ELSE 0
-      END +
-      CASE
-        WHEN lower(COALESCE(m.summary, '')) LIKE lower(terms.query_like) THEN 100
-        ELSE 0
-      END
-    END AS relevance_score''';
-    final clauses = <String>[
-      "m.lifecycle_state = 'active'",
-      // 已离线来源上的影视条目仍必须可见；可播放性由分集接口单独返回。
-      "(m.entry_type = 'series' OR EXISTS (SELECT 1 FROM episodes visible_episode WHERE visible_episode.movie_id = m.id))",
-      '''(
-        terms.query = '' OR lower(m.title) LIKE lower(terms.query_like)
-        OR lower(COALESCE(m.original_title, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(m.summary, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(series.display_name, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(series.original_name, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(series.translated_name, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(publisher.display_name, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(publisher.original_name, '')) LIKE lower(terms.query_like)
-        OR lower(COALESCE(category.name, '')) LIKE lower(terms.query_like)
-        OR (terms.catalog != '' AND lower(REPLACE(REPLACE(REPLACE(
-          COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(terms.catalog_like))
-        OR EXISTS (
-          SELECT 1 FROM movie_actor_links mal JOIN actors a ON a.id = mal.actor_id
-          WHERE mal.movie_id = m.id AND (
-            lower(COALESCE(a.stage_name, '')) LIKE lower(terms.query_like)
-            OR lower(COALESCE(a.original_name, '')) LIKE lower(terms.query_like)
-            OR lower(COALESCE(a.translated_name, '')) LIKE lower(terms.query_like)
-          )
-        )
-        OR EXISTS (
-          SELECT 1 FROM movie_tag_links mtl JOIN tags t ON t.id = mtl.tag_id
-          WHERE mtl.movie_id = m.id AND t.archived_at IS NULL
-            AND lower(t.name) LIKE lower(terms.query_like)
-        )
-        OR EXISTS (
-          SELECT 1 FROM episodes named_episode
-          WHERE named_episode.movie_id = m.id
-            AND lower(named_episode.title) LIKE lower(terms.query_like)
-        )
-      )''',
-      '''(
-        NOT EXISTS (SELECT 1 FROM requested WHERE group_name = 'all')
-        OR NOT EXISTS (
-          SELECT 1 FROM requested r
-          WHERE r.group_name = 'all' AND NOT EXISTS (
-            SELECT 1 FROM tag_scope scope
-            JOIN movie_tag_links links ON links.tag_id = scope.tag_id
-            WHERE scope.group_name = r.group_name
-              AND scope.requested_tag_id = r.requested_tag_id
-              AND links.movie_id = m.id
-          )
-        )
-      )''',
-      '''(
-        NOT EXISTS (SELECT 1 FROM requested WHERE group_name = 'any')
-        OR EXISTS (
-          SELECT 1 FROM tag_scope scope
-          JOIN movie_tag_links links ON links.tag_id = scope.tag_id
-          WHERE scope.group_name = 'any' AND links.movie_id = m.id
-        )
-      )''',
-      '''NOT EXISTS (
-        SELECT 1 FROM tag_scope scope
-        JOIN movie_tag_links links ON links.tag_id = scope.tag_id
-        WHERE scope.group_name = 'exclude' AND links.movie_id = m.id
-      )''',
-    ];
-    final whereValues = <Object?>[];
-    void addIdSetClause(String column, Set<String> ids) {
-      if (ids.isEmpty) return;
-      final sorted = ids.toList()..sort();
-      clauses.add('$column IN (${List.filled(sorted.length, '?').join(', ')})');
-      whereValues.addAll(sorted);
-    }
-
-    addIdSetClause('m.category_id', filter.effectiveCategoryIds);
-    addIdSetClause('m.series_id', filter.seriesIds);
-    if(filter.publisherIds.isNotEmpty){
-      final ids=filter.publisherIds.toList()..sort();
-      final placeholders=List.filled(ids.length,'?').join(',');
-      clauses.add('(m.publisher_id IN ($placeholders) OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id IN ($placeholders)))');
-      whereValues.addAll([...ids,...ids]);
-    }
-    if (filter.actorIds.isNotEmpty) {
-      final actorIds = filter.actorIds.toList()..sort();
-      clauses.add('''EXISTS (
-        SELECT 1 FROM movie_actor_links selected_actor
-        WHERE selected_actor.movie_id = m.id
-          AND selected_actor.actor_id IN (${List.filled(actorIds.length, '?').join(', ')})
-      )''');
-      whereValues.addAll(actorIds);
-    }
-    if (filter.isFavorite != null) {
-      clauses.add('m.is_favorite = ?');
-      whereValues.add(filter.isFavorite! ? 1 : 0);
-    }
-    if (filter.resolutions.isNotEmpty) {
-      clauses.add('''EXISTS (
-        SELECT 1 FROM episodes resolution_episode
-        WHERE resolution_episode.movie_id = m.id
-          AND resolution_episode.is_available = 1
-          AND resolution_episode.resolution_label IN (${List.filled(filter.resolutions.length, '?').join(', ')})
-      )''');
-      whereValues.addAll(filter.resolutions.toList()..sort());
-    }
-    if (filter.watchStates.isNotEmpty) {
-      final watchStateClauses = <String>[];
-      if (filter.watchStates.contains('unwatched')) {
-        watchStateClauses.add('''NOT EXISTS (
-          SELECT 1 FROM playback_history watched
-          WHERE watched.movie_id = m.id
-        )''');
-      }
-      if (filter.watchStates.contains('continue')) {
-        watchStateClauses.add('''EXISTS (
-          SELECT 1 FROM episode_playback_progress progress
-          WHERE progress.movie_id = m.id
-            AND progress.position_ms > 0
-            AND progress.duration_ms > 0
-            AND progress.position_ms < progress.duration_ms
-        )''');
-      }
-      clauses.add('(${watchStateClauses.join(' OR ')})');
-    }
-    final cte = '''WITH RECURSIVE
-      requested(group_name, requested_tag_id, include_descendants) AS (
-        $requestedSql
-      ),
-      search_terms(query, query_like, query_prefix, catalog, catalog_like, catalog_prefix) AS (
-        VALUES (?, ?, ?, ?, ?, ?)
-      ),
-      tag_scope(group_name, requested_tag_id, tag_id) AS (
-        SELECT group_name, requested_tag_id, requested_tag_id FROM requested
-        UNION
-        SELECT scope.group_name, scope.requested_tag_id, links.child_tag_id
-        FROM tag_scope scope
-        JOIN requested request ON request.group_name = scope.group_name
-          AND request.requested_tag_id = scope.requested_tag_id
-        JOIN tag_parent_links links ON links.parent_tag_id = scope.tag_id
-        JOIN tags child ON child.id = links.child_tag_id
-        WHERE request.include_descendants = 1 AND child.archived_at IS NULL
-      ),
-      matching_movies AS (
-        SELECT m.id, m.title, m.original_title, m.catalog_number,
-               m.publisher_id, publisher.display_name AS publisher_name,
-               m.series_id, series.display_name AS series_name,
-               m.summary, m.poster_file_name, m.play_count, m.is_favorite,
-               m.created_at, m.updated_at,
-               m.entry_type,
-               $relevanceSql,
-               m.category_id, category.name AS category_name,
-               COUNT(e.id) AS episode_count,
-               SUM(COALESCE(e.duration_ms, 0)) AS duration_ms,
-               MAX(e.video_width) AS video_width,
-               MAX(e.video_height) AS video_height,
-               CASE WHEN COUNT(DISTINCT NULLIF(e.resolution_label, '')) > 1
-                    THEN '多种分辨率' ELSE MAX(e.resolution_label) END AS resolution_label
-        FROM movies m
-        CROSS JOIN search_terms terms
-        LEFT JOIN episodes e ON e.movie_id = m.id
-        LEFT JOIN publishers publisher ON publisher.id = m.publisher_id
-        LEFT JOIN series ON series.id = m.series_id
-        LEFT JOIN library_categories category ON category.id = m.category_id
-        WHERE ${clauses.join(' AND ')}
-        GROUP BY m.id
-      )''';
-    final parameters = [
-      ...requestedValues,
-      query,
-      queryLike,
-      queryPrefix,
-      normalizedCatalog,
-      catalogLike,
-      catalogPrefix,
-      ...whereValues,
-    ];
-    final total = _db
-        .select(
-            '$cte SELECT COUNT(*) AS count FROM matching_movies', parameters)
-        .single['count'] as int;
-    final upperOrder = filter.order.toUpperCase();
-    final orderBy = switch (filter.sort) {
-      'relevance' => 'relevance_score $upperOrder, created_at DESC, id ASC',
-      'createdAt' => 'created_at $upperOrder, id ASC',
-      'title' => 'title COLLATE NOCASE $upperOrder, id ASC',
-      'durationMs' => 'duration_ms $upperOrder, id ASC',
-      'recent' => 'play_count $upperOrder, id ASC',
-      _ => 'updated_at $upperOrder, id ASC',
-    };
-    final offset = (filter.page - 1) * filter.pageSize;
-    final rows = _db.select('''$cte
-      SELECT * FROM matching_movies
-      ORDER BY $orderBy
-      LIMIT ? OFFSET ?
-    ''', [...parameters, filter.pageSize, offset]);
-    final items = rows.map(_mapSearchMovie).toList(growable: false);
-    return NasMovieSearchPage(
-      items: items,
-      number: filter.page,
-      size: filter.pageSize,
-      total: total,
-      hasMore: offset + items.length < total,
-    );
-  }
+  NasMovieSearchPage searchMovies(NasMovieSearchFilter filter) =>
+      _queries.searchMovies(filter);
 
   List<NasPublisher> listPublishers({
     String query = '',
     bool includeArchived = false,
-  }) {
-    final queryLike = '%${query.trim()}%';
-    final rows = _db.select('''
-      SELECT p.id, p.profile_identity, p.display_name, p.original_name, p.country_region,
-             p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
-             p.archived_at,
-              (SELECT COUNT(*) FROM movies m
-                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active') AS movie_count,
-             (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
-             (SELECT SUM(COALESCE(e.duration_ms, 0))
-                FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active'
-                  AND e.is_available = 1) AS duration_ms
-      FROM publishers p
-      WHERE (? = 1 OR p.archived_at IS NULL)
-        AND (? = '%%' OR lower(p.display_name) LIKE lower(?)
-             OR lower(COALESCE(p.original_name, '')) LIKE lower(?))
-      ORDER BY p.created_at DESC, p.id DESC
-    ''', [includeArchived ? 1 : 0, queryLike, queryLike, queryLike]);
-    return rows.map(_mapPublisher).toList(growable: false);
-  }
+  }) =>
+      _profiles.listPublishers(query: query, includeArchived: includeArchived);
 
-  NasPublisher? findPublisher(String publisherId) {
-    final rows = _db.select('''
-      SELECT p.id, p.profile_identity, p.display_name, p.original_name, p.country_region,
-             p.founded_date, p.logo_asset_id, p.created_at, p.updated_at,
-             p.archived_at,
-              (SELECT COUNT(*) FROM movies m
-                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active') AS movie_count,
-             (SELECT COUNT(*) FROM series s WHERE s.publisher_id = p.id) AS series_count,
-             (SELECT SUM(COALESCE(e.duration_ms, 0))
-                FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE (m.publisher_id = p.id OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=p.id)) AND m.lifecycle_state = 'active'
-                  AND e.is_available = 1) AS duration_ms
-      FROM publishers p WHERE p.id = ?
-    ''', [publisherId]);
-    return rows.isEmpty ? null : _mapPublisher(rows.single);
-  }
+  NasPublisher? findPublisher(String publisherId) =>
+      _profiles.findPublisher(publisherId);
 
-  NasPublisher? findPublisherByProfileIdentity(String profileIdentity) {
-    final rows = _db.select(
-      'SELECT id FROM publishers WHERE profile_identity = ?',
-      [profileIdentity],
-    );
-    return rows.isEmpty ? null : findPublisher(rows.single['id'] as String);
-  }
+  NasPublisher? findPublisherByProfileIdentity(String profileIdentity) =>
+      _profiles.findPublisherByProfileIdentity(profileIdentity);
 
-  bool publisherDisplayNameExists(String displayName) => _db.select(
-        'SELECT 1 FROM publishers WHERE lower(display_name) = lower(?) LIMIT 1',
-        [displayName.trim()],
-      ).isNotEmpty;
+  bool publisherDisplayNameExists(String displayName) =>
+      _profiles.publisherDisplayNameExists(displayName);
 
-  NasPublisher? findPublisherByDisplayName(String displayName) {
-    final rows = _db.select(
-      'SELECT id FROM publishers WHERE lower(display_name) = lower(?) LIMIT 1',
-      [displayName.trim()],
-    );
-    return rows.isEmpty ? null : findPublisher(rows.single['id'] as String);
-  }
+  NasPublisher? findPublisherByDisplayName(String displayName) =>
+      _profiles.findPublisherByDisplayName(displayName);
 
   NasPublisher createPublisher({
     required String displayName,
@@ -3049,142 +317,45 @@ class NasLibraryDatabase {
     String? countryRegion,
     String? foundedDate,
     String? logoAssetId,
-  }) {
-    final id = newUuidV4();
-    final timestamp = _now();
-    _db.execute('''
-      INSERT INTO publishers(
-        id, profile_identity, display_name, original_name, country_region, founded_date,
-        logo_asset_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', [
-      id,
-      _nullableTrimmed(profileIdentity) ?? newUuidV4(),
-      displayName.trim(),
-      _nullableTrimmed(originalName),
-      _nullableTrimmed(countryRegion),
-      _nullableTrimmed(foundedDate),
-      logoAssetId,
-      timestamp,
-      timestamp,
-    ]);
-    return findPublisher(id)!;
-  }
+  }) =>
+      _profiles.createPublisher(
+          displayName: displayName,
+          profileIdentity: profileIdentity,
+          originalName: originalName,
+          countryRegion: countryRegion,
+          foundedDate: foundedDate,
+          logoAssetId: logoAssetId);
 
   NasPublisher? updatePublisher(
-      String publisherId, Map<String, Object?> values) {
-    if (findPublisher(publisherId) == null) return null;
-    if (values.isEmpty) return findPublisher(publisherId);
-    markScrapeManual('company', publisherId, values.keys);
-    final assignments = <String>[];
-    final parameters = <Object?>[];
-    values.forEach((key, value) {
-      assignments.add('$key = ?');
-      parameters.add(value);
-    });
-    assignments.add('updated_at = ?');
-    parameters
-      ..add(_now())
-      ..add(publisherId);
-    _db.execute(
-      'UPDATE publishers SET ${assignments.join(', ')} WHERE id = ?',
-      parameters,
-    );
-    return findPublisher(publisherId);
-  }
+          String publisherId, Map<String, Object?> values) =>
+      _profiles.updatePublisher(publisherId, values);
 
-  NasPublisher? archivePublisher(String publisherId) => updatePublisher(
-        publisherId,
-        {'archived_at': _now()},
-      );
+  NasPublisher? archivePublisher(String publisherId) =>
+      _profiles.archivePublisher(publisherId);
 
-  bool publisherHasReferences(String publisherId) => _db.select('''
-    SELECT 1
-    WHERE EXISTS(SELECT 1 FROM movies
-      WHERE publisher_id = ? AND lifecycle_state = 'active')
-       OR EXISTS(SELECT 1 FROM series WHERE publisher_id = ?)
-       OR EXISTS(SELECT 1 FROM actor_publisher_links WHERE publisher_id = ?)
-       OR EXISTS(SELECT 1 FROM movie_company_links WHERE company_id = ?)
-  ''', [publisherId, publisherId, publisherId,publisherId]).isNotEmpty;
+  bool publisherHasReferences(String publisherId) =>
+      _profiles.publisherHasReferences(publisherId);
 
-  bool deletePublisher(String publisherId) {
-    if (findPublisher(publisherId) == null ||
-        publisherHasReferences(publisherId)) {
-      return false;
-    }
-    _db.execute('DELETE FROM publishers WHERE id = ?', [publisherId]);
-    return true;
-  }
+  bool deletePublisher(String publisherId) =>
+      _profiles.deletePublisher(publisherId);
 
   List<NasSeries> listSeries({
     String query = '',
     String? publisherId,
     bool includeArchived = false,
-  }) {
-    final queryLike = '%${query.trim()}%';
-    final rows = _db.select('''
-      SELECT s.id, s.profile_identity, s.display_name, s.original_name, s.translated_name,
-             s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
-             s.updated_at, s.archived_at,
-              (SELECT COUNT(*) FROM movies m
-                WHERE m.series_id = s.id AND m.lifecycle_state = 'active') AS movie_count,
-             (SELECT COUNT(e.id) FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
-                  AND e.is_available = 1) AS episode_count,
-             (SELECT SUM(COALESCE(e.duration_ms, 0))
-                FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
-                  AND e.is_available = 1) AS duration_ms
-      FROM series s
-      WHERE (? = 1 OR s.archived_at IS NULL)
-        AND (? IS NULL OR s.publisher_id = ?)
-        AND (? = '%%' OR lower(s.display_name) LIKE lower(?)
-             OR lower(COALESCE(s.original_name, '')) LIKE lower(?)
-             OR lower(COALESCE(s.translated_name, '')) LIKE lower(?))
-      ORDER BY s.created_at DESC, s.id DESC
-    ''', [
-      includeArchived ? 1 : 0,
-      publisherId,
-      publisherId,
-      queryLike,
-      queryLike,
-      queryLike,
-      queryLike,
-    ]);
-    return rows.map(_mapSeries).toList(growable: false);
-  }
+  }) =>
+      _profiles.listSeries(
+          query: query,
+          publisherId: publisherId,
+          includeArchived: includeArchived);
 
-  NasSeries? findSeries(String seriesId) {
-    final rows = _db.select('''
-      SELECT s.id, s.profile_identity, s.display_name, s.original_name, s.translated_name,
-             s.publisher_id, s.release_date, s.poster_asset_id, s.created_at,
-             s.updated_at, s.archived_at,
-              (SELECT COUNT(*) FROM movies m
-                WHERE m.series_id = s.id AND m.lifecycle_state = 'active') AS movie_count,
-             (SELECT COUNT(e.id) FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
-                  AND e.is_available = 1) AS episode_count,
-             (SELECT SUM(COALESCE(e.duration_ms, 0))
-                FROM movies m JOIN episodes e ON e.movie_id = m.id
-                WHERE m.series_id = s.id AND m.lifecycle_state = 'active'
-                  AND e.is_available = 1) AS duration_ms
-      FROM series s WHERE s.id = ?
-    ''', [seriesId]);
-    return rows.isEmpty ? null : _mapSeries(rows.single);
-  }
+  NasSeries? findSeries(String seriesId) => _profiles.findSeries(seriesId);
 
-  NasSeries? findSeriesByProfileIdentity(String profileIdentity) {
-    final rows = _db.select(
-      'SELECT id FROM series WHERE profile_identity = ?',
-      [profileIdentity],
-    );
-    return rows.isEmpty ? null : findSeries(rows.single['id'] as String);
-  }
+  NasSeries? findSeriesByProfileIdentity(String profileIdentity) =>
+      _profiles.findSeriesByProfileIdentity(profileIdentity);
 
-  bool seriesDisplayNameExists(String displayName) => _db.select(
-        'SELECT 1 FROM series WHERE lower(display_name) = lower(?) LIMIT 1',
-        [displayName.trim()],
-      ).isNotEmpty;
+  bool seriesDisplayNameExists(String displayName) =>
+      _profiles.seriesDisplayNameExists(displayName);
 
   NasSeries createSeries({
     required String displayName,
@@ -3194,135 +365,58 @@ class NasLibraryDatabase {
     String? translatedName,
     String? releaseDate,
     String? posterAssetId,
-  }) {
-    final id = newUuidV4();
-    final timestamp = _now();
-    _db.execute('''
-      INSERT INTO series(
-        id, profile_identity, display_name, original_name, translated_name, publisher_id,
-        release_date, poster_asset_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', [
-      id,
-      _nullableTrimmed(profileIdentity) ?? newUuidV4(),
-      displayName.trim(),
-      _nullableTrimmed(originalName),
-      _nullableTrimmed(translatedName),
-      _nullableTrimmed(publisherId),
-      _nullableTrimmed(releaseDate),
-      posterAssetId,
-      timestamp,
-      timestamp,
-    ]);
-    return findSeries(id)!;
-  }
+  }) =>
+      _profiles.createSeries(
+          displayName: displayName,
+          profileIdentity: profileIdentity,
+          publisherId: publisherId,
+          originalName: originalName,
+          translatedName: translatedName,
+          releaseDate: releaseDate,
+          posterAssetId: posterAssetId);
 
-  NasSeries? updateSeries(String seriesId, Map<String, Object?> values) {
-    if (findSeries(seriesId) == null) return null;
-    if (values.isEmpty) return findSeries(seriesId);
-    final assignments = <String>[];
-    final parameters = <Object?>[];
-    values.forEach((key, value) {
-      assignments.add('$key = ?');
-      parameters.add(value);
-    });
-    assignments.add('updated_at = ?');
-    parameters
-      ..add(_now())
-      ..add(seriesId);
-    _db.execute(
-      'UPDATE series SET ${assignments.join(', ')} WHERE id = ?',
-      parameters,
-    );
-    return findSeries(seriesId);
-  }
+  NasSeries? updateSeries(String seriesId, Map<String, Object?> values) =>
+      _profiles.updateSeries(seriesId, values);
 
-  NasSeries? archiveSeries(String seriesId) => updateSeries(
-        seriesId,
-        {'archived_at': _now()},
-      );
+  NasSeries? archiveSeries(String seriesId) =>
+      _profiles.archiveSeries(seriesId);
 
-  bool deleteSeries(String seriesId) {
-    final series = findSeries(seriesId);
-    if (series == null || series.movieCount > 0) return false;
-    _db.execute('DELETE FROM series WHERE id = ?', [seriesId]);
-    return true;
-  }
+  bool deleteSeries(String seriesId) => _profiles.deleteSeries(seriesId);
 
   List<NasLibraryMovie> moviesForPublisher(String publisherId,
           {String query = ''}) =>
-      listMovies(query: query)
-          .where((movie) => movie.publisherId == publisherId || movieCompanies(movie.id).any((company)=>company['id']==publisherId))
-          .toList(growable: false);
+      _profiles.moviesForPublisher(publisherId, query: query);
 
   List<NasLibraryMovie> moviesForSeries(String seriesId, {String query = ''}) =>
-      listMovies(query: query)
-          .where((movie) => movie.seriesId == seriesId)
-          .toList(growable: false);
+      _profiles.moviesForSeries(seriesId, query: query);
 
   List<NasSeries> seriesForPublisher(String publisherId, {String query = ''}) =>
-      listSeries(query: query, publisherId: publisherId)
-          .toList(growable: false);
+      _profiles.seriesForPublisher(publisherId, query: query);
 
-  List<NasLibraryTag> tagsForPublisher(String publisherId) => _tagsForRelation(
-        '(m.publisher_id = ? OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=?))',
-        [publisherId,publisherId],
-      );
+  List<NasLibraryTag> tagsForPublisher(String publisherId) =>
+      _profiles.tagsForPublisher(publisherId);
 
-  List<NasLibraryTag> tagsForSeries(String seriesId) => _tagsForRelation(
-        'm.series_id = ?',
-        [seriesId],
-      );
+  List<NasLibraryTag> tagsForSeries(String seriesId) =>
+      _profiles.tagsForSeries(seriesId);
 
   List<NasRelatedActor> actorsForPublisher(String publisherId) =>
-      _relatedActorsForMovies('(m.publisher_id = ? OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=?))', [publisherId,publisherId]);
+      _profiles.actorsForPublisher(publisherId);
 
   List<NasRelatedActor> actorsForSeries(String seriesId) =>
-      _relatedActorsForMovies('m.series_id = ?', [seriesId]);
+      _profiles.actorsForSeries(seriesId);
 
-  List<String> publisherIdsForActor(String actorId) => _db
-      .select('''
-        SELECT publisher_id FROM actor_publisher_links
-        WHERE actor_id = ? ORDER BY publisher_id
-      ''', [actorId])
-      .map((row) => row['publisher_id'] as String)
-      .toList(growable: false);
+  List<String> publisherIdsForActor(String actorId) =>
+      _profiles.publisherIdsForActor(actorId);
 
   List<NasPublisher> publishersForActor(String actorId) =>
-      publisherIdsForActor(actorId)
-          .map(findPublisher)
-          .whereType<NasPublisher>()
-          .toList(growable: false);
+      _profiles.publishersForActor(actorId);
 
   bool setActorPublisherIds({
     required String actorId,
     required List<String> publisherIds,
-  }) {
-    if (findActor(actorId) == null ||
-        publisherIds.length != publisherIds.toSet().length ||
-        publisherIds.any((id) {
-          final publisher = findPublisher(id);
-          return publisher == null || publisher.archivedAt != null;
-        })) {
-      return false;
-    }
-    _db.execute('BEGIN');
-    try {
-      _db.execute(
-          'DELETE FROM actor_publisher_links WHERE actor_id = ?', [actorId]);
-      for (final publisherId in publisherIds) {
-        _db.execute(
-          'INSERT INTO actor_publisher_links(actor_id, publisher_id) VALUES (?, ?)',
-          [actorId, publisherId],
-        );
-      }
-      _db.execute('COMMIT');
-      return true;
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-  }
+  }) =>
+      _profiles.setActorPublisherIds(
+          actorId: actorId, publisherIds: publisherIds);
 
   /// 统一解析影片关系，系列存在时始终以系列所属发行商为准。
   ({String? publisherId, String? seriesId})? resolveMovieRelations({
@@ -3331,31 +425,13 @@ class NasLibraryDatabase {
     required bool updatePublisherId,
     String? seriesId,
     required bool updateSeriesId,
-  }) {
-    final movie = findMovieForAdmin(movieId);
-    if (movie == null) return null;
-    final resolvedSeriesId =
-        updateSeriesId ? _nullableTrimmed(seriesId) : movie.seriesId;
-    var resolvedPublisherId =
-        updatePublisherId ? _nullableTrimmed(publisherId) : movie.publisherId;
-    if (resolvedSeriesId != null) {
-      final series = findSeries(resolvedSeriesId);
-      final seriesPublisherId = series?.publisherId;
-      if (series == null ||
-          series.archivedAt != null ||
-          seriesPublisherId == null) {
-        return null;
-      }
-      if (updatePublisherId && resolvedPublisherId != seriesPublisherId)
-        return null;
-      resolvedPublisherId = seriesPublisherId;
-    }
-    if (resolvedPublisherId != null) {
-      final publisher = findPublisher(resolvedPublisherId);
-      if (publisher == null || publisher.archivedAt != null) return null;
-    }
-    return (publisherId: resolvedPublisherId, seriesId: resolvedSeriesId);
-  }
+  }) =>
+      _profiles.resolveMovieRelations(
+          movieId: movieId,
+          publisherId: publisherId,
+          updatePublisherId: updatePublisherId,
+          seriesId: seriesId,
+          updateSeriesId: updateSeriesId);
 
   NasLibraryMovie? updateMovieRelations({
     required String movieId,
@@ -3363,165 +439,47 @@ class NasLibraryDatabase {
     required bool updatePublisherId,
     required String? seriesId,
     required bool updateSeriesId,
-  }) {
-    final relations = resolveMovieRelations(
-      movieId: movieId,
-      publisherId: publisherId,
-      updatePublisherId: updatePublisherId,
-      seriesId: seriesId,
-      updateSeriesId: updateSeriesId,
-    );
-    if (relations == null) return null;
-    if (!updatePublisherId && !updateSeriesId)
-      return findMovieForAdmin(movieId);
-    _db.execute(
-      'UPDATE movies SET publisher_id = ?, series_id = ?, updated_at = ? WHERE id = ?',
-      [relations.publisherId, relations.seriesId, _now(), movieId],
-    );
-    return findMovieForAdmin(movieId);
-  }
+  }) =>
+      _profiles.updateMovieRelations(
+          movieId: movieId,
+          publisherId: publisherId,
+          updatePublisherId: updatePublisherId,
+          seriesId: seriesId,
+          updateSeriesId: updateSeriesId);
 
   List<NasActor> listActors({
     String query = '',
     String? gender,
     bool includeArchived = false,
-  }) {
-    final rows = _db.select('''
-      SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
-             a.aliases_json, a.gender, a.romanized_name, a.birth_date, a.birth_month,
-             a.height_cm, a.weight_kg, a.measurements, a.body_type, a.country,
-             a.birthplace, a.cup, a.career_period, a.debut_month, a.debut_description,
-             a.account_url, a.official_site_url, a.photo_asset_id, a.backdrop_asset_id,
-             a.publisher_names_json,
-             a.created_at, a.updated_at, a.archived_at,
-              COUNT(CASE WHEN linked_movie.lifecycle_state = 'active' THEN l.movie_id END) AS movie_count
-       FROM actors a
-       LEFT JOIN movie_actor_links l ON l.actor_id = a.id
-       LEFT JOIN movies linked_movie ON linked_movie.id = l.movie_id
-      WHERE (? = 1 OR a.archived_at IS NULL)
-        AND (? IS NULL OR a.gender = ?)
-      GROUP BY a.id
-      ORDER BY a.created_at DESC, a.id DESC
-    ''', [includeArchived ? 1 : 0, gender, gender]);
-    final normalizedQuery = _normalizeActorSearch(query);
-    return rows
-        .map(_mapActor)
-        .where((actor) =>
-            normalizedQuery.isEmpty ||
-            _actorSearchText(actor).contains(normalizedQuery))
-        .toList(growable: false);
-  }
+  }) =>
+      _profiles.listActors(
+          query: query, gender: gender, includeArchived: includeArchived);
 
-  NasActor? findActor(String actorId) {
-    final rows = _db.select('''
-      SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
-             a.aliases_json, a.gender, a.romanized_name, a.birth_date, a.birth_month,
-             a.height_cm, a.weight_kg, a.measurements, a.body_type, a.country,
-             a.birthplace, a.cup, a.career_period, a.debut_month, a.debut_description,
-             a.account_url, a.official_site_url, a.photo_asset_id, a.backdrop_asset_id,
-             a.publisher_names_json,
-             a.created_at, a.updated_at, a.archived_at,
-              COUNT(CASE WHEN linked_movie.lifecycle_state = 'active' THEN l.movie_id END) AS movie_count
-       FROM actors a
-       LEFT JOIN movie_actor_links l ON l.actor_id = a.id
-       LEFT JOIN movies linked_movie ON linked_movie.id = l.movie_id
-      WHERE a.id = ?
-      GROUP BY a.id
-    ''', [actorId]);
-    return rows.isEmpty ? null : _mapActor(rows.single);
-  }
+  NasActor? findActor(String actorId) => _profiles.findActor(actorId);
 
-  NasActor? findActorByProfileIdentity(String profileIdentity) {
-    final rows = _db.select(
-      'SELECT id FROM actors WHERE profile_identity = ?',
-      [profileIdentity],
-    );
-    return rows.isEmpty ? null : findActor(rows.single['id'] as String);
-  }
+  NasActor? findActorByProfileIdentity(String profileIdentity) =>
+      _profiles.findActorByProfileIdentity(profileIdentity);
 
-  bool actorDisplayNameExists(String displayName) => _db.select('''
-    SELECT 1 FROM actors
-    WHERE lower(COALESCE(NULLIF(stage_name, ''), NULLIF(original_name, ''),
-      NULLIF(translated_name, ''))) = lower(?)
-    LIMIT 1
-  ''', [displayName.trim()]).isNotEmpty;
+  bool actorDisplayNameExists(String displayName) =>
+      _profiles.actorDisplayNameExists(displayName);
 
   /// 仅接受与任一已保存演员名称完全相等的活动演员，模糊候选必须人工处理。
-  NasActor? findActiveActorByExactName(String name) {
-    final matches = findActorsByExactNames([name]);
-    return matches.length == 1 ? matches.single : null;
-  }
+  NasActor? findActiveActorByExactName(String name) =>
+      _profiles.findActiveActorByExactName(name);
 
   /// 同时核对所有姓名和别名；不同名字指向多位演员时必须人工选择。
   List<NasActor> findActorsByExactNames(Iterable<String> names,
-      {bool includeArchived = false}) {
-    final normalized = names.map((name) => name.trim().toLowerCase())
-        .where((name) => name.isNotEmpty).toSet();
-    if (normalized.isEmpty) return const [];
-    final sourceNames = <String, List<String>>{};
-    for (final row in _db.select('SELECT actor_id,source_name FROM mdcng_actor_source_links')) {
-      sourceNames.putIfAbsent(row['actor_id'] as String, () => [])
-          .add(row['source_name'] as String);
-    }
-    return listActors(includeArchived: includeArchived).where((actor) {
-      final names = <String?>[
-        actor.stageName,
-        actor.originalName,
-        actor.translatedName,
-        ...actor.aliases,
-        ...?sourceNames[actor.id],
-      ];
-      return names
-          .any((candidate) => normalized.contains(candidate?.trim().toLowerCase()));
-    }).toList(growable: false);
-  }
+          {bool includeArchived = false}) =>
+      _profiles.findActorsByExactNames(names, includeArchived: includeArchived);
 
-  List<NasActor> actorsForMovie(String movieId) {
-    final ids = _db.select('''
-      SELECT actor_id FROM movie_actor_links
-      WHERE movie_id = ? ORDER BY actor_id
-    ''', [movieId]);
-    return ids
-        .map((row) => findActor(row['actor_id'] as String))
-        .whereType<NasActor>()
-        .toList(growable: false);
-  }
+  List<NasActor> actorsForMovie(String movieId) =>
+      _profiles.actorsForMovie(movieId);
 
-  List<NasLibraryMovie> moviesForActor(String actorId, {String query = ''}) {
-    final movieIds = _db.select('''
-      SELECT links.movie_id FROM movie_actor_links links
-      JOIN movies m ON m.id = links.movie_id
-      WHERE links.actor_id = ? AND m.lifecycle_state = 'active'
-    ''', [actorId]).map((row) => row['movie_id'] as String).toSet();
-    if (movieIds.isEmpty) return const [];
-    return listMovies(query: query)
-        .where((movie) => movieIds.contains(movie.id))
-        .toList(growable: false);
-  }
+  List<NasLibraryMovie> moviesForActor(String actorId, {String query = ''}) =>
+      _profiles.moviesForActor(actorId, query: query);
 
-  List<NasActorCoactor> coactorsForActor(String actorId) {
-    final rows = _db.select('''
-      SELECT l2.actor_id, COUNT(*) AS movie_count
-      FROM movie_actor_links l1
-      JOIN movie_actor_links l2 ON l2.movie_id = l1.movie_id
-      JOIN movies m ON m.id = l1.movie_id
-      WHERE l1.actor_id = ? AND l2.actor_id != ? AND m.lifecycle_state = 'active'
-      GROUP BY l2.actor_id
-      ORDER BY movie_count DESC, l2.actor_id ASC
-    ''', [actorId, actorId]);
-    return rows
-        .map((row) {
-          final actor = findActor(row['actor_id'] as String);
-          return actor == null
-              ? null
-              : NasActorCoactor(
-                  actor: actor,
-                  movieCount: row['movie_count'] as int,
-                );
-        })
-        .whereType<NasActorCoactor>()
-        .toList(growable: false);
-  }
+  List<NasActorCoactor> coactorsForActor(String actorId) =>
+      _profiles.coactorsForActor(actorId);
 
   List<NasActor> findSimilarActors({
     String? stageName,
@@ -3529,24 +487,13 @@ class NasLibraryDatabase {
     String? translatedName,
     List<String> aliases = const [],
     List<NasActor>? candidates,
-  }) {
-    final names = <String?>[
-      stageName,
-      originalName,
-      translatedName,
-      ...aliases,
-    ];
-    final queries = names
-        .map(_nullableTrimmed)
-        .whereType<String>()
-        .map(_normalizeActorSearch)
-        .where((value) => value.isNotEmpty)
-        .toSet();
-    if (queries.isEmpty) return const [];
-    return (candidates ?? listActors(includeArchived: true))
-        .where((actor) => queries.any(_actorSearchText(actor).contains))
-        .toList(growable: false);
-  }
+  }) =>
+      _profiles.findSimilarActors(
+          stageName: stageName,
+          originalName: originalName,
+          translatedName: translatedName,
+          aliases: aliases,
+          candidates: candidates);
 
   NasActor createActor({
     String? profileIdentity,
@@ -3573,141 +520,69 @@ class NasLibraryDatabase {
     String? photoAssetId,
     String? backdropAssetId,
     List<String> publisherNames = const [],
-  }) {
-    final timestamp = _now();
-    final id = newUuidV4();
-    _db.execute('''
-      INSERT INTO actors(
-        id, profile_identity, stage_name, original_name, translated_name, aliases_json, gender,
-        romanized_name, birth_date, birth_month, height_cm, weight_kg, measurements, body_type,
-        country, birthplace, cup, career_period, debut_month, debut_description,
-        account_url, official_site_url, photo_asset_id, backdrop_asset_id, publisher_names_json,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', [
-      id,
-      _nullableTrimmed(profileIdentity) ?? newUuidV4(),
-      _nullableTrimmed(stageName),
-      _nullableTrimmed(originalName),
-      _nullableTrimmed(translatedName),
-      jsonEncode(_cleanTextList(aliases)),
-      gender,
-      _nullableTrimmed(romanizedName),
-      _nullableTrimmed(birthDate),
-      _nullableTrimmed(birthMonth),
-      heightCm,
-      weightKg,
-      _nullableTrimmed(measurements),
-      _nullableTrimmed(bodyType),
-      _nullableTrimmed(country),
-      _nullableTrimmed(birthplace),
-      _nullableTrimmed(cup),
-      _nullableTrimmed(careerPeriod),
-      _nullableTrimmed(debutMonth),
-      _nullableTrimmed(debutDescription),
-      _nullableTrimmed(accountUrl),
-      _nullableTrimmed(officialSiteUrl),
-      photoAssetId,
-      backdropAssetId,
-      jsonEncode(_cleanTextList(publisherNames)),
-      timestamp,
-      timestamp,
-    ]);
-    return findActor(id)!;
-  }
+  }) =>
+      _profiles.createActor(
+          profileIdentity: profileIdentity,
+          stageName: stageName,
+          originalName: originalName,
+          translatedName: translatedName,
+          aliases: aliases,
+          gender: gender,
+          romanizedName: romanizedName,
+          birthDate: birthDate,
+          birthMonth: birthMonth,
+          heightCm: heightCm,
+          weightKg: weightKg,
+          measurements: measurements,
+          bodyType: bodyType,
+          country: country,
+          birthplace: birthplace,
+          cup: cup,
+          careerPeriod: careerPeriod,
+          debutMonth: debutMonth,
+          debutDescription: debutDescription,
+          accountUrl: accountUrl,
+          officialSiteUrl: officialSiteUrl,
+          photoAssetId: photoAssetId,
+          backdropAssetId: backdropAssetId,
+          publisherNames: publisherNames);
 
-  NasActor? updateActor(String actorId, Map<String, Object?> values) {
-    if (findActor(actorId) == null) return null;
-    if (values.isEmpty) return findActor(actorId);
-    markScrapeManual('actor', actorId, values.keys);
-    final assignments = <String>[];
-    final parameters = <Object?>[];
-    values.forEach((key, value) {
-      assignments.add('$key = ?');
-      parameters.add(value);
-    });
-    assignments.add('updated_at = ?');
-    parameters
-      ..add(_now())
-      ..add(actorId);
-    _db.execute(
-      'UPDATE actors SET ${assignments.join(', ')} WHERE id = ?',
-      parameters,
-    );
-    return findActor(actorId);
-  }
+  NasActor? updateActor(String actorId, Map<String, Object?> values) =>
+      _profiles.updateActor(actorId, values);
 
   NasMdcngActorImportRecord? findMdcngActorImport({
     required String sourceId,
     required String taskId,
     required String sourceFingerprint,
-  }) {
-    final rows = _db.select('''
-      SELECT id, actor_id, source_id, task_id, emby_id, source_fingerprint,
-             applied_fields_json, created_at
-      FROM mdcng_actor_import_records
-      WHERE source_id = ? AND task_id = ? AND source_fingerprint = ?
-      LIMIT 1
-    ''', [sourceId, taskId, sourceFingerprint]);
-    return rows.isEmpty ? null : _mapMdcngActorImportRecord(rows.single);
-  }
+  }) =>
+      _profiles.findMdcngActorImport(
+          sourceId: sourceId,
+          taskId: taskId,
+          sourceFingerprint: sourceFingerprint);
 
   NasActor? findActorByMdcngSource({
     required String sourceId,
     required String embyId,
-  }) {
-    final rows = _db.select('''
-      SELECT actor_id FROM mdcng_actor_source_links
-      WHERE source_id = ? AND emby_id = ?
-      LIMIT 1
-    ''', [sourceId, embyId]);
-    return rows.isEmpty ? null : findActor(rows.single['actor_id'] as String);
-  }
+  }) =>
+      _profiles.findActorByMdcngSource(sourceId: sourceId, embyId: embyId);
 
-  Set<String> mdcngDeferredEmbyIdsForSource(String sourceId) => _db
-      .select('SELECT emby_id FROM mdcng_actor_deferred WHERE source_id = ?',
-          [sourceId])
-      .map((row) => row['emby_id'] as String)
-      .toSet();
+  Set<String> mdcngDeferredEmbyIdsForSource(String sourceId) =>
+      _profiles.mdcngDeferredEmbyIdsForSource(sourceId);
 
   bool isMdcngActorDeferred(
           {required String sourceId, required String embyId}) =>
-      _db.select('''
-        SELECT 1 FROM mdcng_actor_deferred
-        WHERE source_id = ? AND emby_id = ? LIMIT 1
-      ''', [sourceId, embyId]).isNotEmpty;
+      _profiles.isMdcngActorDeferred(sourceId: sourceId, embyId: embyId);
 
   void setMdcngActorDeferred({
     required String sourceId,
     required String embyId,
     required bool deferred,
-  }) {
-    if (isMdcngActorDeferred(sourceId: sourceId, embyId: embyId) == deferred) {
-      return;
-    }
-    if (deferred) {
-      _db.execute('''
-        INSERT INTO mdcng_actor_deferred(source_id, emby_id, created_at)
-        VALUES (?, ?, ?)
-      ''', [sourceId, embyId, _now()]);
-    } else {
-      _db.execute('''
-        DELETE FROM mdcng_actor_deferred
-        WHERE source_id = ? AND emby_id = ?
-      ''', [sourceId, embyId]);
-    }
-  }
+  }) =>
+      _profiles.setMdcngActorDeferred(
+          sourceId: sourceId, embyId: embyId, deferred: deferred);
 
-  Map<String, String> mdcngProfileKeysForSource(String sourceId) {
-    final rows = _db.select('''
-      SELECT emby_id, profile_key FROM mdcng_actor_source_links
-      WHERE source_id = ? AND profile_key IS NOT NULL AND profile_key != ''
-    ''', [sourceId]);
-    return {
-      for (final row in rows)
-        row['emby_id'] as String: row['profile_key'] as String,
-    };
-  }
+  Map<String, String> mdcngProfileKeysForSource(String sourceId) =>
+      _profiles.mdcngProfileKeysForSource(sourceId);
 
   void linkActorToMdcngSource({
     required String sourceId,
@@ -3716,24 +591,18 @@ class NasLibraryDatabase {
     required String sourceName,
     required String profileKey,
     bool reconcileMovies = true,
-  }) {
-    _db.execute('''
-      INSERT INTO mdcng_actor_source_links(
-        source_id, emby_id, actor_id, source_name, profile_key, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(source_id, emby_id) DO UPDATE SET
-        actor_id = excluded.actor_id,
-        source_name = excluded.source_name,
-        profile_key = excluded.profile_key,
-        updated_at = excluded.updated_at
-    ''', [sourceId, embyId, actorId, sourceName.trim(), profileKey, _now()]);
-    if (reconcileMovies) reconcileScrapeActorMovies(actorId);
-  }
+  }) =>
+      _profiles.linkActorToMdcngSource(
+          sourceId: sourceId,
+          embyId: embyId,
+          actorId: actorId,
+          sourceName: sourceName,
+          profileKey: profileKey,
+          reconcileMovies: reconcileMovies);
 
-  bool actorHasOtherMdcngIdentity(String actorId, String sourceId, String embyId) =>
-      _db.select('''SELECT 1 FROM mdcng_actor_source_links
-        WHERE actor_id=? AND source_id=? AND emby_id!=? LIMIT 1''',
-        [actorId, sourceId, embyId]).isNotEmpty;
+  bool actorHasOtherMdcngIdentity(
+          String actorId, String sourceId, String embyId) =>
+      _profiles.actorHasOtherMdcngIdentity(actorId, sourceId, embyId);
 
   NasMdcngActorImportRecord addMdcngActorImport({
     required String actorId,
@@ -3742,387 +611,94 @@ class NasLibraryDatabase {
     required String embyId,
     required String sourceFingerprint,
     required List<String> appliedFields,
-  }) {
-    final record = NasMdcngActorImportRecord(
-      id: newUuidV4(),
-      actorId: actorId,
-      sourceId: sourceId,
-      taskId: taskId,
-      embyId: embyId,
-      sourceFingerprint: sourceFingerprint,
-      appliedFields: _cleanTextList(appliedFields),
-      createdAt: _now(),
-    );
-    _db.execute('''
-      INSERT INTO mdcng_actor_import_records(
-        id, actor_id, source_id, task_id, emby_id, source_fingerprint,
-        applied_fields_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', [
-      record.id,
-      record.actorId,
-      record.sourceId,
-      record.taskId,
-      record.embyId,
-      record.sourceFingerprint,
-      jsonEncode(record.appliedFields),
-      record.createdAt,
-    ]);
-    return record;
-  }
+  }) =>
+      _profiles.addMdcngActorImport(
+          actorId: actorId,
+          sourceId: sourceId,
+          taskId: taskId,
+          embyId: embyId,
+          sourceFingerprint: sourceFingerprint,
+          appliedFields: appliedFields);
 
-  NasActor? archiveActor(String actorId) => updateActor(actorId, {
-        'archived_at': _now(),
-      });
+  NasActor? archiveActor(String actorId) => _profiles.archiveActor(actorId);
 
   /// 删除无活跃影片关联的演员；归并审计关系不再阻止资料清理。
-  bool deleteActor(String actorId) {
-    if (findActor(actorId) == null) return false;
-    final hasActiveReferences = _db.select('''
-      SELECT 1 FROM movie_actor_links links
-      JOIN movies m ON m.id = links.movie_id
-      WHERE links.actor_id = ? AND m.lifecycle_state = 'active'
-      LIMIT 1
-    ''', [actorId]).isNotEmpty;
-    if (hasActiveReferences) return false;
-    _db.execute('''
-      DELETE FROM movie_actor_links
-      WHERE actor_id = ? AND movie_id IN (
-        SELECT id FROM movies WHERE lifecycle_state = 'merged'
-      )
-    ''', [actorId]);
-    _db.execute('DELETE FROM actors WHERE id = ?', [actorId]);
-    return true;
-  }
+  bool deleteActor(String actorId) => _profiles.deleteActor(actorId);
 
   /// Removes the current MDCNG actor import state in one transaction. All
   /// actor-to-movie links are removed first so every actor can be deleted,
   /// including actors that are currently used by active movies.
-  NasMdcngActorReset clearAllMdcngActors() {
-    final actorRows = _db.select('''
-      SELECT photo_asset_id, backdrop_asset_id FROM actors
-    ''');
-    final assetIds = actorRows
-        .expand((row) => [row['photo_asset_id'], row['backdrop_asset_id']])
-        .whereType<String>()
-        .toSet();
-    final assets = assetIds
-        .map(findManagedAsset)
-        .whereType<NasManagedAsset>()
-        .toList(growable: false);
-    final actorCount = (_db
-            .select('SELECT COUNT(*) AS count FROM actors')
-            .single['count'] as int? ??
-        0);
-    final movieLinkCount = (_db
-            .select('SELECT COUNT(*) AS count FROM movie_actor_links')
-            .single['count'] as int? ??
-        0);
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      _db.execute('DELETE FROM movie_actor_links');
-      _db.execute('DELETE FROM mdcng_actor_source_links');
-      _db.execute('DELETE FROM mdcng_actor_import_records');
-      _db.execute('DELETE FROM mdcng_actor_deferred');
-      _db.execute('DELETE FROM actors');
-      _db.execute('COMMIT');
-    } on Object {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return NasMdcngActorReset(
-      deletedActors: actorCount,
-      unlinkedMovieLinks: movieLinkCount,
-      assets: assets,
-    );
-  }
+  NasMdcngActorReset clearAllMdcngActors() => _profiles.clearAllMdcngActors();
 
   bool setMovieActorIds({
     required String movieId,
     required List<String> actorIds,
-  }) {
-    if (findMovieForAdmin(movieId) == null ||
-        actorIds.toSet().length != actorIds.length ||
-        actorIds.any((id) => findActor(id) == null)) {
-      return false;
-    }
-    _db.execute('BEGIN');
-    try {
-      _db.execute(
-          'DELETE FROM movie_actor_links WHERE movie_id = ?', [movieId]);
-      for (final actorId in actorIds) {
-        _db.execute(
-          'INSERT INTO movie_actor_links(movie_id, actor_id) VALUES (?, ?)',
-          [movieId, actorId],
-        );
-      }
-      _db.execute('COMMIT');
-      return true;
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-  }
+  }) =>
+      _profiles.setMovieActorIds(movieId: movieId, actorIds: actorIds);
 
   NasManagedAsset addManagedAsset({
     required String id,
     required String purpose,
     required String fileName,
     required String mimeType,
-  }) {
-    final asset = NasManagedAsset(
-      id: id,
-      purpose: purpose,
-      fileName: fileName,
-      mimeType: mimeType,
-      createdAt: _now(),
-    );
-    _db.execute('''
-      INSERT INTO managed_assets(id, purpose, file_name, mime_type, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    ''', [
-      asset.id,
-      asset.purpose,
-      asset.fileName,
-      asset.mimeType,
-      asset.createdAt
-    ]);
-    return asset;
-  }
+  }) =>
+      _assets.addManagedAsset(
+          id: id, purpose: purpose, fileName: fileName, mimeType: mimeType);
 
-  NasManagedAsset? findManagedAsset(String assetId) {
-    final rows = _db.select('''
-      SELECT id, purpose, file_name, mime_type, created_at
-      FROM managed_assets WHERE id = ?
-    ''', [assetId]);
-    if (rows.isEmpty) return null;
-    final row = rows.single;
-    return NasManagedAsset(
-      id: row['id'] as String,
-      purpose: row['purpose'] as String,
-      fileName: row['file_name'] as String,
-      mimeType: row['mime_type'] as String,
-      createdAt: row['created_at'] as String,
-    );
-  }
+  NasManagedAsset? findManagedAsset(String assetId) =>
+      _assets.findManagedAsset(assetId);
 
   /// 删除受管理资产记录，供演员删除等场景同步清理 NAS 资产目录。
-  NasManagedAsset? removeManagedAsset(String assetId) {
-    final asset = findManagedAsset(assetId);
-    if (asset == null) return null;
-    _db.execute('DELETE FROM managed_assets WHERE id = ?', [assetId]);
-    return asset;
-  }
+  NasManagedAsset? removeManagedAsset(String assetId) =>
+      _assets.removeManagedAsset(assetId);
 
   NasAiTask? createAiTask({
     required String movieId,
     required String instructions,
-  }) {
-    if (findMovieForAdmin(movieId) == null) return null;
-    final task = NasAiTask(
-      id: newUuidV4(),
-      movieId: movieId,
-      instructions: instructions,
-      status: 'queued',
-      createdAt: _now(),
-    );
-    _db.execute('''
-      INSERT INTO ai_metadata_tasks(
-        id, movie_id, instructions, status, created_at
-      ) VALUES (?, ?, ?, ?, ?)
-    ''', [
-      task.id,
-      task.movieId,
-      task.instructions,
-      task.status,
-      task.createdAt
-    ]);
-    return task;
-  }
+  }) =>
+      _metadata.createAiTask(movieId: movieId, instructions: instructions);
 
-  NasAiTask? findAiTask(String taskId) {
-    final rows = _db.select('''
-      SELECT id, movie_id, instructions, status, result_json, error_code,
-             created_at, finished_at
-      FROM ai_metadata_tasks WHERE id = ?
-    ''', [taskId]);
-    if (rows.isEmpty) return null;
-    final row = rows.single;
-    return NasAiTask(
-      id: row['id'] as String,
-      movieId: row['movie_id'] as String,
-      instructions: row['instructions'] as String,
-      status: row['status'] as String,
-      resultJson: row['result_json'] as String?,
-      errorCode: row['error_code'] as String?,
-      createdAt: row['created_at'] as String,
-      finishedAt: row['finished_at'] as String?,
-    );
-  }
+  NasAiTask? findAiTask(String taskId) => _metadata.findAiTask(taskId);
 
-  NasAiTask? markAiTaskRunning(String taskId) {
-    final existing = findAiTask(taskId);
-    if (existing == null || existing.status != 'queued') return null;
-    _db.execute('''
-      UPDATE ai_metadata_tasks
-      SET status = 'running', error_code = NULL, result_json = NULL,
-          finished_at = NULL
-      WHERE id = ? AND status = 'queued'
-    ''', [taskId]);
-    return findAiTask(taskId);
-  }
+  NasAiTask? markAiTaskRunning(String taskId) =>
+      _metadata.markAiTaskRunning(taskId);
 
-  NasAiTask? completeAiTask(String taskId, Map<String, Object?> result) {
-    final existing = findAiTask(taskId);
-    if (existing == null || existing.status != 'running') return null;
-    _db.execute('''
-      UPDATE ai_metadata_tasks
-      SET status = 'succeeded', result_json = ?, error_code = NULL,
-          finished_at = ?
-      WHERE id = ? AND status = 'running'
-    ''', [jsonEncode(result), _now(), taskId]);
-    return findAiTask(taskId);
-  }
+  NasAiTask? completeAiTask(String taskId, Map<String, Object?> result) =>
+      _metadata.completeAiTask(taskId, result);
 
-  NasAiTask? failAiTask(String taskId, String errorCode) {
-    final existing = findAiTask(taskId);
-    if (existing == null || existing.status != 'running') return null;
-    _db.execute('''
-      UPDATE ai_metadata_tasks
-      SET status = 'failed', result_json = NULL, error_code = ?, finished_at = ?
-      WHERE id = ? AND status = 'running'
-    ''', [errorCode, _now(), taskId]);
-    return findAiTask(taskId);
-  }
+  NasAiTask? failAiTask(String taskId, String errorCode) =>
+      _metadata.failAiTask(taskId, errorCode);
 
-  bool get hasMediaRoots =>
-      _db.select('SELECT 1 FROM media_roots LIMIT 1').isNotEmpty;
+  bool get hasMediaRoots => _queries.hasMediaRoots;
 
-  bool get hasScannedMediaRoots => _db
-      .select(
-          'SELECT 1 FROM media_roots WHERE last_scanned_at IS NOT NULL LIMIT 1')
-      .isNotEmpty;
+  bool get hasScannedMediaRoots => _queries.hasScannedMediaRoots;
 
-  NasLibraryMovie? findMovie(String movieId) {
-    final movie = findMovieForAdmin(movieId);
-    if (movie == null ||
-        _db.select(
-          "SELECT 1 FROM movies WHERE id = ? AND lifecycle_state = 'active'",
-          [movieId],
-        ).isEmpty ||
-        (movie.entryType != 'series' && movie.episodeCount == 0)) {
-      return null;
-    }
-    return movie;
-  }
+  NasLibraryMovie? findMovie(String movieId) => _queries.findMovie(movieId);
 
-  NasLibraryMovie? findMovieForAdmin(String movieId) {
-    final rows = _db.select('''
-      SELECT m.id, m.title, m.original_title, m.catalog_number,
-             m.publisher_id, p.display_name AS publisher_name,
-             m.series_id, s.display_name AS series_name,
-             m.summary, m.actors_json, m.poster_file_name, m.play_count,
-             m.is_favorite,
-             m.category_id, c.name AS category_name,
-             m.updated_at, m.entry_type, COUNT(e.id) AS episode_count,
-             SUM(CASE WHEN e.duration_ms IS NULL THEN 0 ELSE e.duration_ms END) AS duration_ms
-      FROM movies m
-      LEFT JOIN publishers p ON p.id = m.publisher_id
-      LEFT JOIN series s ON s.id = m.series_id
-      LEFT JOIN library_categories c ON c.id = m.category_id
-      LEFT JOIN episodes e ON e.movie_id = m.id
-      WHERE m.id = ?
-      GROUP BY m.id
-    ''', [movieId]);
-    return rows.isEmpty ? null : _withResolution(_mapMovie(rows.single));
-  }
+  NasLibraryMovie? findMovieForAdmin(String movieId) =>
+      _queries.findMovieForAdmin(movieId);
 
-  List<String> activeMovieIdsForCategory(String categoryId) => _db
-      .select('''
-        SELECT id FROM movies
-        WHERE category_id = ? AND lifecycle_state = 'active'
-          AND EXISTS (SELECT 1 FROM episodes WHERE movie_id = movies.id)
-        ORDER BY id
-      ''', [categoryId])
-      .map((row) => row['id'] as String)
-      .toList(growable: false);
+  List<String> activeMovieIdsForCategory(String categoryId) =>
+      _queries.activeMovieIdsForCategory(categoryId);
 
-  String? preferredMdcngEpisodeIdForMovie(String movieId) {
-    final linked = _db.select('''
-      SELECT record.episode_id FROM movie_metadata_field_sources source
-      JOIN mdcng_import_records record ON record.id = source.import_record_id
-      WHERE source.movie_id = ?
-      ORDER BY record.created_at DESC, record.id DESC LIMIT 1
-    ''', [movieId]);
-    if (linked.isNotEmpty) return linked.single['episode_id'] as String;
-    final rows = _db.select('''
-      SELECT episode_id FROM mdcng_import_records
-      WHERE movie_id = ? ORDER BY created_at DESC, id DESC LIMIT 1
-    ''', [movieId]);
-    return rows.isEmpty ? null : rows.single['episode_id'] as String;
-  }
+  String? preferredMdcngEpisodeIdForMovie(String movieId) =>
+      _queries.preferredMdcngEpisodeIdForMovie(movieId);
 
-  bool hasDefaultScannedTitle(String movieId) {
-    final rows = _db.select('''
-      SELECT m.title, m.entry_type, m.collection_key,
-             (SELECT e.relative_path FROM episodes e
-              WHERE e.movie_id = m.id ORDER BY e.id LIMIT 1) AS relative_path
-      FROM movies m WHERE m.id = ?
-    ''', [movieId]);
-    if (rows.isEmpty) return false;
-    final row = rows.single;
-    final collectionKey = row['collection_key'] as String?;
-    if (collectionKey != null) {
-      final folder = collectionKey
-          .substring(collectionKey.indexOf(':') + 1)
-          .split('/')
-          .last;
-      return row['title'] == _collectionTitleFromDirectory(folder);
-    }
-    if (row['entry_type'] != 'single') return false;
-    final path = row['relative_path'] as String?;
-    return path != null && row['title'] == _titleFromPath(path);
-  }
+  bool hasDefaultScannedTitle(String movieId) =>
+      _queries.hasDefaultScannedTitle(movieId);
 
   NasLibraryMovie? setMovieFavorite({
     required String movieId,
     required bool isFavorite,
-  }) {
-    if (findMovie(movieId) == null) return null;
-    _db.execute(
-      'UPDATE movies SET is_favorite = ?, updated_at = ? WHERE id = ?',
-      [isFavorite ? 1 : 0, _now(), movieId],
-    );
-    return findMovie(movieId);
-  }
+  }) =>
+      _movies.setMovieFavorite(movieId: movieId, isFavorite: isFavorite);
 
-  NasRemovedMovieIndex? removeMovieFromIndex(String movieId) {
-    final movie = findMovie(movieId);
-    if (movie == null) return null;
-    return transaction(() => _removeMovieIndex(movie));
-  }
+  NasRemovedMovieIndex? removeMovieFromIndex(String movieId) =>
+      _movies.removeMovieFromIndex(movieId);
 
   /// 调用方负责事务；先解除限制删除的引用，再级联清理影片关联。
-  NasRemovedMovieIndex _removeMovieIndex(NasLibraryMovie movie) {
-    final movieId = movie.id;
-    final carouselFileNames = _db
-        .select(
-          'SELECT file_name FROM movie_carousel_images WHERE movie_id = ?',
-          [movieId],
-        )
-        .map((row) => row['file_name'] as String)
-        .toList(growable: false);
-    _db.execute('''DELETE FROM mdcng_import_records WHERE movie_id = ? OR
-      episode_id IN (SELECT id FROM episodes WHERE movie_id = ?)''', [movieId, movieId]);
-    _db.execute('UPDATE movies SET merged_into_movie_id=NULL WHERE merged_into_movie_id=?', [movieId]);
-    _db.execute("DELETE FROM scrape_fields WHERE kind='movie' AND entity_id=?", [movieId]);
-    _db.execute("DELETE FROM scrape_sources WHERE kind='movie' AND entity_id=?", [movieId]);
-    _db.execute('DELETE FROM movies WHERE id = ?', [movieId]);
-    return NasRemovedMovieIndex(
-      posterFileName: movie.posterFileName,
-      carouselFileNames: carouselFileNames,
-    );
-  }
+  NasRemovedMovieIndex _removeMovieIndex(NasLibraryMovie movie) =>
+      _movies.removeMovieIndex(movie);
 
   /// 统一替换影片可编辑元数据，供 Windows 手动管理与未来 AI 富化共用。
   NasLibraryMovie? updateMovieMetadata({
@@ -4137,65 +713,22 @@ class NasLibraryDatabase {
     String? seriesName,
     bool updateSeriesName = false,
     String? summary,
-  }) {
-    if (findMovieForAdmin(movieId) == null) return null;
-    if (title == null &&
-        !updateOriginalTitle &&
-        !updateCatalogNumber &&
-        !updatePublisherName &&
-        !updateSeriesName &&
-        summary == null) {
-      return findMovieForAdmin(movieId);
-    }
-    final assignments = <String>[];
-    final values = <Object?>[];
-    if (title != null) {
-      assignments.add('title = ?');
-      values.add(title);
-    }
-    if (updateOriginalTitle) {
-      assignments.add('original_title = ?');
-      values.add(_nullableTrimmed(originalTitle));
-    }
-    if (updateCatalogNumber) {
-      assignments.add('catalog_number = ?');
-      values.add(_nullableTrimmed(catalogNumber));
-    }
-    if (updatePublisherName) {
-      assignments.add('publisher_name = ?');
-      values.add(_nullableTrimmed(publisherName));
-    }
-    if (updateSeriesName) {
-      assignments.add('series_name = ?');
-      values.add(_nullableTrimmed(seriesName));
-    }
-    if (summary != null) {
-      assignments.add('summary = ?');
-      values.add(summary);
-    }
-    assignments.add('updated_at = ?');
-    values.add(_now());
-    values.add(movieId);
-    _db.execute(
-      'UPDATE movies SET ${assignments.join(', ')} WHERE id = ?',
-      values,
-    );
-    return findMovieForAdmin(movieId);
-  }
+  }) =>
+      _movies.updateMovieMetadata(
+          movieId: movieId,
+          title: title,
+          originalTitle: originalTitle,
+          updateOriginalTitle: updateOriginalTitle,
+          catalogNumber: catalogNumber,
+          updateCatalogNumber: updateCatalogNumber,
+          publisherName: publisherName,
+          updatePublisherName: updatePublisherName,
+          seriesName: seriesName,
+          updateSeriesName: updateSeriesName,
+          summary: summary);
 
-  List<NasLibraryEpisode> episodesForMovie(String movieId) {
-    final rows = _db.select('''
-      SELECT e.id, e.movie_id, e.media_root_id, e.title, e.relative_path, e.file_size, e.is_available,
-             e.duration_ms, e.video_width, e.video_height, e.resolution_label,
-             e.media_modified_at, e.updated_at, e.natural_sort_key, e.manual_order,
-             root.name AS source_name, root.is_online AS source_online
-      FROM episodes e JOIN media_roots root ON root.id = e.media_root_id
-      WHERE e.movie_id = ?
-      ORDER BY e.manual_order IS NOT NULL DESC, e.manual_order,
-               e.natural_sort_key COLLATE NOCASE, e.relative_path COLLATE NOCASE, e.id
-    ''', [movieId]);
-    return rows.map(_mapEpisode).toList(growable: false);
-  }
+  List<NasLibraryEpisode> episodesForMovie(String movieId) =>
+      _queries.episodesForMovie(movieId);
 
   NasEpisodePage episodePageForMovie({
     required String movieId,
@@ -4203,671 +736,87 @@ class NasLibraryDatabase {
     required int page,
     required int pageSize,
     String? anchorEpisodeId,
-  }) {
-    if (page < 1 || pageSize < 1 || pageSize > 100 || query.length > 120) {
-      throw ArgumentError('分集分页参数无效');
-    }
-    final like = '%${query.trim()}%';
-    final total = _db.select('''
-      SELECT COUNT(*) AS count FROM episodes
-      WHERE movie_id = ? AND (? = '%%' OR lower(title) LIKE lower(?))
-    ''', [movieId, like, like]).single['count'] as int;
-    var effectivePage = page;
-    if (anchorEpisodeId != null) {
-      final ordered = _db.select('''
-        SELECT id FROM episodes
-        WHERE movie_id = ? AND (? = '%%' OR lower(title) LIKE lower(?))
-        ORDER BY manual_order IS NOT NULL DESC, manual_order,
-                 natural_sort_key COLLATE NOCASE, relative_path COLLATE NOCASE, id
-      ''', [movieId, like, like]);
-      final index = ordered.indexWhere((row) => row['id'] == anchorEpisodeId);
-      if (index < 0) throw ArgumentError('分集不属于影视条目');
-      effectivePage = index ~/ pageSize + 1;
-    }
-    final offset = (effectivePage - 1) * pageSize;
-    final rows = _db.select('''
-      SELECT e.id, e.movie_id, e.media_root_id, e.title, e.relative_path, e.file_size, e.is_available,
-             e.duration_ms, e.video_width, e.video_height, e.resolution_label,
-             e.media_modified_at, e.updated_at, e.natural_sort_key, e.manual_order,
-             root.name AS source_name, root.is_online AS source_online
-      FROM episodes e JOIN media_roots root ON root.id = e.media_root_id
-      WHERE e.movie_id = ? AND (? = '%%' OR lower(e.title) LIKE lower(?))
-      ORDER BY e.manual_order IS NOT NULL DESC, e.manual_order,
-               e.natural_sort_key COLLATE NOCASE, e.relative_path COLLATE NOCASE, e.id
-      LIMIT ? OFFSET ?
-    ''', [movieId, like, like, pageSize, offset]);
-    final items = rows.map(_mapEpisode).toList(growable: false);
-    return NasEpisodePage(
-      items: items,
-      number: effectivePage,
-      size: pageSize,
-      total: total,
-      hasMore: offset + items.length < total,
-    );
-  }
+  }) =>
+      _queries.episodePageForMovie(
+          movieId: movieId,
+          query: query,
+          page: page,
+          pageSize: pageSize,
+          anchorEpisodeId: anchorEpisodeId);
 
   NasScannedMediaFilePage scannedMediaFiles({
     required int page,
     required int pageSize,
     String query = '',
-  }) {
-    if (page < 1 || pageSize < 1 || pageSize > 100 || query.length > 120) {
-      throw ArgumentError('媒体文件分页参数无效');
-    }
-    final like = '%${query.trim()}%';
-    final total = _db.select('''
-      SELECT COUNT(*) AS count FROM episodes e JOIN movies m ON m.id = e.movie_id
-      WHERE ? = '%%' OR lower(e.title) LIKE lower(?) OR lower(m.title) LIKE lower(?)
-    ''', [like, like, like]).single['count'] as int;
-    final offset = (page - 1) * pageSize;
-    final rows = _db.select('''
-      SELECT e.id, e.movie_id, e.media_root_id, e.title, e.relative_path,
-             e.file_size, e.is_available, e.duration_ms, e.video_width,
-             e.video_height, e.resolution_label, e.media_modified_at, e.updated_at,
-             e.natural_sort_key, e.manual_order, root.name AS source_name,
-              root.is_online AS source_online, m.title AS movie_title,
-              m.entry_type, m.category_id
-      FROM episodes e
-      JOIN movies m ON m.id = e.movie_id
-      JOIN media_roots root ON root.id = e.media_root_id
-      WHERE ? = '%%' OR lower(e.title) LIKE lower(?) OR lower(m.title) LIKE lower(?)
-      ORDER BY e.updated_at DESC, e.id
-      LIMIT ? OFFSET ?
-    ''', [like, like, like, pageSize, offset]);
-    final items = rows
-        .map(
-          (row) => NasScannedMediaFile(
-            episode: _mapEpisode(row),
-            movieId: row['movie_id'] as String,
-            movieTitle: row['movie_title'] as String,
-            entryType: row['entry_type'] as String,
-            categoryId: row['category_id'] as String?,
-          ),
-        )
-        .toList(growable: false);
-    return NasScannedMediaFilePage(
-      items: items,
-      number: page,
-      size: pageSize,
-      total: total,
-      hasMore: offset + items.length < total,
-    );
-  }
+  }) =>
+      _queries.scannedMediaFiles(page: page, pageSize: pageSize, query: query);
 
   NasLibraryMovie createEmptySeries({
     required String title,
     required String categoryId,
-  }) {
-    final normalizedTitle = title.trim();
-    if (normalizedTitle.isEmpty || findCategory(categoryId) == null) {
-      throw ArgumentError('影集资料无效');
-    }
-    final timestamp = _now();
-    final id = newUuidV4();
-    _db.execute('''
-      INSERT INTO movies(id, title, category_id, entry_type, created_at, updated_at)
-      VALUES (?, ?, ?, 'series', ?, ?)
-    ''', [id, normalizedTitle, categoryId, timestamp, timestamp]);
-    return findMovieForAdmin(id)!;
-  }
+  }) =>
+      _collections.createEmptySeries(title: title, categoryId: categoryId);
 
   bool mergeEpisodesIntoSeries({
     required String targetMovieId,
     required List<String> episodeIds,
     required String metadataSourceMovieId,
-  }) {
-    if (episodeIds.isEmpty ||
-        episodeIds.length > 500 ||
-        episodeIds.toSet().length != episodeIds.length) {
-      return false;
-    }
-    final target = findMovieForAdmin(targetMovieId);
-    if (target == null ||
-        target.entryType != 'series' ||
-        _db.select(
-          "SELECT 1 FROM movies WHERE id = ? AND lifecycle_state = 'active'",
-          [targetMovieId],
-        ).isEmpty) {
-      return false;
-    }
-    final placeholders = List.filled(episodeIds.length, '?').join(', ');
-    final rows = _db.select('''
-      SELECT e.id, e.movie_id, m.category_id
-      FROM episodes e JOIN movies m ON m.id = e.movie_id
-      WHERE e.id IN ($placeholders)
-    ''', episodeIds);
-    if (rows.length != episodeIds.length) return false;
-    final sourceMovieIds = rows.map((row) => row['movie_id'] as String).toSet();
-    final sourceMoviePlaceholders =
-        List.filled(sourceMovieIds.length, '?').join(', ');
-    if (metadataSourceMovieId != targetMovieId &&
-        !sourceMovieIds.contains(metadataSourceMovieId)) {
-      return false;
-    }
-    final targetCategory = _db.select(
-      'SELECT category_id FROM movies WHERE id = ?',
-      [targetMovieId],
-    ).single['category_id'] as String?;
-    // 分类是影集的逻辑归属。任何跨分类归并都必须走未来单独设计的迁移流程。
-    if (targetCategory == null ||
-        rows.any((row) => row['category_id'] != targetCategory)) {
-      return false;
-    }
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      if (metadataSourceMovieId != targetMovieId) {
-        _copyMovieMetadataToSeries(
-          fromMovieId: metadataSourceMovieId,
+  }) =>
+      _collections.mergeEpisodesIntoSeries(
           targetMovieId: targetMovieId,
-        );
-      }
-      final movedPlaybackCount = _db.select('''
-        SELECT COUNT(*) AS count FROM playback_history
-        WHERE movie_id != ? AND episode_id IN ($placeholders)
-      ''', [targetMovieId, ...episodeIds]).single['count'] as int;
-      _db.execute('''
-        UPDATE movies
-        SET play_count = MAX(0, play_count - (
-          SELECT COUNT(*) FROM playback_history history
-          WHERE history.movie_id = movies.id
-            AND history.episode_id IN ($placeholders)
-        ))
-        WHERE id IN ($sourceMoviePlaceholders) AND id != ?
-      ''', [
-        ...episodeIds,
-        ...sourceMovieIds,
-        targetMovieId,
-      ]);
-      _db.execute('''
-        UPDATE movies SET play_count = play_count + ? WHERE id = ?
-      ''', [movedPlaybackCount, targetMovieId]);
-      _db.execute('''
-        UPDATE playback_history SET movie_id = ?
-        WHERE episode_id IN ($placeholders) AND movie_id != ?
-      ''', [targetMovieId, ...episodeIds, targetMovieId]);
-      _db.execute('''
-        UPDATE episodes SET movie_id = ? WHERE id IN ($placeholders)
-      ''', [targetMovieId, ...episodeIds]);
-      _db.execute('''
-        UPDATE episode_playback_progress SET movie_id = ?
-        WHERE episode_id IN ($placeholders)
-      ''', [targetMovieId, ...episodeIds]);
-      // 保留旧条目与全部关系以便审计，却从普通查询和统计中明确排除。
-      _db.execute('''
-        UPDATE movies
-        SET lifecycle_state = 'merged', merged_into_movie_id = ?, merged_at = ?,
-            updated_at = ?
-        WHERE id IN ($sourceMoviePlaceholders) AND id != ?
-          AND NOT EXISTS (SELECT 1 FROM episodes WHERE episodes.movie_id = movies.id)
-      ''', [
-        targetMovieId,
-        _now(),
-        _now(),
-        ...sourceMovieIds,
-        targetMovieId,
-      ]);
-      _db.execute(
-        "UPDATE movies SET entry_type = 'series', updated_at = ? WHERE id = ?",
-        [_now(), targetMovieId],
-      );
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return true;
-  }
+          episodeIds: episodeIds,
+          metadataSourceMovieId: metadataSourceMovieId);
 
   List<NasLibraryMovie>? splitEpisodesIntoSingles({
     required String movieId,
     required List<String> episodeIds,
-  }) {
-    if (episodeIds.isEmpty ||
-        episodeIds.length > 500 ||
-        episodeIds.toSet().length != episodeIds.length) {
-      return null;
-    }
-    final source = findMovieForAdmin(movieId);
-    if (source == null || source.entryType != 'series') return null;
-    final placeholders = List.filled(episodeIds.length, '?').join(', ');
-    final episodes = _db.select('''
-      SELECT id, title FROM episodes WHERE movie_id = ? AND id IN ($placeholders)
-    ''', [movieId, ...episodeIds]);
-    if (episodes.length != episodeIds.length) return null;
-    final sourceEpisodeCount = _db.select(
-      'SELECT COUNT(*) AS count FROM episodes WHERE movie_id = ?',
-      [movieId],
-    ).single['count'] as int;
-    final isCompleteSplit = sourceEpisodeCount == episodeIds.length;
-    final created = <NasLibraryMovie>[];
-    final sourceImages = carouselImagesForMovie(movieId);
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      // 必须在迁移历史关联前扣除原影集的计数，避免被已迁走的记录误算为零。
-      _db.execute('''
-        UPDATE movies
-        SET play_count = MAX(0, play_count - (
-          SELECT COUNT(*) FROM playback_history history
-          WHERE history.movie_id = movies.id AND history.episode_id IN ($placeholders)
-        ))
-        WHERE id = ?
-      ''', [...episodeIds, movieId]);
-      for (final episode in episodes) {
-        final id = newUuidV4();
-        final timestamp = _now();
-        _db.execute('''
-          INSERT INTO movies(
-            id, title, original_title, catalog_number, publisher_id, series_id,
-            summary, category_id, poster_file_name, entry_type, play_count,
-            created_at, updated_at
-          ) SELECT ?, ?, original_title, catalog_number, publisher_id, series_id,
-                   summary, category_id, poster_file_name, 'single',
-                   (SELECT COUNT(*) FROM playback_history WHERE movie_id = ? AND episode_id = ?),
-                   ?, ?
-          FROM movies WHERE id = ?
-        ''', [
-          id,
-          episode['title'],
-          movieId,
-          episode['id'],
-          timestamp,
-          timestamp,
-          movieId,
-        ]);
-        _db.execute('''
-          INSERT INTO movie_actor_links(movie_id, actor_id)
-          SELECT ?, actor_id FROM movie_actor_links WHERE movie_id = ?
-        ''', [id, movieId]);
-        _db.execute('''
-          INSERT INTO movie_tag_links(movie_id, tag_id)
-          SELECT ?, tag_id FROM movie_tag_links WHERE movie_id = ?
-        ''', [id, movieId]);
-        _db.execute('UPDATE episodes SET movie_id = ? WHERE id = ?',
-            [id, episode['id']]);
-        _db.execute(
-          'UPDATE episode_playback_progress SET movie_id = ? WHERE episode_id = ?',
-          [id, episode['id']],
-        );
-        _db.execute(
-          'UPDATE playback_history SET movie_id = ? WHERE episode_id = ?',
-          [id, episode['id']],
-        );
-        // 部分拆分时原影集仍可访问，完整拆分时首个新条目接管原记录；
-        // 其余新条目都得到独立图片文件和记录，绝不共享或删除原资产。
-        if (!isCompleteSplit || created.isNotEmpty) {
-          _copyCarouselImages(sourceImages, id);
-        }
-        created.add(findMovieForAdmin(id)!);
-      }
-      if (isCompleteSplit && created.isNotEmpty) {
-        _db.execute(
-          'UPDATE movie_carousel_images SET movie_id = ? WHERE movie_id = ?',
-          [created.first.id, movieId],
-        );
-      }
-      // 完整拆分后，原影集已经被拆出的独立条目替代。保留原行供审计，
-      // 但不能再让没有分集的来源条目参与任何普通列表或资料统计。
-      _db.execute('''
-        UPDATE movies
-        SET entry_type = 'single', collection_key = NULL,
-            lifecycle_state = CASE WHEN ? THEN 'merged' ELSE lifecycle_state END,
-            merged_into_movie_id = CASE WHEN ? THEN NULL ELSE merged_into_movie_id END,
-            merged_at = CASE WHEN ? THEN ? ELSE merged_at END,
-            updated_at = ?
-        WHERE id = ? AND NOT EXISTS (SELECT 1 FROM episodes WHERE movie_id = ?)
-      ''', [
-        isCompleteSplit ? 1 : 0,
-        isCompleteSplit ? 1 : 0,
-        isCompleteSplit ? 1 : 0,
-        _now(),
-        _now(),
-        movieId,
-        movieId,
-      ]);
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return created;
-  }
+  }) =>
+      _collections.splitEpisodesIntoSingles(
+          movieId: movieId, episodeIds: episodeIds);
 
-  List<NasCollectionMigrationCandidate> collectionMigrationPreview() {
-    final groups = <String, _LegacyCollectionGroup>{};
-    for (final category in listCategories()) {
-      for (final source in category.mediaSources) {
-        final rows = _db.select('''
-          SELECT e.id, e.movie_id, e.relative_path, m.entry_type, m.collection_key
-          FROM episodes e JOIN movies m ON m.id = e.movie_id
-          WHERE e.media_root_id = ? AND m.category_id = ?
-            AND m.lifecycle_state = 'active'
-        ''', [source.mediaRootId, category.id]);
-        final prefix = '${source.relativePath}/';
-        for (final row in rows) {
-          final path = row['relative_path'] as String;
-          if (!path.startsWith(prefix) ||
-              row['entry_type'] != 'single' ||
-              row['collection_key'] != null) {
-            continue;
-          }
-          final grouping = _episodeGrouping(path.substring(prefix.length));
-          if (grouping.isConflict || grouping.rootPath == null) continue;
-          final key = '${category.id}:${grouping.rootPath}';
-          final group = groups.putIfAbsent(
-            key,
-            () => _LegacyCollectionGroup(
-              categoryId: category.id,
-              title: grouping.displayTitle!,
-            ),
-          );
-          group.episodeIds.add(row['id'] as String);
-          group.sourceMovieIds.add(row['movie_id'] as String);
-        }
-      }
-    }
-    return groups.entries
-        .map(
-          (entry) => NasCollectionMigrationCandidate(
-            key: entry.key,
-            categoryId: entry.value.categoryId,
-            title: entry.value.title,
-            episodeIds: entry.value.episodeIds.toList(growable: false),
-            sourceMovieIds: entry.value.sourceMovieIds.toList(growable: false),
-            requiresMetadataChoice: entry.value.sourceMovieIds.length > 1,
-          ),
-        )
-        .toList(growable: false);
-  }
+  List<NasCollectionMigrationCandidate> collectionMigrationPreview() =>
+      _collections.collectionMigrationPreview();
 
   NasLibraryMovie? applyCollectionMigration({
     required String key,
     required String metadataSourceMovieId,
-  }) {
-    NasCollectionMigrationCandidate? candidate;
-    for (final item in collectionMigrationPreview()) {
-      if (item.key == key) {
-        candidate = item;
-        break;
-      }
-    }
-    if (candidate == null ||
-        !candidate.sourceMovieIds.contains(metadataSourceMovieId)) {
-      return null;
-    }
-    final id = _movieIdForScannedEpisode(
-      categoryId: candidate.categoryId,
-      collectionKey: candidate.key,
-      title: candidate.title,
-    );
-    if (!mergeEpisodesIntoSeries(
-      targetMovieId: id,
-      episodeIds: candidate.episodeIds,
-      metadataSourceMovieId: metadataSourceMovieId,
-    )) {
-      return null;
-    }
-    return findMovieForAdmin(id);
-  }
+  }) =>
+      _collections.applyCollectionMigration(
+          key: key, metadataSourceMovieId: metadataSourceMovieId);
 
-  void _copyMovieMetadataToSeries({
-    required String fromMovieId,
-    required String targetMovieId,
-  }) {
-    _db.execute('''
-      UPDATE movies SET
-        title = (SELECT title FROM movies WHERE id = ?),
-        original_title = (SELECT original_title FROM movies WHERE id = ?),
-        catalog_number = (SELECT catalog_number FROM movies WHERE id = ?),
-        publisher_id = (SELECT publisher_id FROM movies WHERE id = ?),
-        series_id = (SELECT series_id FROM movies WHERE id = ?),
-        summary = (SELECT summary FROM movies WHERE id = ?),
-        poster_file_name = (SELECT poster_file_name FROM movies WHERE id = ?),
-        updated_at = ?
-      WHERE id = ?
-    ''', [
-      fromMovieId,
-      fromMovieId,
-      fromMovieId,
-      fromMovieId,
-      fromMovieId,
-      fromMovieId,
-      fromMovieId,
-      _now(),
-      targetMovieId,
-    ]);
-    _db.execute(
-        'DELETE FROM movie_actor_links WHERE movie_id = ?', [targetMovieId]);
-    _db.execute('''
-      INSERT INTO movie_actor_links(movie_id, actor_id)
-      SELECT ?, actor_id FROM movie_actor_links WHERE movie_id = ?
-    ''', [targetMovieId, fromMovieId]);
-    _db.execute(
-        'DELETE FROM movie_tag_links WHERE movie_id = ?', [targetMovieId]);
-    _db.execute('''
-      INSERT INTO movie_tag_links(movie_id, tag_id)
-      SELECT ?, tag_id FROM movie_tag_links WHERE movie_id = ?
-    ''', [targetMovieId, fromMovieId]);
-    _db.execute('''
-      UPDATE movie_carousel_images SET movie_id = ? WHERE movie_id = ?
-    ''', [targetMovieId, fromMovieId]);
-    _db.execute('DELETE FROM movie_metadata_field_sources WHERE movie_id = ?',
-        [targetMovieId]);
-    _db.execute('''
-      INSERT INTO movie_metadata_field_sources(
-        movie_id, field_key, source_kind, import_record_id,
-        source_content_hash, updated_at
-      ) SELECT ?, field_key, source_kind, import_record_id,
-               source_content_hash, updated_at
-        FROM movie_metadata_field_sources WHERE movie_id = ?
-    ''', [targetMovieId, fromMovieId]);
-  }
-
-  /// 为拆出的影视条目复制截图文件和记录。
-  ///
-  /// 部分拆分保留源记录；完整拆分会由首个新条目接管源记录，其余条目各自复制。
-  /// 复制失败会回滚数据库变更，源图片文件绝不删除。
-  void _copyCarouselImages(
-      List<NasCarouselImage> images, String targetMovieId) {
-    for (final image in images) {
-      final extensionIndex = image.fileName.lastIndexOf('.');
-      if (extensionIndex <= 0) {
-        throw StateError('截图文件名无效，无法安全拆分');
-      }
-      final extension = image.fileName.substring(extensionIndex);
-      final copiedFileName = '$targetMovieId-${newUuidV4()}$extension';
-      final sourceFile = File(
-        '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel${Platform.pathSeparator}${image.fileName}',
-      );
-      if (!sourceFile.existsSync()) {
-        throw StateError('截图资产缺失，无法安全拆分');
-      }
-      final destinationFile = File(
-        '$dataDir${Platform.pathSeparator}artwork${Platform.pathSeparator}carousel${Platform.pathSeparator}$copiedFileName',
-      );
-      sourceFile.copySync(destinationFile.path);
-      _db.execute(
-        'INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at) VALUES (?, ?, ?, ?)',
-        [newUuidV4(), targetMovieId, copiedFileName, _now()],
-      );
-    }
-  }
-
-  NasLibraryEpisode? findEpisode(String episodeId) {
-    final rows = _db.select('''
-      SELECT id, movie_id, title, relative_path, file_size, is_available, duration_ms
-      FROM episodes WHERE id = ?
-    ''', [episodeId]);
-    return rows.isEmpty
-        ? null
-        : episodesForMovie(rows.first['movie_id'] as String)
-            .firstWhere((episode) => episode.id == episodeId);
-  }
+  NasLibraryEpisode? findEpisode(String episodeId) =>
+      _queries.findEpisode(episodeId);
 
   NasLibraryEpisode? updateEpisodeTitle({
     required String episodeId,
     required String title,
-  }) {
-    final episode = findEpisode(episodeId);
-    if (episode == null) return null;
-    _db.execute(
-      'UPDATE episodes SET title = ?, updated_at = ? WHERE id = ?',
-      [title, _now(), episodeId],
-    );
-    return findEpisode(episodeId);
-  }
+  }) =>
+      _movies.updateEpisodeTitle(episodeId: episodeId, title: title);
 
-  List<NasLibraryCategory> listCategories() => _db
-      .select(
-          '''SELECT c.*, ($_categoryMovieCountSql) AS movie_count
-             FROM library_categories c ORDER BY c.name COLLATE NOCASE, c.id''')
-      .map(_mapCategoryWithSources)
-      .toList(growable: false);
+  List<NasLibraryCategory> listCategories() => _taxonomy.listCategories();
 
-  NasLibraryCategory? findCategory(String categoryId) {
-    final rows = _db.select(
-      '''SELECT c.*, ($_categoryMovieCountSql) AS movie_count
-         FROM library_categories c WHERE c.id = ?''',
-      [categoryId],
-    );
-    return rows.isEmpty ? null : _mapCategoryWithSources(rows.single);
-  }
+  NasLibraryCategory? findCategory(String categoryId) =>
+      _taxonomy.findCategory(categoryId);
 
   // 与影片墙一致：按逻辑影片统计，影集只算一部；离线记录仍保留，归并来源不计入。
-  static const _categoryMovieCountSql = '''SELECT COUNT(*) FROM movies m
-    WHERE m.category_id=c.id AND m.lifecycle_state='active'
-      AND (m.entry_type='series' OR EXISTS(SELECT 1 FROM episodes e WHERE e.movie_id=m.id))''';
 
-  List<NasCategoryMediaSource> mediaSourcesForCategory(String categoryId) {
-    final rows = _db.select('''
-      SELECT source.id, source.category_id, source.media_root_id,
-             root.name AS source_name, source.relative_path,
-             root.is_online, root.last_scanned_at
-      FROM category_media_sources source
-      JOIN media_roots root ON root.id = source.media_root_id
-      WHERE source.category_id = ?
-      ORDER BY root.name COLLATE NOCASE, source.relative_path COLLATE NOCASE, source.id
-    ''', [categoryId]);
-    return rows
-        .map(
-          (row) => NasCategoryMediaSource(
-            id: row['id'] as String,
-            categoryId: row['category_id'] as String,
-            mediaRootId: row['media_root_id'] as String,
-            sourceName: row['source_name'] as String,
-            relativePath: row['relative_path'] as String,
-            isOnline: (row['is_online'] as int) == 1,
-            lastScannedAt: row['last_scanned_at'] as String?,
-          ),
-        )
-        .toList(growable: false);
-  }
+  List<NasCategoryMediaSource> mediaSourcesForCategory(String categoryId) =>
+      _taxonomy.mediaSourcesForCategory(categoryId);
 
   bool replaceCategoryMediaSources({
     required String categoryId,
     required List<NasCategoryMediaSourceInput> sources,
-  }) {
-    if (findCategory(categoryId) == null || sources.length > 32) return false;
-    final normalized = <NasCategoryMediaSourceInput>[];
-    for (final source in sources) {
-      final relativePath = _normalizeRelativePath(source.relativePath);
-      if (relativePath == null || findMediaRoot(source.mediaRootId) == null) {
-        return false;
-      }
-      normalized.add(NasCategoryMediaSourceInput(
-        mediaRootId: source.mediaRootId,
-        relativePath: relativePath,
-      ));
-    }
-    if (normalized
-            .map((source) => '${source.mediaRootId}:${source.relativePath}')
-            .toSet()
-            .length !=
-        normalized.length) {
-      return false;
-    }
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      _db.execute('DELETE FROM category_media_sources WHERE category_id = ?',
-          [categoryId]);
-      final timestamp = _now();
-      for (final source in normalized) {
-        _db.execute('''
-          INSERT INTO category_media_sources(
-            id, category_id, media_root_id, relative_path, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?)
-        ''', [
-          newUuidV4(),
-          categoryId,
-          source.mediaRootId,
-          source.relativePath,
-          timestamp,
-          timestamp,
-        ]);
-      }
-      _db.execute(
-        'UPDATE library_categories SET media_relative_path = ?, updated_at = ? WHERE id = ?',
-        [
-          normalized.isEmpty ? null : normalized.first.relativePath,
-          timestamp,
-          categoryId
-        ],
-      );
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return true;
-  }
+  }) =>
+      _taxonomy.replaceCategoryMediaSources(
+          categoryId: categoryId, sources: sources);
 
-  bool hasCategoryName(String name, {String? excludingId}) {
-    final normalized = normalizeTaxonomyName(name);
-    return listCategories().any(
-      (category) =>
-          category.id != excludingId &&
-          normalizeTaxonomyName(category.name) == normalized,
-    );
-  }
+  bool hasCategoryName(String name, {String? excludingId}) =>
+      _taxonomy.hasCategoryName(name, excludingId: excludingId);
 
   NasLibraryCategory createCategory(String name,
-      {String? mediaRelativePath, String? color}) {
-    _requireTaxonomyName(name, '分类');
-    if (hasCategoryName(name)) {
-      throw ArgumentError.value(name, 'name', 'already exists');
-    }
-    final timestamp = _now();
-    final category = NasLibraryCategory(
-      id: newUuidV4(),
-      name: name,
-      color: color,
-      mediaRelativePath: mediaRelativePath,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    );
-    _db.execute(
-      'INSERT INTO library_categories(id, name, color, media_relative_path, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-      [
-        category.id,
-        category.name,
-        category.color,
-        category.mediaRelativePath,
-        category.createdAt,
-        category.updatedAt
-      ],
-    );
-    if (mediaRelativePath != null && listMediaRoots().isNotEmpty) {
-      replaceCategoryMediaSources(
-        categoryId: category.id,
-        sources: [
-          NasCategoryMediaSourceInput(
-            mediaRootId: listMediaRoots().first.id,
-            relativePath: mediaRelativePath,
-          ),
-        ],
-      );
-    }
-    return findCategory(category.id)!;
-  }
+          {String? mediaRelativePath, String? color}) =>
+      _taxonomy.createCategory(name,
+          mediaRelativePath: mediaRelativePath, color: color);
 
   NasLibraryCategory? updateCategory(
     String categoryId, {
@@ -4876,163 +825,41 @@ class NasLibraryDatabase {
     String? color,
     bool updateColor = false,
     required bool updateMediaRelativePath,
-  }) {
-    if (findCategory(categoryId) == null) return null;
-    _requireTaxonomyName(name, '分类');
-    if (hasCategoryName(name, excludingId: categoryId)) {
-      throw ArgumentError.value(name, 'name', 'already exists');
-    }
-    // 保存绑定不立即清理；分类扫描完成后统一移除退出扫描范围的旧索引。
-    _db.execute(
-      updateMediaRelativePath
-          ? 'UPDATE library_categories SET name = ?, color = ?, media_relative_path = ?, updated_at = ? WHERE id = ?'
-          : 'UPDATE library_categories SET name = ?, color = ?, updated_at = ? WHERE id = ?',
-      updateMediaRelativePath
-          ? [
-              name,
-              updateColor ? color : findCategory(categoryId)!.color,
-              mediaRelativePath,
-              _now(),
-              categoryId
-            ]
-          : [
-              name,
-              updateColor ? color : findCategory(categoryId)!.color,
-              _now(),
-              categoryId
-            ],
-    );
-    if (updateMediaRelativePath &&
-        mediaRelativePath != null &&
-        listMediaRoots().isNotEmpty) {
-      replaceCategoryMediaSources(
-        categoryId: categoryId,
-        sources: [
-          NasCategoryMediaSourceInput(
-            mediaRootId: listMediaRoots().first.id,
-            relativePath: mediaRelativePath,
-          ),
-        ],
-      );
-    }
-    return findCategory(categoryId);
-  }
+  }) =>
+      _taxonomy.updateCategory(categoryId,
+          name: name,
+          mediaRelativePath: mediaRelativePath,
+          color: color,
+          updateColor: updateColor,
+          updateMediaRelativePath: updateMediaRelativePath);
 
   bool deleteCategory(String categoryId, {bool deleteMovies = false}) =>
-      deleteCategoryWithIndexes(categoryId, deleteMovies: deleteMovies) != null;
+      _taxonomy.deleteCategory(categoryId, deleteMovies: deleteMovies);
 
   /// 原子删除分类和索引，返回仅供清理 NAS 内部图片副本的信息。
   List<NasRemovedMovieIndex>? deleteCategoryWithIndexes(String categoryId,
-      {bool deleteMovies = false}) => transaction(() {
-    if (findCategory(categoryId) == null) return null;
-    final removed = <NasRemovedMovieIndex>[];
-    if (deleteMovies) {
-      // 隐藏的归并来源也属于本分类，不能留下无分类的旧记录。
-      final ids = _db.select('SELECT id FROM movies WHERE category_id=?', [categoryId]);
-      for (final row in ids) {
-        removed.add(_removeMovieIndex(findMovieForAdmin(row['id'] as String)!));
-      }
-    }
-    _db.execute('DELETE FROM library_categories WHERE id = ?', [categoryId]);
-    return removed;
-  });
+          {bool deleteMovies = false}) =>
+      _taxonomy.deleteCategoryWithIndexes(categoryId,
+          deleteMovies: deleteMovies);
 
-  NasCategoryTaxonomyTransfer exportCategoryTaxonomy() {
-    final conflicts = categoryTaxonomyViolations();
-    if (conflicts.isNotEmpty) throw StateError(conflicts.join('\n'));
-    return NasCategoryTaxonomyTransfer(
-      categories: [
-        for (final category in listCategories())
-          NasTaxonomyCategoryDefinition(
-              name: category.name, color: category.color),
-      ],
-    );
-  }
+  NasCategoryTaxonomyTransfer exportCategoryTaxonomy() =>
+      _taxonomy.exportCategoryTaxonomy();
 
   NasTaxonomyTransferResult importCategoryTaxonomy(
     NasCategoryTaxonomyTransfer transfer,
-  ) {
-    final conflicts = categoryTaxonomyViolations();
-    if (conflicts.isNotEmpty) {
-      return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: const [],
-        conflicts: conflicts,
-      );
-    }
-    final existing = {
-      for (final category in listCategories())
-        normalizeTaxonomyName(category.name): category,
-    };
-    final added = <String>[];
-    final skipped = <String>[];
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      for (final definition in transfer.categories) {
-        final normalized = normalizeTaxonomyName(definition.name);
-        if (existing.containsKey(normalized)) {
-          skipped.add('分类：${existing[normalized]!.name}');
-          continue;
-        }
-        createCategory(
-          definition.name,
-          color: definition.color ??
-              _randomImportColor(_importCategoryColorOptions),
-        );
-        added.add('分类：${definition.name}');
-      }
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return NasTaxonomyTransferResult(
-      added: added,
-      skipped: skipped,
-      conflicts: const [],
-    );
-  }
+  ) =>
+      _taxonomy.importCategoryTaxonomy(transfer);
 
-  List<NasLibraryTag> listTags({int? level, bool includeArchived = false}) {
-    final conditions = <String>[if (!includeArchived) 'archived_at IS NULL'];
-    final parameters = <Object?>[];
-    if (level != null) {
-      conditions.add('level = ?');
-      parameters.add(level);
-    }
-    return _db.select('''
-      SELECT id, name, level, description, color, created_at, updated_at, archived_at
-      FROM tags
-      ${conditions.isEmpty ? '' : 'WHERE ${conditions.join(' AND ')}'}
-      ORDER BY level, name COLLATE NOCASE, id
-    ''', parameters).map(_mapTag).toList(growable: false);
-  }
+  List<NasLibraryTag> listTags({int? level, bool includeArchived = false}) =>
+      _taxonomy.listTags(level: level, includeArchived: includeArchived);
 
-  NasLibraryTag? findTag(String tagId) {
-    final rows = _db.select('''
-      SELECT id, name, level, description, color, created_at, updated_at, archived_at
-      FROM tags WHERE id = ?
-    ''', [tagId]);
-    return rows.isEmpty ? null : _mapTag(rows.single);
-  }
+  NasLibraryTag? findTag(String tagId) => _taxonomy.findTag(tagId);
 
-  NasLibraryTag? findActiveTagByName(String name) {
-    final normalized = normalizeTaxonomyName(name);
-    if (normalized.isEmpty) return null;
-    final rows = _db.select('''
-      SELECT id, name, level, description, color, created_at, updated_at, archived_at
-      FROM tags WHERE normalized_name = ? AND archived_at IS NULL
-    ''', [normalized]);
-    return rows.length == 1 ? _mapTag(rows.single) : null;
-  }
+  NasLibraryTag? findActiveTagByName(String name) =>
+      _taxonomy.findActiveTagByName(name);
 
-  bool hasTagName(String name, {String? excludingId}) {
-    final rows = _db.select(
-      'SELECT id FROM tags WHERE normalized_name = ?',
-      [normalizeTaxonomyName(name)],
-    );
-    return rows.any((row) => row['id'] != excludingId);
-  }
+  bool hasTagName(String name, {String? excludingId}) =>
+      _taxonomy.hasTagName(name, excludingId: excludingId);
 
   NasLibraryTag createTag({
     required String name,
@@ -5040,31 +867,13 @@ class NasLibraryDatabase {
     String description = '',
     String? color,
     List<String> parentIds = const [],
-  }) {
-    _requireWritableTaxonomy();
-    _requireTagInput(
-      name: name,
-      level: level,
-      color: color,
-      parentIds: parentIds,
-    );
-    if (hasTagName(name)) {
-      throw ArgumentError.value(name, 'name', '标签名称已存在');
-    }
-    final timestamp = _now();
-    final tag = NasLibraryTag(
-      id: newUuidV4(),
-      name: name,
-      level: level,
-      description: description.trim(),
-      color: color,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    );
-    _insertTag(tag);
-    _replaceTagParents(tag.id, parentIds, timestamp);
-    return tag;
-  }
+  }) =>
+      _taxonomy.createTag(
+          name: name,
+          level: level,
+          description: description,
+          color: color,
+          parentIds: parentIds);
 
   NasLibraryTag? updateTag({
     required String tagId,
@@ -5072,224 +881,28 @@ class NasLibraryDatabase {
     required String description,
     String? color,
     required List<String> parentIds,
-  }) {
-    final current = findTag(tagId);
-    if (current == null) return null;
-    _requireWritableTaxonomy();
-    _requireTagInput(
-      name: name,
-      level: current.level,
-      color: color,
-      parentIds: parentIds,
-    );
-    if (hasTagName(name, excludingId: tagId)) {
-      throw ArgumentError.value(name, 'name', '标签名称已存在');
-    }
-    final timestamp = _now();
-    _db.execute('''
-      UPDATE tags
-      SET name = ?, normalized_name = ?, description = ?, color = ?, updated_at = ?
-      WHERE id = ?
-    ''', [
-      name,
-      normalizeTaxonomyName(name),
-      description.trim(),
-      color,
-      timestamp,
-      tagId,
-    ]);
-    _replaceTagParents(tagId, parentIds, timestamp);
-    return findTag(tagId);
-  }
+  }) =>
+      _taxonomy.updateTag(
+          tagId: tagId,
+          name: name,
+          description: description,
+          color: color,
+          parentIds: parentIds);
 
-  bool archiveTag(String tagId) {
-    if (findTag(tagId) == null) return false;
-    _requireWritableTaxonomy();
-    _db.execute(
-      'UPDATE tags SET archived_at = ?, updated_at = ? WHERE id = ?',
-      [_now(), _now(), tagId],
-    );
-    return true;
-  }
+  bool archiveTag(String tagId) => _taxonomy.archiveTag(tagId);
 
-  bool deleteTag(String tagId) {
-    final tag = findTag(tagId);
-    if (tag == null) return false;
-    _requireWritableTaxonomy();
-    final movieLinks = _db.select(
-      '''SELECT COUNT(*) AS count FROM movie_tag_links links
-         JOIN movies m ON m.id = links.movie_id
-         WHERE links.tag_id = ? AND m.lifecycle_state = 'active' ''',
-      [tagId],
-    ).single['count'] as int;
-    final childLinks = _db.select(
-      'SELECT COUNT(*) AS count FROM tag_parent_links WHERE parent_tag_id = ?',
-      [tagId],
-    ).single['count'] as int;
-    if (movieLinks > 0 || childLinks > 0) {
-      throw StateError('标签仍有关联影片或子级，只能归档');
-    }
-    _db.execute('''
-      DELETE FROM movie_tag_links
-      WHERE tag_id = ? AND movie_id IN (
-        SELECT id FROM movies WHERE lifecycle_state = 'merged'
-      )
-    ''', [tagId]);
-    _db.execute('DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
-    _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
-    return true;
-  }
+  bool deleteTag(String tagId) => _taxonomy.deleteTag(tagId);
 
-  NasTagOverview tagOverview() {
-    final row = _db.select('''
-      SELECT COUNT(*) AS total,
-             SUM(CASE WHEN level = 1 THEN 1 ELSE 0 END) AS level_one,
-             SUM(CASE WHEN level = 2 THEN 1 ELSE 0 END) AS level_two,
-             SUM(CASE WHEN level = 3 THEN 1 ELSE 0 END) AS level_three
-      FROM tags
-    ''').single;
-    final links =
-        _db.select('''SELECT COUNT(*) AS count FROM movie_tag_links links
-          JOIN movies m ON m.id = links.movie_id
-          WHERE m.lifecycle_state = 'active' ''').single['count'] as int;
-    return NasTagOverview(
-      total: row['total'] as int,
-      levelOne: (row['level_one'] as int?) ?? 0,
-      levelTwo: (row['level_two'] as int?) ?? 0,
-      levelThree: (row['level_three'] as int?) ?? 0,
-      movieLinks: links,
-    );
-  }
+  NasTagOverview tagOverview() => _taxonomy.tagOverview();
 
-  List<NasTagDirectoryRoot> tagDirectory({String query = ''}) {
-    final tags = listTags();
-    final byId = {for (final tag in tags) tag.id: tag};
-    final childrenByParent = _tagChildrenByParent();
-    final counts = _tagMovieCounts();
-    final normalized = query.trim().toLowerCase();
-    final roots = tags.where((tag) => tag.level == 1).toList(growable: false);
-    return roots
-        .map((root) {
-          final children = (childrenByParent[root.id] ?? const <String>[])
-              .map((id) => byId[id])
-              .whereType<NasLibraryTag>()
-              .where((tag) => tag.level == 2)
-              .map((tag) => NasTagDirectoryChild(
-                    tag: tag,
-                    movieCount: counts[tag.id] ?? 0,
-                  ))
-              .toList(growable: false);
-          if (normalized.isNotEmpty &&
-              !root.name.toLowerCase().contains(normalized) &&
-              !children.any(
-                  (item) => item.tag.name.toLowerCase().contains(normalized))) {
-            return null;
-          }
-          final visibleChildren = normalized.isNotEmpty &&
-                  !root.name.toLowerCase().contains(normalized)
-              ? children
-                  .where((item) =>
-                      item.tag.name.toLowerCase().contains(normalized))
-                  .toList(growable: false)
-              : children;
-          return NasTagDirectoryRoot(
-            tag: root,
-            movieCount: counts[root.id] ?? 0,
-            children: visibleChildren,
-          );
-        })
-        .whereType<NasTagDirectoryRoot>()
-        .toList(growable: false);
-  }
+  List<NasTagDirectoryRoot> tagDirectory({String query = ''}) =>
+      _taxonomy.tagDirectory(query: query);
 
   /// 仅返回活跃的一、二级标签及进入二级时需要的一级路径上下文。
   List<NasMovieSearchTagDirectoryRoot> movieSearchTagDirectory({
     String query = '',
-  }) {
-    final queryLike = '%${query.trim()}%';
-    final rows = _db.select('''
-      WITH RECURSIVE descendants(ancestor_id, descendant_id) AS (
-        SELECT id, id FROM tags WHERE archived_at IS NULL
-        UNION
-        SELECT descendants.ancestor_id, links.child_tag_id
-        FROM descendants
-        JOIN tag_parent_links links ON links.parent_tag_id = descendants.descendant_id
-        JOIN tags child ON child.id = links.child_tag_id
-        WHERE child.archived_at IS NULL
-      ),
-      tag_counts AS (
-        SELECT descendants.ancestor_id AS tag_id,
-                COUNT(DISTINCT CASE WHEN movie.lifecycle_state = 'active'
-                  THEN movie_tag_links.movie_id END) AS movie_count
-        FROM descendants
-        LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
-        LEFT JOIN movies movie ON movie.id = movie_tag_links.movie_id
-        GROUP BY descendants.ancestor_id
-      )
-      SELECT root.id AS root_id, root.name AS root_name,
-             COALESCE(root_count.movie_count, 0) AS root_movie_count,
-             child.id AS child_id, child.name AS child_name,
-             COALESCE(child_count.movie_count, 0) AS child_movie_count,
-             (
-               SELECT COUNT(*) FROM tag_parent_links third_link
-               JOIN tags third ON third.id = third_link.child_tag_id
-               WHERE third_link.parent_tag_id = child.id
-                 AND third.level = 3 AND third.archived_at IS NULL
-             ) AS third_level_count
-      FROM tags root
-      LEFT JOIN tag_parent_links child_link ON child_link.parent_tag_id = root.id
-      LEFT JOIN tags child ON child.id = child_link.child_tag_id
-        AND child.level = 2 AND child.archived_at IS NULL
-      LEFT JOIN tag_counts root_count ON root_count.tag_id = root.id
-      LEFT JOIN tag_counts child_count ON child_count.tag_id = child.id
-      WHERE root.level = 1 AND root.archived_at IS NULL
-        AND (? = '%%' OR lower(root.name) LIKE lower(?)
-             OR lower(COALESCE(child.name, '')) LIKE lower(?))
-      ORDER BY root.name COLLATE NOCASE, root.id, child.name COLLATE NOCASE, child.id
-    ''', [queryLike, queryLike, queryLike]);
-    final rootOrder = <String>[];
-    final roots = <String, NasLibraryTag>{};
-    final rootCounts = <String, int>{};
-    final children = <String, List<NasMovieSearchTagDirectoryChild>>{};
-    for (final row in rows) {
-      final rootId = row['root_id'] as String;
-      if (!roots.containsKey(rootId)) {
-        rootOrder.add(rootId);
-        roots[rootId] = NasLibraryTag(
-          id: rootId,
-          name: row['root_name'] as String,
-          level: 1,
-          createdAt: '',
-          updatedAt: '',
-        );
-        rootCounts[rootId] = row['root_movie_count'] as int;
-      }
-      final childId = row['child_id'] as String?;
-      if (childId == null) continue;
-      children.putIfAbsent(rootId, () => []).add(
-            NasMovieSearchTagDirectoryChild(
-              tag: NasLibraryTag(
-                id: childId,
-                name: row['child_name'] as String,
-                level: 2,
-                createdAt: '',
-                updatedAt: '',
-              ),
-              movieCount: row['child_movie_count'] as int,
-              thirdLevelCount: row['third_level_count'] as int,
-            ),
-          );
-    }
-    return rootOrder
-        .map(
-          (id) => NasMovieSearchTagDirectoryRoot(
-            tag: roots[id]!,
-            movieCount: rootCounts[id]!,
-            children: children[id] ?? const [],
-          ),
-        )
-        .toList(growable: false);
-  }
+  }) =>
+      _taxonomy.movieSearchTagDirectory(query: query);
 
   /// 固定 30 条读取某个二级标签的直属三级标签，不展开其余目录。
   NasMovieSearchThirdLevelTagPage movieSearchThirdLevelTags({
@@ -5297,94 +910,22 @@ class NasLibraryDatabase {
     String query = '',
     int page = 1,
     int pageSize = 30,
-  }) {
-    final parent = findTag(parentTagId);
-    if (parent == null || parent.archivedAt != null || parent.level != 2) {
-      throw ArgumentError('二级标签不存在或不可用');
-    }
-    if (page < 1 || pageSize != 30) {
-      throw ArgumentError('三级标签分页参数无效');
-    }
-    final queryLike = '%${query.trim()}%';
-    const from = '''
-      FROM tag_parent_links link
-      JOIN tags child ON child.id = link.child_tag_id
-      LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = child.id
-      LEFT JOIN movies linked_movie ON linked_movie.id = movie_tag_links.movie_id
-      WHERE link.parent_tag_id = ? AND child.level = 3
-        AND child.archived_at IS NULL
-        AND (? = '%%' OR lower(child.name) LIKE lower(?))
-    ''';
-    final parameters = <Object?>[parentTagId, queryLike, queryLike];
-    final total = _db
-        .select('SELECT COUNT(DISTINCT child.id) AS count $from', parameters)
-        .single['count'] as int;
-    final offset = (page - 1) * pageSize;
-    final rows = _db.select('''
-      SELECT child.id, child.name,
-             COUNT(DISTINCT CASE WHEN linked_movie.lifecycle_state = 'active'
-               THEN movie_tag_links.movie_id END) AS movie_count
-      $from
-      GROUP BY child.id
-      ORDER BY child.name COLLATE NOCASE, child.id
-      LIMIT ? OFFSET ?
-    ''', [...parameters, pageSize, offset]);
-    return NasMovieSearchThirdLevelTagPage(
-      items: rows
-          .map(
-            (row) => NasTagChildSummary(
-              tag: NasLibraryTag(
-                id: row['id'] as String,
-                name: row['name'] as String,
-                level: 3,
-                createdAt: '',
-                updatedAt: '',
-              ),
-              movieCount: row['movie_count'] as int,
-            ),
-          )
-          .toList(growable: false),
-      number: page,
-      size: pageSize,
-      total: total,
-      hasMore: offset + rows.length < total,
-    );
-  }
+  }) =>
+      _taxonomy.movieSearchThirdLevelTags(
+          parentTagId: parentTagId,
+          query: query,
+          page: page,
+          pageSize: pageSize);
 
   NasTagDetails? tagDetails({
     required String tagId,
     String? contextParentId,
     String? contextRootId,
-  }) {
-    final tag = findTag(tagId);
-    if (tag == null) return null;
-    final allTags = listTags(includeArchived: true);
-    final byId = {for (final item in allTags) item.id: item};
-    final parentsByChild = _tagParentsByChild();
-    final parentIds = parentsByChild[tagId] ?? const <String>[];
-    final parents = parentIds
-        .map((id) => byId[id])
-        .whereType<NasLibraryTag>()
-        .toList(growable: false);
-    final directChildCount = _db.select(
-      'SELECT COUNT(*) AS count FROM tag_parent_links WHERE parent_tag_id = ?',
-      [tagId],
-    ).single['count'] as int;
-    final path = _tagPathForContext(
-      tag: tag,
-      byId: byId,
-      parentsByChild: parentsByChild,
-      contextParentId: contextParentId,
-      contextRootId: contextRootId,
-    );
-    return NasTagDetails(
-      tag: tag,
-      parents: parents,
-      directChildCount: directChildCount,
-      movieCount: _tagMovieCounts()[tagId] ?? 0,
-      path: path,
-    );
-  }
+  }) =>
+      _taxonomy.tagDetails(
+          tagId: tagId,
+          contextParentId: contextParentId,
+          contextRootId: contextRootId);
 
   NasTagChildPage tagChildren({
     required String parentTagId,
@@ -5394,47 +935,15 @@ class NasLibraryDatabase {
     String order = 'desc',
     int page = 1,
     int pageSize = 10,
-  }) {
-    if (page < 1 ||
-        pageSize != 10 ||
-        !const {'movieCount', 'name', 'createdAt'}.contains(sort) ||
-        !const {'asc', 'desc'}.contains(order)) {
-      throw ArgumentError('子标签分页参数无效');
-    }
-    final tags = listTags();
-    final byId = {for (final tag in tags) tag.id: tag};
-    final counts = _tagMovieCounts();
-    final normalized = query.trim().toLowerCase();
-    final items = (_tagChildrenByParent()[parentTagId] ?? const <String>[])
-        .map((id) => byId[id])
-        .whereType<NasLibraryTag>()
-        .where((tag) =>
-            normalized.isEmpty || tag.name.toLowerCase().contains(normalized))
-        .where((tag) =>
-            associated == null || ((counts[tag.id] ?? 0) > 0) == associated)
-        .map((tag) =>
-            NasTagChildSummary(tag: tag, movieCount: counts[tag.id] ?? 0))
-        .toList(growable: false);
-    items.sort((left, right) {
-      final comparison = switch (sort) {
-        'movieCount' => left.movieCount.compareTo(right.movieCount),
-        'name' => left.tag.name.compareTo(right.tag.name),
-        _ => left.tag.createdAt.compareTo(right.tag.createdAt),
-      };
-      return order == 'asc' ? comparison : -comparison;
-    });
-    final offset = (page - 1) * pageSize;
-    final paged = offset >= items.length
-        ? const <NasTagChildSummary>[]
-        : items.skip(offset).take(pageSize).toList(growable: false);
-    return NasTagChildPage(
-      items: paged,
-      number: page,
-      size: pageSize,
-      total: items.length,
-      hasMore: offset + paged.length < items.length,
-    );
-  }
+  }) =>
+      _taxonomy.tagChildren(
+          parentTagId: parentTagId,
+          query: query,
+          associated: associated,
+          sort: sort,
+          order: order,
+          page: page,
+          pageSize: pageSize);
 
   NasTagMoviePage tagMovies({
     required String tagId,
@@ -5445,535 +954,48 @@ class NasLibraryDatabase {
     String order = 'desc',
     int page = 1,
     int pageSize = 15,
-  }) {
-    if (page < 1 ||
-        pageSize != 15 ||
-        !const {'lastPlayedAt', 'createdAt', 'title', 'durationMs'}
-            .contains(sort) ||
-        !const {'asc', 'desc'}.contains(order)) {
-      throw ArgumentError('关联影片分页参数无效');
-    }
-    final clauses = <String>[
-      "m.lifecycle_state = 'active'",
-      'm.id IN (SELECT movie_id FROM movie_tag_links WHERE tag_id IN (SELECT tag_id FROM tag_scope))',
-    ];
-    final parameters = <Object?>[tagId];
-    final trimmed = query.trim();
-    if (trimmed.isNotEmpty) {
-      final like = '%$trimmed%';
-      final catalog = '%${_normalizeCatalogNumber(trimmed)}%';
-      clauses.add('''(
-        lower(m.title) LIKE lower(?) OR
-        lower(COALESCE(m.original_title, '')) LIKE lower(?) OR
-        lower(REPLACE(REPLACE(REPLACE(COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(?)
-      )''');
-      parameters.addAll([like, like, catalog]);
-    }
-    if (categoryId != null) {
-      clauses.add('m.category_id = ?');
-      parameters.add(categoryId);
-    }
-    if (resolution != null) {
-      clauses.add(
-          'EXISTS (SELECT 1 FROM episodes re WHERE re.movie_id = m.id AND re.resolution_label = ?)');
-      parameters.add(resolution);
-    }
-    final where = clauses.join(' AND ');
-    final cte = '''WITH RECURSIVE tag_scope(tag_id) AS (
-      SELECT ?
-      UNION
-      SELECT l.child_tag_id FROM tag_parent_links l
-      JOIN tag_scope scope ON scope.tag_id = l.parent_tag_id
-    )''';
-    final count = _db
-        .select('$cte SELECT COUNT(*) AS count FROM movies m WHERE $where',
-            parameters)
-        .single['count'] as int;
-    final expression = switch (sort) {
-      'title' => 'm.title COLLATE NOCASE',
-      'createdAt' => 'm.created_at',
-      'durationMs' => 'SUM(COALESCE(e.duration_ms, 0))',
-      _ => 'MAX(h.started_at)',
-    };
-    final offset = (page - 1) * pageSize;
-    final rows = _db.select('''$cte
-      SELECT m.id
-      FROM movies m
-      LEFT JOIN episodes e ON e.movie_id = m.id
-      LEFT JOIN playback_history h ON h.movie_id = m.id
-      WHERE $where
-      GROUP BY m.id
-      ORDER BY $expression ${order.toUpperCase()}, m.id ASC
-      LIMIT ? OFFSET ?
-    ''', [...parameters, pageSize, offset]);
-    return NasTagMoviePage(
-      movieIds: rows.map((row) => row['id'] as String).toList(growable: false),
-      number: page,
-      size: pageSize,
-      total: count,
-      hasMore: offset + rows.length < count,
-    );
-  }
+  }) =>
+      _taxonomy.tagMovies(
+          tagId: tagId,
+          query: query,
+          categoryId: categoryId,
+          resolution: resolution,
+          sort: sort,
+          order: order,
+          page: page,
+          pageSize: pageSize);
 
-  NasTagTaxonomyTransfer exportTagTaxonomy() {
-    final tags = listTags();
-    final byId = {for (final tag in tags) tag.id: tag};
-    final parents = _tagParentsByChild();
-    return NasTagTaxonomyTransfer(
-      tags: tags
-          .map((tag) => NasTaxonomyTagDefinition(
-                name: tag.name,
-                level: tag.level,
-                description: tag.description,
-                color: tag.color,
-                parents: (parents[tag.id] ?? const <String>[])
-                    .map((id) => byId[id]?.name)
-                    .whereType<String>()
-                    .toList(growable: false),
-              ))
-          .toList(growable: false),
-    );
-  }
+  NasTagTaxonomyTransfer exportTagTaxonomy() => _taxonomy.exportTagTaxonomy();
 
-  NasTaxonomyTransferResult importTagTaxonomy(NasTagTaxonomyTransfer transfer) {
-    if (transfer.validationConflicts.isNotEmpty) {
-      return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: transfer.sourceSkipped,
-        conflicts: transfer.validationConflicts,
-      );
-    }
-    final violations = taxonomyViolations();
-    if (violations.isNotEmpty) {
-      return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: transfer.sourceSkipped,
-        conflicts: violations,
-      );
-    }
-    final tagsByName = {
-      for (final tag in listTags(includeArchived: true))
-        normalizeTaxonomyName(tag.name): tag,
-    };
-    final definitions = {
-      for (final definition in transfer.tags)
-        normalizeTaxonomyName(definition.name): definition,
-    };
-    final conflicts = <String>[];
-    for (final definition in transfer.tags) {
-      final existing = tagsByName[normalizeTaxonomyName(definition.name)];
-      if (existing != null && existing.level != definition.level) {
-        conflicts.add(
-            '标签层级冲突：${definition.name} 已是${_tagLevelName(existing.level)}标签');
-      }
-      for (final parentName in definition.parents) {
-        final key = normalizeTaxonomyName(parentName);
-        final parent = tagsByName[key];
-        final pending = definitions[key];
-        final parentLevel = parent?.level ?? pending?.level;
-        if (parentLevel == null) {
-          conflicts.add('标签父级不存在：$parentName → ${definition.name}');
-        } else if (parentLevel != definition.level - 1) {
-          conflicts.add('标签父级层级错误：$parentName → ${definition.name}');
-        } else if (parent?.archivedAt != null) {
-          conflicts.add('标签父级已归档：$parentName → ${definition.name}');
-        }
-      }
-    }
-    if (conflicts.isNotEmpty) {
-      return NasTaxonomyTransferResult(
-        added: const [],
-        skipped: transfer.sourceSkipped,
-        conflicts: conflicts,
-      );
-    }
-    final links = _db
-        .select('SELECT child_tag_id, parent_tag_id FROM tag_parent_links')
-        .map((row) => '${row['child_tag_id']}:${row['parent_tag_id']}')
-        .toSet();
-    final added = <String>[];
-    final skipped = <String>[...transfer.sourceSkipped];
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      for (var level = 1; level <= 3; level++) {
-        for (final definition
-            in transfer.tags.where((item) => item.level == level)) {
-          final key = normalizeTaxonomyName(definition.name);
-          if (tagsByName.containsKey(key)) {
-            skipped.add('${_tagLevelName(level)}标签：${tagsByName[key]!.name}');
-            continue;
-          }
-          final timestamp = _now();
-          final tag = NasLibraryTag(
-            id: newUuidV4(),
-            name: definition.name,
-            level: level,
-            description: definition.description,
-            color:
-                definition.color ?? _randomImportColor(_importTagColorOptions),
-            createdAt: timestamp,
-            updatedAt: timestamp,
-          );
-          _insertTag(tag);
-          tagsByName[key] = tag;
-          added.add('${_tagLevelName(level)}标签：${tag.name}');
-        }
-      }
-      for (final definition in transfer.tags.where((item) => item.level > 1)) {
-        final child = tagsByName[normalizeTaxonomyName(definition.name)]!;
-        for (final parentName in definition.parents) {
-          final parent = tagsByName[normalizeTaxonomyName(parentName)]!;
-          final key = '${child.id}:${parent.id}';
-          if (!links.add(key)) {
-            skipped.add('标签归属：${parent.name} → ${child.name}');
-            continue;
-          }
-          _db.execute('''
-            INSERT INTO tag_parent_links(child_tag_id, parent_tag_id, created_at)
-            VALUES (?, ?, ?)
-          ''', [child.id, parent.id, _now()]);
-          added.add('标签归属：${parent.name} → ${child.name}');
-        }
-      }
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return NasTaxonomyTransferResult(
-        added: added, skipped: skipped, conflicts: const []);
-  }
+  NasTaxonomyTransferResult importTagTaxonomy(
+          NasTagTaxonomyTransfer transfer) =>
+      _taxonomy.importTagTaxonomy(transfer);
 
-  List<String> taxonomyViolations() {
-    final tags = listTags(includeArchived: true);
-    final byId = {for (final tag in tags) tag.id: tag};
-    final parents = _tagParentsByChild();
-    final violations = <String>[];
-    for (final tag in tags) {
-      final parentIds = parents[tag.id] ?? const <String>[];
-      if (tag.level == 1 && parentIds.isNotEmpty) {
-        violations.add('一级标签不能拥有父级：${tag.name}');
-      }
-      if (tag.level > 1 && parentIds.isEmpty) {
-        violations.add('${_tagLevelName(tag.level)}标签缺少父级：${tag.name}');
-      }
-      for (final parentId in parentIds) {
-        final parent = byId[parentId];
-        if (parent == null || parent.level != tag.level - 1) {
-          violations.add('标签父级层级错误：${tag.name}');
-        }
-      }
-    }
-    return violations;
-  }
+  List<String> taxonomyViolations() => _taxonomy.taxonomyViolations();
 
-  List<String> _categoryViolations() {
-    final names = <String, String>{};
-    final violations = <String>[];
-    for (final category in listCategories()) {
-      final key = normalizeTaxonomyName(category.name);
-      final existing = names[key];
-      if (existing != null) {
-        violations.add('分类名称重复（不区分大小写）：$existing / ${category.name}');
-      } else {
-        names[key] = category.name;
-      }
-    }
-    return violations;
-  }
+  List<String> categoryTaxonomyViolations() =>
+      _taxonomy.categoryTaxonomyViolations();
 
-  List<String> categoryTaxonomyViolations() => _categoryViolations();
-
-  void _requireWritableTaxonomy() {
-    final violations = taxonomyViolations();
-    if (violations.isNotEmpty) throw StateError(violations.join('\n'));
-  }
-
-  static void _requireTaxonomyName(String name, String label) {
-    if (name.trim().isEmpty || name != name.trim()) {
-      throw ArgumentError.value(name, 'name', '$label 名称不能为空或含首尾空白');
-    }
-  }
-
-  void _requireTagInput({
-    required String name,
-    required int level,
-    required String? color,
-    required List<String> parentIds,
-  }) {
-    _requireTaxonomyName(name, '标签');
-    if (level < 1 || level > 3 || !isValidTaxonomyColor(color)) {
-      throw ArgumentError('标签层级或颜色无效');
-    }
-    if ((level == 1 && parentIds.isNotEmpty) ||
-        (level > 1 && parentIds.isEmpty) ||
-        parentIds.toSet().length != parentIds.length) {
-      throw ArgumentError('标签父级不符合固定三级规则');
-    }
-    for (final parentId in parentIds) {
-      final parent = findTag(parentId);
-      if (parent == null ||
-          parent.archivedAt != null ||
-          parent.level != level - 1) {
-        throw ArgumentError('标签父级不存在、已归档或层级不匹配');
-      }
-    }
-  }
-
-  void _insertTag(NasLibraryTag tag) {
-    _db.execute('''
-      INSERT INTO tags(
-        id, name, normalized_name, level, description, color,
-        created_at, updated_at, archived_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', [
-      tag.id,
-      tag.name,
-      normalizeTaxonomyName(tag.name),
-      tag.level,
-      tag.description,
-      tag.color,
-      tag.createdAt,
-      tag.updatedAt,
-      tag.archivedAt,
-    ]);
-  }
-
-  void _replaceTagParents(
-    String tagId,
-    List<String> parentIds,
-    String timestamp,
-  ) {
-    _db.execute('DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
-    for (final parentId in parentIds) {
-      _db.execute('''
-        INSERT INTO tag_parent_links(child_tag_id, parent_tag_id, created_at)
-        VALUES (?, ?, ?)
-      ''', [tagId, parentId, timestamp]);
-    }
-  }
-
-  Map<String, List<String>> _tagParentsByChild() {
-    final values = <String, List<String>>{};
-    for (final row in _db.select('''
-      SELECT child_tag_id, parent_tag_id
-      FROM tag_parent_links
-      ORDER BY parent_tag_id, child_tag_id
-    ''')) {
-      values
-          .putIfAbsent(row['child_tag_id'] as String, () => [])
-          .add(row['parent_tag_id'] as String);
-    }
-    return values;
-  }
-
-  Map<String, List<String>> _tagChildrenByParent() {
-    final values = <String, List<String>>{};
-    for (final entry in _tagParentsByChild().entries) {
-      for (final parentId in entry.value) {
-        values.putIfAbsent(parentId, () => []).add(entry.key);
-      }
-    }
-    return values;
-  }
-
-  Map<String, int> _tagMovieCounts() {
-    final rows = _db.select('''
-      WITH RECURSIVE descendants(ancestor_id, descendant_id) AS (
-        SELECT id, id FROM tags
-        UNION
-        SELECT descendants.ancestor_id, links.child_tag_id
-        FROM descendants
-        JOIN tag_parent_links links ON links.parent_tag_id = descendants.descendant_id
-      )
-      SELECT descendants.ancestor_id AS tag_id,
-              COUNT(DISTINCT CASE WHEN movie.lifecycle_state = 'active'
-                THEN movie_tag_links.movie_id END) AS movie_count
-       FROM descendants
-       LEFT JOIN movie_tag_links ON movie_tag_links.tag_id = descendants.descendant_id
-       LEFT JOIN movies movie ON movie.id = movie_tag_links.movie_id
-      GROUP BY descendants.ancestor_id
-    ''');
-    return {
-      for (final row in rows)
-        row['tag_id'] as String: row['movie_count'] as int,
-    };
-  }
-
-  List<NasLibraryTag> _tagPathForContext({
-    required NasLibraryTag tag,
-    required Map<String, NasLibraryTag> byId,
-    required Map<String, List<String>> parentsByChild,
-    required String? contextParentId,
-    required String? contextRootId,
-  }) {
-    if (tag.level == 1) return [tag];
-    final parentIds = parentsByChild[tag.id] ?? const <String>[];
-    final selectedParentId =
-        contextParentId != null && parentIds.contains(contextParentId)
-            ? contextParentId
-            : parentIds.isEmpty
-                ? null
-                : parentIds.first;
-    final parent = selectedParentId == null ? null : byId[selectedParentId];
-    if (parent == null) return [tag];
-    if (tag.level == 2) return [parent, tag];
-    final grandparentIds = parentsByChild[parent.id] ?? const <String>[];
-    final grandparentId =
-        contextRootId != null && grandparentIds.contains(contextRootId)
-            ? contextRootId
-            : grandparentIds.isEmpty
-                ? null
-                : grandparentIds.first;
-    final grandparent = grandparentId == null ? null : byId[grandparentId];
-    return [if (grandparent != null) grandparent, parent, tag];
-  }
-
-  List<NasTagPath> _tagPathsForIds(Iterable<String> tagIds) {
-    final tags = listTags(includeArchived: true);
-    final byId = {for (final tag in tags) tag.id: tag};
-    final parentsByChild = _tagParentsByChild();
-    List<List<NasLibraryTag>> pathsFor(String tagId, Set<String> visiting) {
-      final tag = byId[tagId];
-      if (tag == null || !visiting.add(tagId)) return const [];
-      try {
-        if (tag.level == 1)
-          return [
-            [tag]
-          ];
-        final parentIds = parentsByChild[tagId] ?? const <String>[];
-        final paths = <List<NasLibraryTag>>[];
-        for (final parentId in parentIds) {
-          for (final path in pathsFor(parentId, visiting)) {
-            paths.add([...path, tag]);
-          }
-        }
-        return paths;
-      } finally {
-        visiting.remove(tagId);
-      }
-    }
-
-    final result = <NasTagPath>[];
-    final seen = <String>{};
-    for (final tagId in tagIds) {
-      final tag = byId[tagId];
-      if (tag == null) continue;
-      for (final path in pathsFor(tagId, <String>{})) {
-        final names = path.map((item) => item.name).toList(growable: false);
-        final key = '${tag.id}:${names.join('\u0000')}';
-        if (!seen.add(key)) continue;
-        result.add(NasTagPath(
-          placementId: tag.id,
-          tagId: tag.id,
-          tagName: tag.name,
-          names: names,
-        ));
-      }
-    }
-    return result;
-  }
-
-  NasLibraryCategory? categoryForMovie(String movieId) {
-    final rows = _db.select('''
-      SELECT category_id FROM movies WHERE id = ?
-    ''', [movieId]);
-    final id = rows.isEmpty ? null : rows.single['category_id'] as String?;
-    return id == null ? null : findCategory(id);
-  }
+  NasLibraryCategory? categoryForMovie(String movieId) =>
+      _taxonomy.categoryForMovie(movieId);
 
   /// Batch the current page's associations; load tag ancestry only once.
-  Map<String, Map<String, Object?>> browseAssociations(List<String> ids) {
-    if (ids.isEmpty) return {};
-    final placeholders = List.filled(ids.length, '?').join(',');
-    final result = {for (final id in ids) id: <String, Object?>{
-      'actors': <Map<String, Object?>>[], 'tags': <Map<String, Object?>>[], 'tagPaths': <List<String>>[],
-    }};
-    for (final row in _db.select('''SELECT links.movie_id, a.id, a.stage_name,
-      a.original_name, a.translated_name, a.gender FROM movie_actor_links links
-      JOIN actors a ON a.id=links.actor_id WHERE links.movie_id IN ($placeholders)
-      ORDER BY a.id''', ids)) {
-      (result[row['movie_id']]!['actors'] as List).add({
-        'id': row['id'], 'name': [row['stage_name'], row['original_name'], row['translated_name']]
-          .whereType<String>().where((name) => name.trim().isNotEmpty).firstOrNull ?? '',
-        'gender': row['gender'],
-      });
-    }
-    final tags = _db.select('''SELECT links.movie_id, t.* FROM movie_tag_links links
-      JOIN tags t ON t.id=links.tag_id WHERE links.movie_id IN ($placeholders)
-      ORDER BY t.level, t.name COLLATE NOCASE, t.id''', ids);
-    final paths = _tagPathsForIds(tags.map((row) => row['id'] as String).toSet());
-    final pathsById = <String, List<List<String>>>{};
-    for (final path in paths) { pathsById.putIfAbsent(path.tagId, () => []).add(path.names); }
-    for (final row in tags) {
-      final item = result[row['movie_id']]!;
-      (item['tags'] as List).add({'id': row['id'], 'name': row['name'], 'level': row['level'],
-        'description': row['description'], 'color': row['color'], 'createdAt': row['created_at'],
-        'updatedAt': row['updated_at'], 'archivedAt': row['archived_at']});
-      (item['tagPaths'] as List).addAll(pathsById[row['id']] ?? const []);
-    }
-    return result;
-  }
+  Map<String, Map<String, Object?>> browseAssociations(List<String> ids) =>
+      _taxonomy.browseAssociations(ids);
 
-  List<NasTagPath> tagPathsForMovie(String movieId) {
-    final linkedIds = _db.select('''
-      SELECT tag_id FROM movie_tag_links WHERE movie_id = ? ORDER BY tag_id
-    ''', [movieId]).map((row) => row['tag_id'] as String);
-    return _tagPathsForIds(linkedIds);
-  }
+  List<NasTagPath> tagPathsForMovie(String movieId) =>
+      _taxonomy.tagPathsForMovie(movieId);
 
-  List<NasTagPath> allTagPaths() =>
-      _tagPathsForIds(listTags(includeArchived: true).map((tag) => tag.id));
+  List<NasTagPath> allTagPaths() => _taxonomy.allTagPaths();
 
-  List<NasLibraryTag> tagsForMovie(String movieId) {
-    return _db.select('''
-      SELECT t.id, t.name, t.level, t.description, t.color,
-             t.created_at, t.updated_at, t.archived_at
-      FROM tags t JOIN movie_tag_links links ON links.tag_id = t.id
-      WHERE links.movie_id = ?
-      ORDER BY t.level, t.name COLLATE NOCASE, t.id
-    ''', [movieId]).map(_mapTag).toList(growable: false);
-  }
+  List<NasLibraryTag> tagsForMovie(String movieId) =>
+      _taxonomy.tagsForMovie(movieId);
 
   List<NasLibraryTag> _tagsForRelation(
     String condition,
     List<Object?> parameters,
   ) =>
-      _db.select('''
-        SELECT DISTINCT t.id, t.name, t.level, t.description, t.color,
-               t.created_at, t.updated_at, t.archived_at
-        FROM movies m
-        JOIN movie_tag_links links ON links.movie_id = m.id
-        JOIN tags t ON t.id = links.tag_id
-        WHERE m.lifecycle_state = 'active' AND $condition
-        ORDER BY t.name COLLATE NOCASE, t.id
-      ''', parameters).map(_mapTag).toList(growable: false);
-
-  List<NasRelatedActor> _relatedActorsForMovies(
-    String condition,
-    List<Object?> parameters,
-  ) {
-    final rows = _db.select('''
-      SELECT l.actor_id, COUNT(DISTINCT l.movie_id) AS movie_count
-      FROM movie_actor_links l
-      JOIN movies m ON m.id = l.movie_id
-       WHERE m.lifecycle_state = 'active' AND $condition
-      GROUP BY l.actor_id
-      ORDER BY movie_count DESC, l.actor_id ASC
-    ''', parameters);
-    return rows
-        .map((row) {
-          final actor = findActor(row['actor_id'] as String);
-          return actor == null
-              ? null
-              : NasRelatedActor(
-                  actor: actor,
-                  movieCount: row['movie_count'] as int,
-                );
-        })
-        .whereType<NasRelatedActor>()
-        .toList(growable: false);
-  }
+      _taxonomy.tagsForRelation(condition, parameters);
 
   bool setMovieTaxonomy({
     required String movieId,
@@ -5981,247 +1003,37 @@ class NasLibraryDatabase {
     required String? categoryId,
     required bool updateTagIds,
     required List<String> tagIds,
-  }) {
-    if (findMovieForAdmin(movieId) == null) return false;
-    if (updateCategory) {
-      _db.execute(
-        'UPDATE movies SET category_id = ?, updated_at = ? WHERE id = ?',
-        [categoryId, _now(), movieId],
-      );
-    }
-    if (updateTagIds) {
-      _db.execute('DELETE FROM movie_tag_links WHERE movie_id = ?', [movieId]);
-      for (final tagId in tagIds) {
-        _db.execute(
-          'INSERT INTO movie_tag_links(movie_id, tag_id) VALUES (?, ?)',
-          [movieId, tagId],
-        );
-      }
-    }
-    return true;
-  }
+  }) =>
+      _taxonomy.setMovieTaxonomy(
+          movieId: movieId,
+          updateCategory: updateCategory,
+          categoryId: categoryId,
+          updateTagIds: updateTagIds,
+          tagIds: tagIds);
 
   Map<String, NasMovieMetadataFieldSource> metadataFieldSourcesForMovie(
     String movieId,
-  ) {
-    final rows = _db.select('''
-      SELECT field_key, source_kind, import_record_id, source_content_hash,
-             updated_at
-      FROM movie_metadata_field_sources
-      WHERE movie_id = ?
-    ''', [movieId]);
-    return {
-      for (final row in rows)
-        row['field_key'] as String: NasMovieMetadataFieldSource(
-          fieldKey: row['field_key'] as String,
-          sourceKind: row['source_kind'] as String,
-          importRecordId: row['import_record_id'] as String?,
-          sourceContentHash: row['source_content_hash'] as String?,
-          updatedAt: row['updated_at'] as String,
-        ),
-    };
-  }
+  ) =>
+      _metadata.metadataFieldSourcesForMovie(movieId);
 
   /// 由常规管理接口调用，以便后续 MDCNG 预览识别人工已确认的字段。
   bool markMovieMetadataFieldsManual({
     required String movieId,
     required Iterable<String> fieldKeys,
-  }) {
-    if (findMovieForAdmin(movieId) == null) return false;
-    final normalized = fieldKeys.toSet();
-    if (normalized.isEmpty) return true;
-    if (normalized.any((field) => !_metadataFieldKeys.contains(field))) {
-      throw ArgumentError('Unsupported metadata field source.');
-    }
-    final timestamp = _now();
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      for (final fieldKey in normalized) {
-        _db.execute('''
-          INSERT INTO movie_metadata_field_sources(
-            movie_id, field_key, source_kind, import_record_id,
-            source_content_hash, updated_at
-          ) VALUES (?, ?, 'manual', NULL, NULL, ?)
-          ON CONFLICT(movie_id, field_key) DO UPDATE SET
-            source_kind = 'manual',
-            import_record_id = NULL,
-            source_content_hash = NULL,
-            updated_at = excluded.updated_at
-        ''', [movieId, fieldKey, timestamp]);
-      }
-      _db.execute('COMMIT');
-      return true;
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-  }
+  }) =>
+      _metadata.markMovieMetadataFieldsManual(
+          movieId: movieId, fieldKeys: fieldKeys);
 
   /// 原子写入已经由管理员确认的 MDCNG 字段，并保存可追溯的来源摘要。
-  NasMdcngImportRecord applyMdcngMetadata(NasMdcngMetadataApply input) {
-    final movie = findMovieForAdmin(input.movieId);
-    final episode = findEpisode(input.episodeId);
-    final fields = input.fieldKeys.toSet();
-    if (movie == null ||
-        episode == null ||
-        episode.movieId != input.movieId ||
-        fields.isEmpty ||
-        fields.length != input.fieldKeys.length ||
-        fields.any((field) => !_metadataFieldKeys.contains(field))) {
-      throw ArgumentError('Invalid MDCNG metadata import.');
-    }
-    if ((fields.contains('title') && input.title == null) ||
-        (fields.contains('originalTitle') && input.originalTitle == null) ||
-        (fields.contains('catalogNumber') && input.catalogNumber == null) ||
-        (fields.contains('summary') && input.summary == null) ||
-        (fields.contains('actors') && input.actorIds == null) ||
-        (fields.contains('tags') && input.tagIds == null) ||
-        (fields.contains('poster') && input.posterFileName == null) ||
-        (fields.contains('fanart') && input.fanartFileName == null)) {
-      throw ArgumentError('Missing selected MDCNG metadata field.');
-    }
-    final actorIds = input.actorIds;
-    if (actorIds != null &&
-        (actorIds.toSet().length != actorIds.length ||
-            actorIds.any((id) {
-              final actor = findActor(id);
-              return actor == null || actor.archivedAt != null;
-            }))) {
-      throw ArgumentError('Invalid MDCNG actors.');
-    }
-    final tagIds = input.tagIds;
-    if (tagIds != null &&
-        (tagIds.toSet().length != tagIds.length ||
-            tagIds.any((id) {
-              final tag = findTag(id);
-              return tag == null || tag.archivedAt != null;
-            }))) {
-      throw ArgumentError('Invalid MDCNG tags.');
-    }
-
-    final timestamp = _now();
-    final record = NasMdcngImportRecord(
-      id: newUuidV4(),
-      movieId: input.movieId,
-      episodeId: input.episodeId,
-      nfoFileName: input.nfoFileName,
-      nfoContentHash: input.nfoContentHash,
-      appliedFieldKeys: input.fieldKeys,
-      createdAt: timestamp,
-    );
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      final assignments = <String>[];
-      final values = <Object?>[];
-      if (fields.contains('title')) {
-        assignments.add('title = ?');
-        values.add(input.title);
-      }
-      if (fields.contains('originalTitle')) {
-        assignments.add('original_title = ?');
-        values.add(input.originalTitle);
-      }
-      if (fields.contains('catalogNumber')) {
-        assignments.add('catalog_number = ?');
-        values.add(input.catalogNumber);
-      }
-      if (fields.contains('summary')) {
-        assignments.add('summary = ?');
-        values.add(input.summary);
-      }
-      if (fields.contains('poster')) {
-        assignments.add('poster_file_name = ?');
-        values.add(input.posterFileName);
-      }
-      assignments.add('updated_at = ?');
-      values.add(timestamp);
-      values.add(input.movieId);
-      _db.execute(
-        'UPDATE movies SET ${assignments.join(', ')} WHERE id = ?',
-        values,
-      );
-
-      if (actorIds != null) {
-        _db.execute('DELETE FROM movie_actor_links WHERE movie_id = ?',
-            [input.movieId]);
-        for (final actorId in actorIds) {
-          _db.execute(
-            'INSERT INTO movie_actor_links(movie_id, actor_id) VALUES (?, ?)',
-            [input.movieId, actorId],
-          );
-        }
-      }
-      if (tagIds != null) {
-        _db.execute(
-            'DELETE FROM movie_tag_links WHERE movie_id = ?', [input.movieId]);
-        for (final tagId in tagIds) {
-          _db.execute(
-            'INSERT INTO movie_tag_links(movie_id, tag_id) VALUES (?, ?)',
-            [input.movieId, tagId],
-          );
-        }
-      }
-
-      _db.execute('''
-        INSERT INTO mdcng_import_records(
-          id, movie_id, episode_id, nfo_file_name, nfo_content_hash,
-          applied_fields_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-      ''', [
-        record.id,
-        record.movieId,
-        record.episodeId,
-        record.nfoFileName,
-        record.nfoContentHash,
-        jsonEncode(record.appliedFieldKeys),
-        record.createdAt,
-      ]);
-      if (input.fanartFileName != null) {
-        final imageId = newUuidV4();
-        _db.execute('''
-          INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at)
-          VALUES (?, ?, ?, ?)
-        ''', [imageId, input.movieId, input.fanartFileName, timestamp]);
-        recordGalleryOrigin(imageId, 'mdcng_cover');
-      }
-      for (final fieldKey in fields) {
-        _db.execute('''
-          INSERT INTO movie_metadata_field_sources(
-            movie_id, field_key, source_kind, import_record_id,
-            source_content_hash, updated_at
-          ) VALUES (?, ?, 'mdcng', ?, ?, ?)
-          ON CONFLICT(movie_id, field_key) DO UPDATE SET
-            source_kind = 'mdcng',
-            import_record_id = excluded.import_record_id,
-            source_content_hash = excluded.source_content_hash,
-            updated_at = excluded.updated_at
-        ''', [
-          input.movieId,
-          fieldKey,
-          record.id,
-          input.nfoContentHash,
-          timestamp,
-        ]);
-      }
-      _db.execute('COMMIT');
-      return record;
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-  }
+  NasMdcngImportRecord applyMdcngMetadata(NasMdcngMetadataApply input) =>
+      _metadata.applyMdcngMetadata(input);
 
   NasLibraryMovie? updateMoviePosterFileName({
     required String movieId,
     required String posterFileName,
-  }) {
-    if (findMovieForAdmin(movieId) == null) return null;
-    _db.execute(
-      'UPDATE movies SET poster_file_name = ?, updated_at = ? WHERE id = ?',
-      [posterFileName, _now(), movieId],
-    );
-    return findMovieForAdmin(movieId);
-  }
+  }) =>
+      _movies.updateMoviePosterFileName(
+          movieId: movieId, posterFileName: posterFileName);
 
   NasLibraryEpisode? updateEpisodeSourceAfterRename({
     required String episodeId,
@@ -6229,88 +1041,30 @@ class NasLibraryDatabase {
     required String title,
     required int fileSize,
     required int mediaModifiedAt,
-  }) {
-    final episode = findEpisode(episodeId);
-    if (episode == null) return null;
-    _db.execute('BEGIN IMMEDIATE');
-    try {
-      _db.execute(
-        '''UPDATE episodes
-           SET relative_path = ?, title = ?, file_size = ?, media_modified_at = ?,
-               is_available = 1, updated_at = ?
-           WHERE id = ?''',
-        [
-          relativePath,
-          title,
-          fileSize,
-          mediaModifiedAt,
-          _now(),
-          episodeId,
-        ],
-      );
-      _db.execute('COMMIT');
-    } catch (_) {
-      _db.execute('ROLLBACK');
-      rethrow;
-    }
-    return findEpisode(episodeId);
-  }
+  }) =>
+      _movies.updateEpisodeSourceAfterRename(
+          episodeId: episodeId,
+          relativePath: relativePath,
+          title: title,
+          fileSize: fileSize,
+          mediaModifiedAt: mediaModifiedAt);
 
   NasEpisodePlaybackProgress? playbackProgressForEpisode({
     required String movieId,
     required String episodeId,
-  }) {
-    final rows = _db.select('''
-      SELECT position_ms, duration_ms FROM episode_playback_progress
-      WHERE movie_id = ? AND episode_id = ?
-    ''', [movieId, episodeId]);
-    if (rows.isEmpty) return null;
-    final row = rows.single;
-    return NasEpisodePlaybackProgress(
-      positionMs: row['position_ms'] as int,
-      durationMs: row['duration_ms'] as int,
-    );
-  }
+  }) =>
+      _playback.playbackProgressForEpisode(
+          movieId: movieId, episodeId: episodeId);
 
   int resumePositionMsForEpisode({
     required String movieId,
     required String episodeId,
   }) =>
-      playbackProgressForEpisode(movieId: movieId, episodeId: episodeId)
-          ?.positionMs ??
-      0;
+      _playback.resumePositionMsForEpisode(
+          movieId: movieId, episodeId: episodeId);
 
-  NasPlaybackResumeTarget? resumeTargetForMovie(String movieId) {
-    final progressed = _db.select('''
-      SELECT episode_id, position_ms
-      FROM episode_playback_progress
-      WHERE movie_id = ?
-        AND position_ms > 0
-        AND duration_ms > 0
-        AND position_ms < duration_ms
-      ORDER BY updated_at DESC, episode_id DESC
-      LIMIT 1
-    ''', [movieId]);
-    if (progressed.isNotEmpty) {
-      return NasPlaybackResumeTarget(
-        episodeId: progressed.single['episode_id'] as String,
-        positionMs: progressed.single['position_ms'] as int,
-      );
-    }
-
-    final latestStarted = _db.select('''
-      SELECT episode_id
-      FROM playback_history
-      WHERE movie_id = ?
-      ORDER BY started_at DESC, id DESC
-      LIMIT 1
-    ''', [movieId]);
-    if (latestStarted.isEmpty) return null;
-    return NasPlaybackResumeTarget(
-      episodeId: latestStarted.single['episode_id'] as String,
-      positionMs: 0,
-    );
-  }
+  NasPlaybackResumeTarget? resumeTargetForMovie(String movieId) =>
+      _playback.resumeTargetForMovie(movieId);
 
   String recordPlaybackStarted({
     required String movieId,
@@ -6319,32 +1073,14 @@ class NasLibraryDatabase {
     String devicePlatform = 'unknown',
     String? startedAt,
     int? durationMs,
-  }) {
-    final historyId = newUuidV4();
-    final timestamp = startedAt ?? _now();
-    _db.execute(
-      'UPDATE movies SET play_count = play_count + 1, updated_at = ? WHERE id = ?',
-      [timestamp, movieId],
-    );
-    _db.execute(
-      '''INSERT INTO playback_history(
-           id, movie_id, episode_id, started_at, last_reported_at,
-           watch_duration_ms, last_position_ms, playback_status,
-           device_id, device_platform, duration_ms, end_position_ms
-         ) VALUES (?, ?, ?, ?, ?, 0, 0, 'playing', ?, ?, ?, 0)''',
-      [
-        historyId,
-        movieId,
-        episodeId,
-        timestamp,
-        timestamp,
-        deviceId,
-        devicePlatform,
-        durationMs,
-      ],
-    );
-    return historyId;
-  }
+  }) =>
+      _playback.recordPlaybackStarted(
+          movieId: movieId,
+          episodeId: episodeId,
+          deviceId: deviceId,
+          devicePlatform: devicePlatform,
+          startedAt: startedAt,
+          durationMs: durationMs);
 
   /// 只更新当前正式播放会话绑定的那一条记录，绝不按影片合并历史活动。
   void reportPlaybackHistory({
@@ -6354,22 +1090,14 @@ class NasLibraryDatabase {
     required int lastPositionMs,
     required int? durationMs,
     required String playbackStatus,
-  }) {
-    _db.execute('''
-      UPDATE playback_history
-      SET last_reported_at = ?, watch_duration_ms = ?, last_position_ms = ?,
-          duration_ms = ?, end_position_ms = ?, playback_status = ?
-      WHERE id = ?
-    ''', [
-      lastReportedAt,
-      watchDurationMs,
-      lastPositionMs,
-      durationMs,
-      lastPositionMs,
-      playbackStatus,
-      historyId,
-    ]);
-  }
+  }) =>
+      _playback.reportPlaybackHistory(
+          historyId: historyId,
+          lastReportedAt: lastReportedAt,
+          watchDurationMs: watchDurationMs,
+          lastPositionMs: lastPositionMs,
+          durationMs: durationMs,
+          playbackStatus: playbackStatus);
 
   void finishPlaybackHistory({
     required String historyId,
@@ -6378,665 +1106,53 @@ class NasLibraryDatabase {
     String? lastReportedAt,
     int? watchDurationMs,
     String playbackStatus = 'ended',
-  }) {
-    _db.execute(
-      '''UPDATE playback_history
-         SET ended_at = ?, last_reported_at = ?, end_position_ms = ?,
-             last_position_ms = ?, duration_ms = ?, watch_duration_ms = ?,
-             playback_status = ?
-         WHERE id = ?''',
-      [
-        _now(),
-        lastReportedAt ?? _now(),
-        endPositionMs,
-        endPositionMs ?? 0,
-        durationMs,
-        watchDurationMs ?? 0,
-        playbackStatus,
-        historyId,
-      ],
-    );
-  }
+  }) =>
+      _playback.finishPlaybackHistory(
+          historyId: historyId,
+          endPositionMs: endPositionMs,
+          durationMs: durationMs,
+          lastReportedAt: lastReportedAt,
+          watchDurationMs: watchDurationMs,
+          playbackStatus: playbackStatus);
 
-  NasWatchHistoryPage watchHistoryPage(NasWatchHistoryQuery query) {
-    final clauses = <String>[];
-    final parameters = <Object?>[];
-    final normalizedQuery = query.query.trim();
-    final like = '%$normalizedQuery%';
-    final catalogLike = '%${_normalizeCatalogNumber(normalizedQuery)}%';
-    if (normalizedQuery.isNotEmpty) {
-      clauses.add('''(
-        lower(m.title) LIKE lower(?)
-        OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
-        OR lower(e.title) LIKE lower(?)
-        OR lower(REPLACE(REPLACE(REPLACE(COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE lower(?)
-      )''');
-      parameters.addAll([like, like, like, catalogLike]);
-    }
-    if (query.startedOnOrAfter != null) {
-      clauses.add('h.started_at >= ?');
-      parameters.add(query.startedOnOrAfter);
-    }
-    if (query.startedBefore != null) {
-      clauses.add('h.started_at < ?');
-      parameters.add(query.startedBefore);
-    }
-    if (query.devicePlatform != null) {
-      clauses.add('h.device_platform = ?');
-      parameters.add(query.devicePlatform);
-    }
-    final where = clauses.isEmpty ? '1 = 1' : clauses.join(' AND ');
-    final sortExpression = switch (query.sort) {
-      'watchDurationMs' => 'h.watch_duration_ms',
-      'lastReportedAt' => 'h.last_reported_at',
-      _ => 'h.started_at',
-    };
-    final direction = query.order == 'asc' ? 'ASC' : 'DESC';
-    final offset = (query.page - 1) * query.pageSize;
-    const from = '''
-      FROM playback_history h
-      JOIN movies m ON m.id = h.movie_id
-      JOIN episodes e ON e.id = h.episode_id
-      LEFT JOIN media_roots root ON root.id = e.media_root_id
-    ''';
-    final total = _db
-        .select('SELECT COUNT(*) AS count $from WHERE $where', parameters)
-        .single['count'] as int;
-    final rows = _db.select('''
-      SELECT h.id, h.movie_id, h.episode_id, h.started_at, h.last_reported_at,
-             h.ended_at, h.watch_duration_ms, h.last_position_ms,
-             h.duration_ms, h.playback_status, h.device_id, h.device_platform,
-             m.title, m.original_title, m.catalog_number, m.poster_file_name,
-             e.title AS episode_title, root.name AS source_name
-      $from
-      WHERE $where
-      ORDER BY $sortExpression $direction, h.id $direction
-      LIMIT ? OFFSET ?
-    ''', [...parameters, query.pageSize, offset]);
-    final statsRow = _db.select('''
-      SELECT COUNT(*) AS record_count,
-             COALESCE(SUM(h.watch_duration_ms), 0) AS watch_duration_ms,
-             COUNT(DISTINCT h.device_id) AS active_device_count
-      $from
-      WHERE $where
-    ''', parameters).single;
-    final deviceRows = _db.select('''
-      SELECT h.device_platform, COUNT(*) AS count
-      $from
-      WHERE $where
-      GROUP BY h.device_platform
-    ''', parameters);
-    return NasWatchHistoryPage(
-      items: rows.map(_mapWatchHistoryRecord).toList(growable: false),
-      number: query.page,
-      size: query.pageSize,
-      total: total,
-      hasMore: offset + rows.length < total,
-      stats: NasWatchHistoryStats(
-        recordCount: statsRow['record_count'] as int,
-        watchDurationMs: statsRow['watch_duration_ms'] as int,
-        continueCount: _continueWatchingItems().length,
-        activeDeviceCount: statsRow['active_device_count'] as int,
-      ),
-      continueItems: _continueWatchingItems(),
-      deviceCounts: {
-        for (final row in deviceRows)
-          row['device_platform'] as String: row['count'] as int,
-      },
-    );
-  }
+  NasWatchHistoryPage watchHistoryPage(NasWatchHistoryQuery query) =>
+      _playback.watchHistoryPage(query);
 
-  List<NasWatchHistoryRecord> _continueWatchingItems() {
-    final rows = _db.select('''
-      SELECT COALESCE(h.id, '') AS id, p.movie_id, p.episode_id,
-             COALESCE(h.started_at, p.updated_at) AS started_at,
-             COALESCE(h.last_reported_at, p.updated_at) AS last_reported_at,
-             h.ended_at, COALESCE(h.watch_duration_ms, 0) AS watch_duration_ms,
-             p.position_ms AS last_position_ms, p.duration_ms,
-             COALESCE(h.playback_status, 'paused') AS playback_status,
-             COALESCE(h.device_id, 'legacy') AS device_id,
-             COALESCE(h.device_platform, 'unknown') AS device_platform,
-             m.title, m.original_title, m.catalog_number, m.poster_file_name,
-             e.title AS episode_title, root.name AS source_name
-      FROM episode_playback_progress p
-      JOIN movies m ON m.id = p.movie_id
-      JOIN episodes e ON e.id = p.episode_id
-      LEFT JOIN media_roots root ON root.id = e.media_root_id
-      LEFT JOIN playback_history h ON h.id = (
-        SELECT latest.id FROM playback_history latest
-        WHERE latest.episode_id = p.episode_id
-        ORDER BY latest.last_reported_at DESC, latest.id DESC
-        LIMIT 1
-      )
-      WHERE p.position_ms > 0 AND p.duration_ms > 0
-        AND p.position_ms < p.duration_ms
-      ORDER BY p.updated_at DESC, p.episode_id DESC
-      LIMIT 12
-    ''');
-    return rows.map(_mapWatchHistoryRecord).toList(growable: false);
-  }
-
-  NasWatchHistoryRecord _mapWatchHistoryRecord(Row row) =>
-      NasWatchHistoryRecord(
-        recordId: row['id'] as String,
-        movieId: row['movie_id'] as String,
-        episodeId: row['episode_id'] as String,
-        title: row['title'] as String,
-        episodeTitle: row['episode_title'] as String,
-        startedAt: row['started_at'] as String,
-        lastReportedAt: row['last_reported_at'] as String,
-        watchDurationMs: row['watch_duration_ms'] as int,
-        lastPositionMs: row['last_position_ms'] as int,
-        durationMs: row['duration_ms'] as int?,
-        status: row['playback_status'] as String,
-        deviceId: row['device_id'] as String,
-        devicePlatform: row['device_platform'] as String,
-        originalTitle: row['original_title'] as String?,
-        catalogNumber: row['catalog_number'] as String?,
-        posterFileName: row['poster_file_name'] as String?,
-        sourceName: row['source_name'] as String?,
-        endedAt: row['ended_at'] as String?,
-      );
-
-  List<NasPlaybackHistoryItem> listPlaybackHistory({String titleQuery = ''}) {
-    final query = titleQuery.trim();
-    final like = '%$query%';
-    final normalizedCatalogQuery = _normalizeCatalogNumber(query);
-    final catalogLike = '%$normalizedCatalogQuery%';
-    final rows = _db.select('''
-      SELECT h.id, h.movie_id, h.episode_id, m.title, m.original_title,
-             m.catalog_number, m.poster_file_name,
-             h.started_at, h.ended_at, h.end_position_ms, h.duration_ms
-        FROM playback_history h
-        JOIN movies m ON m.id = h.movie_id
-       WHERE (
-         ? = ''
-         OR lower(m.title) LIKE lower(?)
-         OR lower(COALESCE(m.original_title, '')) LIKE lower(?)
-         OR (? != '' AND lower(REPLACE(REPLACE(REPLACE(
-           COALESCE(m.catalog_number, ''), '-', ''), '_', ''), ' ', '')) LIKE ?)
-       )
-       ORDER BY h.started_at DESC, h.id DESC
-    ''', [query, like, like, normalizedCatalogQuery, catalogLike]);
-    return rows
-        .map(
-          (row) => NasPlaybackHistoryItem(
-            id: row['id'] as String,
-            movieId: row['movie_id'] as String,
-            episodeId: row['episode_id'] as String,
-            title: row['title'] as String,
-            originalTitle: row['original_title'] as String?,
-            catalogNumber: row['catalog_number'] as String?,
-            posterFileName: row['poster_file_name'] as String?,
-            startedAt: row['started_at'] as String,
-            endedAt: row['ended_at'] as String?,
-            endPositionMs: row['end_position_ms'] as int?,
-            durationMs: row['duration_ms'] as int?,
-          ),
-        )
-        .toList(growable: false);
-  }
+  List<NasPlaybackHistoryItem> listPlaybackHistory({String titleQuery = ''}) =>
+      _playback.listPlaybackHistory(titleQuery: titleQuery);
 
   void savePlaybackProgress({
     required String movieId,
     required String episodeId,
     required int positionMs,
     required int durationMs,
-  }) {
-    final boundedPosition = positionMs > durationMs ? durationMs : positionMs;
-    _db.execute('''
-      INSERT INTO episode_playback_progress(
-        movie_id, episode_id, position_ms, duration_ms, updated_at
-      ) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(movie_id, episode_id) DO UPDATE SET
-        position_ms = excluded.position_ms,
-        duration_ms = excluded.duration_ms,
-        updated_at = excluded.updated_at
-    ''', [movieId, episodeId, boundedPosition, durationMs, _now()]);
-  }
+  }) =>
+      _playback.savePlaybackProgress(
+          movieId: movieId,
+          episodeId: episodeId,
+          positionMs: positionMs,
+          durationMs: durationMs);
 
   List<NasCarouselImage> carouselImagesForMovie(String movieId) =>
-      _db.select('''
-        SELECT id, movie_id, file_name, created_at
-        FROM movie_carousel_images WHERE movie_id = ? ORDER BY created_at, id
-      ''', [movieId]).map(_mapCarouselImage).toList(growable: false);
+      _assets.carouselImagesForMovie(movieId);
 
-  String? lastPlaybackStartedAtForMovie(String movieId) {
-    final rows = _db.select('''
-      SELECT started_at FROM playback_history
-      WHERE movie_id = ?
-      ORDER BY started_at DESC, id DESC
-      LIMIT 1
-    ''', [movieId]);
-    return rows.isEmpty ? null : rows.single['started_at'] as String?;
-  }
+  String? lastPlaybackStartedAtForMovie(String movieId) =>
+      _playback.lastPlaybackStartedAtForMovie(movieId);
 
   NasCarouselImage? addCarouselImage({
     required String movieId,
     required String fileName,
-  }) {
-    if (findMovieForAdmin(movieId) == null) return null;
-    final image = NasCarouselImage(
-      id: newUuidV4(),
-      movieId: movieId,
-      fileName: fileName,
-      createdAt: _now(),
-    );
-    _db.execute(
-      'INSERT INTO movie_carousel_images(id, movie_id, file_name, created_at) VALUES (?, ?, ?, ?)',
-      [image.id, image.movieId, image.fileName, image.createdAt],
-    );
-    return image;
-  }
+  }) =>
+      _assets.addCarouselImage(movieId: movieId, fileName: fileName);
 
   NasCarouselImage? removeCarouselImage({
     required String movieId,
     required String imageId,
-  }) {
-    final rows = _db.select('''
-      SELECT id, movie_id, file_name, created_at FROM movie_carousel_images
-      WHERE id = ? AND movie_id = ?
-    ''', [imageId, movieId]);
-    if (rows.isEmpty) return null;
-    final image = _mapCarouselImage(rows.single);
-    _db.execute('DELETE FROM movie_carousel_images WHERE id = ?', [imageId]);
-    return image;
-  }
+  }) =>
+      _assets.removeCarouselImage(movieId: movieId, imageId: imageId);
 
-  NasCarouselImage? findCarouselImage(String imageId) {
-    final rows = _db.select('''
-      SELECT id, movie_id, file_name, created_at FROM movie_carousel_images
-      WHERE id = ?
-    ''', [imageId]);
-    return rows.isEmpty ? null : _mapCarouselImage(rows.single);
-  }
+  NasCarouselImage? findCarouselImage(String imageId) =>
+      _assets.findCarouselImage(imageId);
 
-  NasPublisher _mapPublisher(Row row) => NasPublisher(
-        id: row['id'] as String,
-        profileIdentity: row['profile_identity'] as String,
-        displayName: row['display_name'] as String,
-        originalName: row['original_name'] as String?,
-        countryRegion: row['country_region'] as String?,
-        foundedDate: row['founded_date'] as String?,
-        logoAssetId: row['logo_asset_id'] as String?,
-        movieCount: row['movie_count'] as int,
-        seriesCount: row['series_count'] as int,
-        durationMs: (row['duration_ms'] as int?) == 0
-            ? null
-            : row['duration_ms'] as int?,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-        archivedAt: row['archived_at'] as String?,
-      );
-
-  NasSeries _mapSeries(Row row) => NasSeries(
-        id: row['id'] as String,
-        profileIdentity: row['profile_identity'] as String,
-        displayName: row['display_name'] as String,
-        originalName: row['original_name'] as String?,
-        translatedName: row['translated_name'] as String?,
-        publisherId: row['publisher_id'] as String?,
-        releaseDate: row['release_date'] as String?,
-        posterAssetId: row['poster_asset_id'] as String?,
-        movieCount: row['movie_count'] as int,
-        episodeCount: row['episode_count'] as int,
-        durationMs: (row['duration_ms'] as int?) == 0
-            ? null
-            : row['duration_ms'] as int?,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-        archivedAt: row['archived_at'] as String?,
-      );
-
-  NasActor _mapActor(Row row) => NasActor(
-        id: row['id'] as String,
-        profileIdentity: row['profile_identity'] as String,
-        stageName: row['stage_name'] as String?,
-        originalName: row['original_name'] as String?,
-        translatedName: row['translated_name'] as String?,
-        aliases: _decodeTextList(row['aliases_json'] as String?),
-        gender: row['gender'] as String?,
-        romanizedName: row['romanized_name'] as String?,
-        birthDate: row['birth_date'] as String?,
-        birthMonth: row['birth_month'] as String?,
-        heightCm: row['height_cm'] as int?,
-        weightKg: row['weight_kg'] as int?,
-        measurements: row['measurements'] as String?,
-        bodyType: row['body_type'] as String?,
-        country: row['country'] as String?,
-        birthplace: row['birthplace'] as String?,
-        cup: row['cup'] as String?,
-        careerPeriod: row['career_period'] as String?,
-        debutMonth: row['debut_month'] as String?,
-        debutDescription: row['debut_description'] as String?,
-        accountUrl: row['account_url'] as String?,
-        officialSiteUrl: row['official_site_url'] as String?,
-        photoAssetId: row['photo_asset_id'] as String?,
-        backdropAssetId: row['backdrop_asset_id'] as String?,
-        publisherIds: publisherIdsForActor(row['id'] as String),
-        movieCount: row['movie_count'] as int,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-        archivedAt: row['archived_at'] as String?,
-      );
-
-  NasMdcngActorImportRecord _mapMdcngActorImportRecord(Row row) =>
-      NasMdcngActorImportRecord(
-        id: row['id'] as String,
-        actorId: row['actor_id'] as String,
-        sourceId: row['source_id'] as String,
-        taskId: row['task_id'] as String,
-        embyId: row['emby_id'] as String,
-        sourceFingerprint: row['source_fingerprint'] as String,
-        appliedFields: _decodeTextList(row['applied_fields_json'] as String?),
-        createdAt: row['created_at'] as String,
-      );
-
-  NasLibraryMovie _mapMovie(Row row) => NasLibraryMovie(
-        id: row['id'] as String,
-        title: row['title'] as String,
-        originalTitle: row['original_title'] as String?,
-        catalogNumber: row['catalog_number'] as String?,
-        publisherId: row['publisher_id'] as String?,
-        publisherName: row['publisher_name'] as String?,
-        seriesId: row['series_id'] as String?,
-        seriesName: row['series_name'] as String?,
-        summary: row['summary'] as String,
-        actors: _movieActors(row['id'] as String),
-        posterFileName: row['poster_file_name'] as String?,
-        playCount: row['play_count'] as int,
-        isFavorite: (row['is_favorite'] as int) == 1,
-        episodeCount: row['episode_count'] as int,
-        durationMs: (row['duration_ms'] as int?) == 0
-            ? null
-            : row['duration_ms'] as int?,
-        entryType: row['entry_type'] as String,
-        updatedAt: row['updated_at'] as String,
-        categoryId: row['category_id'] as String?,
-        categoryName: row['category_name'] as String?,
-      );
-
-  /// 搜索列表已经由 SQL 聚合，不能再为每部影片读取标签或路径。
-  NasLibraryMovie _mapSearchMovie(Row row) => NasLibraryMovie(
-        id: row['id'] as String,
-        title: row['title'] as String,
-        originalTitle: row['original_title'] as String?,
-        catalogNumber: row['catalog_number'] as String?,
-        publisherId: row['publisher_id'] as String?,
-        publisherName: row['publisher_name'] as String?,
-        seriesId: row['series_id'] as String?,
-        seriesName: row['series_name'] as String?,
-        summary: row['summary'] as String,
-        // 海报墙不展示演员；关键词中的演员匹配也已在同一个 SQL 查询内完成。
-        actors: const [],
-        posterFileName: row['poster_file_name'] as String?,
-        playCount: row['play_count'] as int,
-        isFavorite: (row['is_favorite'] as int) == 1,
-        episodeCount: row['episode_count'] as int,
-        durationMs: (row['duration_ms'] as int?) == 0
-            ? null
-            : row['duration_ms'] as int?,
-        entryType: row['entry_type'] as String,
-        updatedAt: row['updated_at'] as String,
-        categoryId: row['category_id'] as String?,
-        categoryName: row['category_name'] as String?,
-        videoWidth: row['video_width'] as int?,
-        videoHeight: row['video_height'] as int?,
-        resolutionLabel: row['resolution_label'] as String?,
-      );
-
-  NasLibraryMovie _withResolution(NasLibraryMovie movie) {
-    final rows = _db.select(
-      'SELECT DISTINCT video_width, video_height, resolution_label FROM episodes WHERE movie_id = ? AND is_available = 1 AND video_width IS NOT NULL AND video_height IS NOT NULL',
-      [movie.id],
-    );
-    final label = rows.length > 1
-        ? '多种分辨率'
-        : rows.isEmpty
-            ? null
-            : rows.single['resolution_label'] as String?;
-    final row = rows.length == 1 ? rows.single : null;
-    return NasLibraryMovie(
-      id: movie.id,
-      title: movie.title,
-      originalTitle: movie.originalTitle,
-      catalogNumber: movie.catalogNumber,
-      publisherId: movie.publisherId,
-      publisherName: movie.publisherName,
-      seriesId: movie.seriesId,
-      seriesName: movie.seriesName,
-      summary: movie.summary,
-      actors: movie.actors,
-      posterFileName: movie.posterFileName,
-      episodeCount: movie.episodeCount,
-      durationMs: movie.durationMs,
-      entryType: movie.entryType,
-      playCount: movie.playCount,
-      isFavorite: movie.isFavorite,
-      updatedAt: movie.updatedAt,
-      categoryId: movie.categoryId,
-      categoryName: movie.categoryName,
-      videoWidth: row?['video_width'] as int?,
-      videoHeight: row?['video_height'] as int?,
-      resolutionLabel: label,
-    );
-  }
-
-  List<NasMovieActor> _movieActors(String movieId) => actorsForMovie(movieId)
-      .map(
-        (actor) => NasMovieActor(
-          id: actor.id,
-          name: actor.translatedName ??
-              actor.stageName ??
-              actor.originalName ??
-              '未命名演员',
-          gender:
-              NasActorGender.tryParse(actor.gender) ?? NasActorGender.unknown,
-        ),
-      )
-      .toList(growable: false);
-
-  NasMediaRoot? _mediaRootForContainerPath(String containerPath) {
-    final rows = _db.select('''
-      SELECT id, name, container_path, read_only, enabled, created_at,
-             updated_at, last_scanned_at, is_online
-      FROM media_roots WHERE container_path = ?
-    ''', [containerPath]);
-    return rows.isEmpty ? null : _mapMediaRoot(rows.single);
-  }
-
-  NasMediaRoot _mapMediaRoot(Row row) => NasMediaRoot(
-        id: row['id'] as String,
-        name: row['name'] as String,
-        containerPath: row['container_path'] as String,
-        readOnly: (row['read_only'] as int) == 1,
-        enabled: (row['enabled'] as int) == 1,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-        lastScannedAt: row['last_scanned_at'] as String?,
-        isOnline: (row['is_online'] as int? ?? 0) == 1,
-      );
-
-  NasLibraryCategory _mapCategory(Row row) => NasLibraryCategory(
-        id: row['id'] as String,
-        name: row['name'] as String,
-        color: row['color'] as String?,
-        mediaRelativePath: row['media_relative_path'] as String?,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-      );
-
-  NasLibraryEpisode _mapEpisode(Row row) => NasLibraryEpisode(
-        id: row['id'] as String,
-        movieId: row['movie_id'] as String,
-        mediaRootId: row['media_root_id'] as String,
-        title: row['title'] as String,
-        relativePath: row['relative_path'] as String,
-        fileSize: row['file_size'] as int,
-        isAvailable: (row['is_available'] as int) == 1,
-        durationMs: row['duration_ms'] as int?,
-        videoWidth: row['video_width'] as int?,
-        videoHeight: row['video_height'] as int?,
-        resolutionLabel: row['resolution_label'] as String?,
-        mediaModifiedAt: row['media_modified_at'] as int?,
-        updatedAt: row['updated_at'] as String,
-        sourceName: row['source_name'] as String? ?? '未知来源盘',
-        sourceOnline: (row['source_online'] as int? ?? 0) == 1,
-      );
-
-  NasLibraryCategory _mapCategoryWithSources(Row row) {
-    final category = _mapCategory(row);
-    return NasLibraryCategory(
-      id: category.id,
-      name: category.name,
-      color: category.color,
-      mediaRelativePath: category.mediaRelativePath,
-      createdAt: category.createdAt,
-      updatedAt: category.updatedAt,
-      mediaSources: mediaSourcesForCategory(category.id),
-      movieCount: row['movie_count'] as int,
-    );
-  }
-
-  NasCarouselImage _mapCarouselImage(Row row) => NasCarouselImage(
-        id: row['id'] as String,
-        movieId: row['movie_id'] as String,
-        fileName: row['file_name'] as String,
-        createdAt: row['created_at'] as String,
-      );
-
-  NasLibraryTag _mapTag(Row row) => NasLibraryTag(
-        id: row['id'] as String,
-        name: row['name'] as String,
-        level: row['level'] as int,
-        description: row['description'] as String? ?? '',
-        color: row['color'] as String?,
-        createdAt: row['created_at'] as String,
-        updatedAt: row['updated_at'] as String,
-        archivedAt: row['archived_at'] as String?,
-      );
-
-  void _backfillLegacyCategorySources(String rootId) {
-    final categories = _db.select('''
-      SELECT id, media_relative_path FROM library_categories
-      WHERE media_relative_path IS NOT NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM category_media_sources source
-          WHERE source.category_id = library_categories.id
-        )
-    ''');
-    final timestamp = _now();
-    for (final category in categories) {
-      final path = _normalizeRelativePath(
-        category['media_relative_path'] as String?,
-      );
-      if (path == null) continue;
-      _db.execute('''
-        INSERT INTO category_media_sources(
-          id, category_id, media_root_id, relative_path, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      ''', [newUuidV4(), category['id'], rootId, path, timestamp, timestamp]);
-    }
-  }
-
-  void _markRootScanned(String rootId) {
-    _db.execute(
-      'UPDATE media_roots SET last_scanned_at = ?, is_online = 1, updated_at = ? WHERE id = ?',
-      [_now(), _now(), rootId],
-    );
-  }
-
-  void _markRootOffline(String rootId) {
-    _db.execute(
-      'UPDATE media_roots SET is_online = 0, updated_at = ? WHERE id = ?',
-      [_now(), rootId],
-    );
-  }
-
-  static bool _isVideo(String path) => RegExp(
-        r'\.(mp4|m4v|mkv|mov|webm|avi|wmv|flv|ts|m2ts|rmvb)$',
-        caseSensitive: false,
-      ).hasMatch(path);
-
-  static String? _collectionTitleFromDirectory(String value) {
-    final match = RegExp(r'^(.*?)\s*[-－—]\s*影集\s*$').firstMatch(value);
-    final title = match?.group(1)?.trim();
-    return title == null || title.isEmpty ? null : title;
-  }
-
-  static String _naturalSortKey(String value) =>
-      value.toLowerCase().replaceAllMapped(
-          RegExp(r'\d+'), (match) => match.group(0)!.padLeft(16, '0'));
-
-  static String? _normalizeRelativePath(String? value) {
-    final normalized = value?.trim().replaceAll('\\', '/');
-    if (normalized == null ||
-        normalized.isEmpty ||
-        normalized.startsWith('/') ||
-        normalized.split('/').any(
-              (segment) => segment.isEmpty || segment == '.' || segment == '..',
-            )) {
-      return null;
-    }
-    return normalized;
-  }
-
-  static String _titleFromPath(String relativePath) {
-    final name = relativePath.split('/').last;
-    final dot = name.lastIndexOf('.');
-    return dot <= 0 ? name : name.substring(0, dot);
-  }
-
-  static String _now() => DateTime.now().toUtc().toIso8601String();
+  static String _now() => now();
 }
-
-class _EpisodeGrouping {
-  const _EpisodeGrouping({
-    this.rootPath,
-    this.displayTitle,
-    this.conflictPath,
-  });
-
-  final String? rootPath;
-  final String? displayTitle;
-  final String? conflictPath;
-
-  bool get isConflict => conflictPath != null;
-}
-
-class _LegacyCollectionGroup {
-  _LegacyCollectionGroup({required this.categoryId, required this.title});
-
-  final String categoryId;
-  final String title;
-  final Set<String> episodeIds = <String>{};
-  final Set<String> sourceMovieIds = <String>{};
-}
-
-List<String> _decodeTextList(String? value) {
-  if (value == null || value.isEmpty) return const [];
-  try {
-    final decoded = jsonDecode(value);
-    if (decoded is! List) return const [];
-    return _cleanTextList(decoded.whereType<String>());
-  } on FormatException {
-    return const [];
-  }
-}
-
-List<String> _cleanTextList(Iterable<String> values) => values
-    .map((value) => value.trim())
-    .where((value) => value.isNotEmpty)
-    .toSet()
-    .toList(growable: false);
-
-String _normalizeActorSearch(String value) =>
-    value.trim().toLowerCase().replaceAll(RegExp(r'[\s\-_.·•]+'), '');
-
-String _actorSearchText(NasActor actor) => _normalizeActorSearch([
-      actor.stageName,
-      actor.originalName,
-      actor.translatedName,
-      actor.bodyType,
-      ...actor.aliases,
-    ].whereType<String>().join(' '));

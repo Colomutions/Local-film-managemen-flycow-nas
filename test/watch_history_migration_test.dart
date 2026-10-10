@@ -37,6 +37,16 @@ Future<void> main() async {
         'legacy-record', 'legacy-movie', 'legacy-episode',
         '2026-09-01T10:00:00.000Z', '2026-09-01T10:02:00.000Z', 120000, 300000
       );
+      -- 保留 v23 影片关系供启动查询使用，后续 migration 会扩展这些表。
+      CREATE TABLE movies (
+        id TEXT PRIMARY KEY,
+        lifecycle_state TEXT NOT NULL DEFAULT 'active',
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE episodes (
+        id TEXT PRIMARY KEY,
+        movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE
+      );
       -- v23 已包含资料实体与资产表；保留 migration 26/28 所需结构。
       CREATE TABLE managed_assets (
         id TEXT PRIMARY KEY,
@@ -45,9 +55,42 @@ Future<void> main() async {
         mime_type TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
-      CREATE TABLE actors (id TEXT PRIMARY KEY);
+      -- v14 的演员资料与关联表在启动时也会被查询，不能简化为只有 id。
+      CREATE TABLE actors (
+        id TEXT PRIMARY KEY,
+        stage_name TEXT,
+        original_name TEXT,
+        translated_name TEXT,
+        aliases_json TEXT NOT NULL DEFAULT '[]',
+        gender TEXT CHECK(gender IN ('female', 'intersex', 'male')),
+        birth_month TEXT,
+        height_cm INTEGER,
+        weight_kg INTEGER,
+        measurements TEXT,
+        body_type TEXT,
+        country TEXT,
+        debut_month TEXT,
+        debut_description TEXT,
+        photo_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
+        publisher_names_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        archived_at TEXT
+      );
+      CREATE TABLE movie_actor_links (
+        movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+        PRIMARY KEY(movie_id, actor_id)
+      );
       CREATE TABLE publishers (id TEXT PRIMARY KEY);
       CREATE TABLE series (id TEXT PRIMARY KEY);
+      -- v7 已包含画廊表；启动时会查询它以补记旧图片来源。
+      CREATE TABLE movie_carousel_images (
+        id TEXT PRIMARY KEY,
+        movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+      );
     ''');
   } finally {
     legacy.dispose();

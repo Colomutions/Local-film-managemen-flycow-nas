@@ -276,6 +276,13 @@ void _createVersion19TaxonomyDatabase(String path) {
         movie_id TEXT NOT NULL,
         relative_path TEXT NOT NULL
       );
+      -- v7 已包含画廊表；启动时会查询它以补记旧图片来源。
+      CREATE TABLE movie_carousel_images (
+        id TEXT PRIMARY KEY,
+        movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE library_categories (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -301,7 +308,33 @@ void _createVersion19TaxonomyDatabase(String path) {
         mime_type TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
-      CREATE TABLE actors (id TEXT PRIMARY KEY);
+      -- v14 的演员资料与关联表在启动时也会被查询，不能简化为只有 id。
+      CREATE TABLE actors (
+        id TEXT PRIMARY KEY,
+        stage_name TEXT,
+        original_name TEXT,
+        translated_name TEXT,
+        aliases_json TEXT NOT NULL DEFAULT '[]',
+        gender TEXT CHECK(gender IN ('female', 'intersex', 'male')),
+        birth_month TEXT,
+        height_cm INTEGER,
+        weight_kg INTEGER,
+        measurements TEXT,
+        body_type TEXT,
+        country TEXT,
+        debut_month TEXT,
+        debut_description TEXT,
+        photo_asset_id TEXT REFERENCES managed_assets(id) ON DELETE SET NULL,
+        publisher_names_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        archived_at TEXT
+      );
+      CREATE TABLE movie_actor_links (
+        movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+        actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+        PRIMARY KEY(movie_id, actor_id)
+      );
       CREATE TABLE publishers (id TEXT PRIMARY KEY);
       CREATE TABLE series (id TEXT PRIMARY KEY);
       CREATE TABLE tags (
