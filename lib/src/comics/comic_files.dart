@@ -261,6 +261,7 @@ class ComicFiles {
     }
     await _checkZipDirectoryBounds(file);
     InputFileStream? input;
+    var hasDirectories = false;
     try {
       input = InputFileStream(file.path);
       final directory = ZipDirectory.read(input);
@@ -294,7 +295,11 @@ class ComicFiles {
             (entry.compressionMethod != 0 && entry.compressionMethod != 8)) {
           throw const ComicFailure('invalid_comic_content');
         }
-        if (!isFile) continue;
+        if (!isFile) {
+          if (size != 0) throw const ComicFailure('invalid_comic_content');
+          hasDirectories = true;
+          continue;
+        }
         total += size;
         if (total > 4 * 1024 * 1024 * 1024)
           throw const ComicFailure('invalid_comic_content');
@@ -325,7 +330,13 @@ class ComicFiles {
       await input?.close();
     }
     final executable = Platform.isWindows ? 'tar' : 'unzip';
-    final args = Platform.isWindows ? ['-xOf', file.path] : ['-tqq', file.path];
+    // Older Android downloads contain empty deflated directory entries with
+    // no deflate stream (archive 4.1). Their paths and zero size were checked
+    // above; test every regular file, including its CRC, without inflating
+    // these directory placeholders. Never accept unzip's nonzero exit codes.
+    final args = Platform.isWindows
+        ? ['-xOf', file.path]
+        : ['-tqq', file.path, if (hasDirectories) ...['-x', '*/']];
     try {
       final process = await Process.start(executable, args);
       final output = process.stdout.drain<void>();
