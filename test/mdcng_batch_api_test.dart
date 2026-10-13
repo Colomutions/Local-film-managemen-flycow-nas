@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:sqlite3/sqlite3.dart' as sqlite;
+
 import '../lib/mujing_nas.dart';
 
 Future<void> main() async {
@@ -44,6 +46,7 @@ Future<void> main() async {
     mediaDir: media.path,
     timezone: 'Asia/Shanghai',
   ));
+  sqlite.Database? raw;
   try {
     await server.start();
     final base = Uri.parse('http://127.0.0.1:${server.port}');
@@ -148,16 +151,70 @@ Future<void> main() async {
         '批量导入保留人工标题且不复制重复图片');
 
     await soloNfo.writeAsString('<movie><title>Solo 正确标题</title></movie>');
-    final retried = await _request(base, 'POST',
+    final fixedRetry = await _request(base, 'POST',
         '/api/v1/admin/mdcng-import-jobs/${batch.data['id']}/retry',
+        token: admin);
+    final fixedDone =
+        await _waitForBatch(base, fixedRetry.data['id'] as String, admin);
+    _expect(
+        fixedDone['total'] == 1 &&
+            fixedDone['applied'] == 1 &&
+            fixedDone['failed'] == 0,
+        '修复 NFO 后只重试失败项并导入');
+
+    await soloNfo.delete();
+    final missingBatch = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-import-jobs',
+        token: admin, body: {'categoryId': categoryId});
+    final missingDone =
+        await _waitForBatch(base, missingBatch.data['id'] as String, admin);
+    _expect(
+        missingDone['failed'] == 1 &&
+            (missingDone['failures'] as List).single['reason'] ==
+                'sidecar_not_found',
+        '有可用来源但确实缺少 NFO 仍列为失败');
+
+    // 扫描索引会保留临时离线的旧盘记录。批量预览和失败项重试都应跳过
+    // 只有不可用来源的影片，而不是把它再次报告成 NFO 缺失。
+    raw = sqlite.sqlite3.open(
+        '${root.path}${Platform.pathSeparator}data${Platform.pathSeparator}db${Platform.pathSeparator}mujing.sqlite');
+    raw.execute('UPDATE episodes SET is_available=0 WHERE relative_path LIKE ?',
+        ['%Solo.mp4']);
+    final unavailablePreview = await _request(base, 'GET',
+        '/api/v1/admin/mdcng-import-jobs/preview?categoryId=$categoryId',
+        token: admin);
+    _expect(
+        unavailablePreview.data['movieCount'] == 1 &&
+            unavailablePreview.data['unavailableCount'] == 1 &&
+            unavailablePreview.data['categoryMovieCount'] == 2 &&
+            (unavailablePreview.data['unavailableMovies'] as List)
+                    .single['title'] ==
+                'Solo 正确标题' &&
+            (unavailablePreview.data['unavailableMovies'] as List)
+                    .single['sources']
+                    .single['reason'] ==
+                'source_unavailable',
+        '批量预览列出只有不可用来源的旧盘影片');
+    await soloNfo.writeAsString('<movie><title>Solo 正确标题</title></movie>');
+    final retried = await _request(base, 'POST',
+        '/api/v1/admin/mdcng-import-jobs/${missingBatch.data['id']}/retry',
         token: admin);
     final retryDone =
         await _waitForBatch(base, retried.data['id'] as String, admin);
     _expect(
         retryDone['total'] == 1 &&
-            retryDone['applied'] == 1 &&
+            retryDone['applied'] == 0 &&
+            retryDone['skipped'] == 1 &&
             retryDone['failed'] == 0,
-        '只重试失败项');
+        '只重试失败项，并跳过已离线来源');
+
+    final availableBatch = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-import-jobs',
+        token: admin, body: {'categoryId': categoryId});
+    final availableDone =
+        await _waitForBatch(base, availableBatch.data['id'] as String, admin);
+    _expect(availableDone['total'] == 1 && availableDone['failed'] == 0,
+        '新批量任务仅处理可用来源，问题清单中的旧记录不误报 NFO 缺失');
 
     final scan = await _request(base, 'POST', '/api/v1/admin/scan-jobs',
         token: admin, body: {'categoryId': categoryId});
@@ -170,6 +227,7 @@ Future<void> main() async {
             rescanned.data['posterUrl'] != null,
         '二次扫描保留影片资料、海报和两段视频');
   } finally {
+    raw?.dispose();
     await server.stop();
     await root.delete(recursive: true);
   }

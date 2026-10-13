@@ -678,8 +678,18 @@ class NasLibraryDatabase {
   NasLibraryMovie? findMovieForAdmin(String movieId) =>
       _queries.findMovieForAdmin(movieId);
 
-  List<String> activeMovieIdsForCategory(String categoryId) =>
-      _queries.activeMovieIdsForCategory(categoryId);
+  List<String> activeMovieIdsForCategory(String categoryId,
+          {bool availableOnly = false}) =>
+      _queries.activeMovieIdsForCategory(categoryId,
+          availableOnly: availableOnly);
+
+  List<({String id, String title, String entryType})>
+      activeMovieSummariesForCategory(String categoryId) =>
+          _queries.activeMovieSummariesForCategory(categoryId);
+
+  List<({String movieId, String title, String sourceName, String relativePath})>
+      availableSingleVideoSourcesForCategory(String categoryId) =>
+          _queries.availableSingleVideoSourcesForCategory(categoryId);
 
   String? preferredMdcngEpisodeIdForMovie(String movieId) =>
       _queries.preferredMdcngEpisodeIdForMovie(movieId);

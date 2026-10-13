@@ -601,6 +601,7 @@ class NasHealthServer {
     libraryDatabase: _libraryDatabase,
     artworkService: _artworkService,
     media: _media,
+    logger: _logger,
     diskWork: _diskWork,
     scans: _scans,
     config: config,

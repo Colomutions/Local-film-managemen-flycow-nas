@@ -22,6 +22,7 @@ Future<void> main() async {
     final big = db.createCategory('AV'), empty = db.createCategory('空分类');
     raw = sqlite.sqlite3.open('${db.dataDir}/db/mujing.sqlite');
     raw.execute('PRAGMA foreign_keys=ON');
+    raw.execute('UPDATE media_roots SET is_online=1 WHERE id=?', [root.id]);
     raw.execute('BEGIN');
     for (var i = 0; i < 864; i++) {
       raw.execute('INSERT INTO movies(id,title,category_id,created_at,updated_at) VALUES (?,?,?,?,?)',
@@ -59,12 +60,36 @@ Future<void> main() async {
     }
     final preview = await request(base, 'GET', '/api/v1/admin/mdcng-import-jobs/preview?categoryId=${big.id}', token: admin);
     check(preview.$1 == 200 && preview.$2['data']['movieCount'] == 864, '普通片库与 MDCNG 预览总数一致');
+    raw.execute('''INSERT INTO movies(id,title,category_id,lifecycle_state,created_at,updated_at)
+        VALUES ('offline-only','仅离线影片',?,'active','now','now')''', [big.id]);
+    raw.execute('''INSERT INTO episodes(id,movie_id,media_root_id,title,relative_path,file_size,is_available,updated_at)
+        VALUES ('offline-only-episode','offline-only',?,'仅离线影片','offline-only.mp4',1,0,'now')''', [root.id]);
+    final availablePreview = await request(base, 'GET', '/api/v1/admin/mdcng-import-jobs/preview?categoryId=${big.id}', token: admin);
+    check(
+        availablePreview.$1 == 200 &&
+            availablePreview.$2['data']['movieCount'] == 864 &&
+            availablePreview.$2['data']['unavailableCount'] == 1 &&
+            (availablePreview.$2['data']['unavailableMovies'] as List)
+                    .single['title'] ==
+                '仅离线影片',
+        'MDCNG 批量预览列出只有不可用分集的影片');
     raw.execute('UPDATE media_roots SET is_online=0 WHERE id=?', [root.id]);
-    check(db.findCategory(big.id)!.movieCount == 864, '离线不使影片总数下降');
+    final offlinePreview = await request(base, 'GET', '/api/v1/admin/mdcng-import-jobs/preview?categoryId=${big.id}', token: admin);
+    check(offlinePreview.$2['data']['movieCount'] == 0 &&
+        offlinePreview.$2['data']['unavailableCount'] == 865 &&
+        (offlinePreview.$2['data']['unavailableMovies'] as List)
+            .every((movie) => movie['reason'] == 'media_root_offline'),
+        '根目录离线时完整列出所有问题影片，不截断到分页数量');
+    check(db.findCategory(big.id)!.movieCount == 865, '离线不使影片总数下降');
     db.removeMovieFromIndex('movie-1');
-    check(db.findCategory(big.id)!.movieCount == 863, '移除索引后即刻更新统计');
+    check(db.findCategory(big.id)!.movieCount == 864, '移除索引后即刻更新统计');
     db.createEmptySeries(title: '手动空影集', categoryId: empty.id);
     check(db.findCategory(empty.id)!.movieCount == 1, '与影片墙一致，手动空影集按一部计');
+    final emptyPreview = await request(base, 'GET', '/api/v1/admin/mdcng-import-jobs/preview?categoryId=${empty.id}', token: admin);
+    check(emptyPreview.$2['data']['categoryMovieCount'] == 1 &&
+        emptyPreview.$2['data']['movieCount'] == 0 &&
+        (emptyPreview.$2['data']['unavailableMovies'] as List)
+            .single['reason'] == 'no_episodes', '空影集也要列出没有分集的原因');
     check((await request(base, 'GET', '/api/v1/categories?sort=invalid', token: viewer)).$1 == 400,
         '排序白名单校验');
     stdout.writeln('category_counts_api_test: PASS');

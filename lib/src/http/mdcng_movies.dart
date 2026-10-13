@@ -4,6 +4,7 @@ import 'dart:io';
 import '../artwork_service.dart';
 import '../auth.dart';
 import '../config.dart';
+import '../diagnostic_log.dart';
 import '../disk_work_queue.dart';
 
 import '../library/mdcng_sidecar.dart';
@@ -22,6 +23,7 @@ class NasMdcngMoviesHttpApi {
     required NasLibraryDatabase libraryDatabase,
     required NasArtworkService artworkService,
     required NasMediaResolver media,
+    required NasDiagnosticLogger logger,
     required DiskWorkQueue diskWork,
     required NasScanHttpApi scans,
     required this.config,
@@ -29,11 +31,13 @@ class NasMdcngMoviesHttpApi {
   })  : _libraryDatabase = libraryDatabase,
         _artworkService = artworkService,
         _media = media,
+        _logger = logger,
         _diskWork = diskWork,
         _scans = scans,
         _presenter = presenter;
   final NasLibraryDatabase _libraryDatabase;
   final NasConfig config;
+  final NasDiagnosticLogger _logger;
 
   final NasLibraryPresenter _presenter;
   final NasArtworkService _artworkService;
@@ -579,7 +583,8 @@ class NasMdcngMoviesHttpApi {
     final job = _MdcngBatchJob(
       id: newUuidV4(),
       categoryId: categoryId,
-      movieIds: _libraryDatabase.activeMovieIdsForCategory(categoryId),
+      movieIds: _libraryDatabase.activeMovieIdsForCategory(categoryId,
+          availableOnly: true),
     );
     _rememberMdcngBatchJob(job);
     _activeMdcngBatchTask = Future<void>.delayed(Duration.zero).then(
@@ -609,11 +614,63 @@ class NasMdcngMoviesHttpApi {
         _libraryDatabase.findCategory(categoryId) == null) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
+    final allMovies =
+        _libraryDatabase.activeMovieSummariesForCategory(categoryId);
+    final availableMovieIds = _libraryDatabase
+        .activeMovieIdsForCategory(categoryId, availableOnly: true)
+        .toSet();
+    // 同文件名只用于提示可能重复的记录，不能据此借用 NFO 或合并影片。
+    final availableSourcesByName = <String, List<Map<String, String>>>{};
+    for (final source in _libraryDatabase
+        .availableSingleVideoSourcesForCategory(categoryId)) {
+      final name = nasSourceFileName(source.relativePath).toLowerCase();
+      (availableSourcesByName[name] ??= []).add({
+        'movieId': source.movieId,
+        'title': source.title,
+        'sourceName': source.sourceName,
+        'relativePath': source.relativePath,
+      });
+    }
+    final unavailableMovies = allMovies
+        .where((movie) => !availableMovieIds.contains(movie.id))
+        .map((movie) {
+      final episodes = _libraryDatabase.episodesForMovie(movie.id);
+      final matchingNames = movie.entryType == 'single'
+          ? episodes
+              .map((episode) =>
+                  nasSourceFileName(episode.relativePath).toLowerCase())
+              .toSet()
+          : const <String>{};
+      return {
+        'movieId': movie.id,
+        'title': movie.title,
+        'reason': episodes.isEmpty
+            ? 'no_episodes'
+            : episodes.every((episode) => !episode.sourceOnline)
+                ? 'media_root_offline'
+                : 'no_available_source',
+        'sources': episodes
+            .map((episode) => {
+                  'sourceName': episode.sourceName,
+                  'relativePath': episode.relativePath,
+                  'reason': !episode.sourceOnline
+                      ? 'media_root_offline'
+                      : 'source_unavailable',
+                })
+            .toList(growable: false),
+        'matchingAvailableSources': [
+          for (final name in matchingNames)
+            ...availableSourcesByName[name] ?? const <Map<String, String>>[],
+        ],
+      };
+    }).toList(growable: false);
     await writeApiJson(request.response, HttpStatus.ok, {
       'data': {
         'categoryId': categoryId,
-        'movieCount':
-            _libraryDatabase.activeMovieIdsForCategory(categoryId).length,
+        'categoryMovieCount': allMovies.length,
+        'movieCount': availableMovieIds.length,
+        'unavailableCount': unavailableMovies.length,
+        'unavailableMovies': unavailableMovies,
       },
     });
   }
@@ -720,6 +777,26 @@ class NasMdcngMoviesHttpApi {
             job.skipped++;
           }
         } on Object catch (error) {
+          _logger.event('mdcng.batch.movie_failed',
+              level: 'ERROR',
+              component: 'nas.mdcng',
+              fields: {
+                'jobId': job.id,
+                'movieId': movieId,
+                'categoryId': job.categoryId,
+                'errorType': error.runtimeType.toString(),
+                if (error is ArgumentError &&
+                    const {
+                      'Invalid MDCNG metadata import.',
+                      'Missing selected MDCNG metadata field.',
+                      'Invalid MDCNG actors.',
+                      'Invalid MDCNG tags.',
+                    }.contains(error.message))
+                  'validationError': error.message,
+                if (error is MdcngNfoSidecarException) 'reason': error.code,
+                if (error is FileSystemException)
+                  'osErrorCode': error.osError?.errorCode,
+              });
           job.failures[movieId] = (
             title: movie?.title ?? '未知影片',
             reason: error is MdcngNfoSidecarException
@@ -733,9 +810,17 @@ class NasMdcngMoviesHttpApi {
         await Future<void>.delayed(Duration.zero);
       }
       job.status = job.cancelled ? 'cancelled' : 'succeeded';
-    } on Object {
+    } on Object catch (error) {
       job.status = 'failed';
       job.errorCode = 'mdcng_import_failed';
+      _logger.event('mdcng.batch.failed',
+          level: 'ERROR',
+          component: 'nas.mdcng',
+          fields: {
+            'jobId': job.id,
+            'categoryId': job.categoryId,
+            'errorType': error.runtimeType.toString(),
+          });
     } finally {
       _activeMdcngBatchTask = null;
     }
@@ -745,6 +830,12 @@ class NasMdcngMoviesHttpApi {
       String movieId, String categoryId) async {
     final movie = _libraryDatabase.findMovieForAdmin(movieId);
     if (movie == null || movie.categoryId != categoryId) {
+      return (status: 'skipped', warnings: const <String>[]);
+    }
+    // 历史失败项和排队后的影片可能已离线；不可用来源不属于 NFO 缺失。
+    if (!_libraryDatabase
+        .episodesForMovie(movieId)
+        .any((episode) => episode.isAvailable && episode.sourceOnline)) {
       return (status: 'skipped', warnings: const <String>[]);
     }
     final sources = await _mdcngSourcesForMovie(movieId, firstOnly: true);
@@ -811,7 +902,8 @@ class NasMdcngMoviesHttpApi {
         ids.add(actor.id);
       }
       if (ids.isNotEmpty) {
-        actorIds = ids;
+        // 多个名称或别名可以精确匹配同一档案，影片关联应按演员 ID 去重。
+        actorIds = ids.toSet().toList(growable: false);
         fields.add('actors');
       } else {
         warnings.add('actors_unresolved');

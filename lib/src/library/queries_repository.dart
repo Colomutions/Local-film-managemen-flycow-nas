@@ -513,15 +513,56 @@ class NasQueriesRepository {
     return rows.isEmpty ? null : _withResolution(_mapMovie(rows.single));
   }
 
-  List<String> activeMovieIdsForCategory(String categoryId) => _db
-      .select('''
+  List<String> activeMovieIdsForCategory(String categoryId,
+          {bool availableOnly = false}) =>
+      _db
+          .select('''
         SELECT id FROM movies
         WHERE category_id = ? AND lifecycle_state = 'active'
-          AND EXISTS (SELECT 1 FROM episodes WHERE movie_id = movies.id)
+          AND EXISTS (
+            SELECT 1 FROM episodes e
+            JOIN media_roots root ON root.id = e.media_root_id
+            WHERE e.movie_id = movies.id
+              AND (? = 0 OR (e.is_available = 1 AND root.is_online = 1))
+          )
         ORDER BY id
+      ''', [categoryId, availableOnly ? 1 : 0])
+          .map((row) => row['id'] as String)
+          .toList(growable: false);
+
+  List<({String id, String title, String entryType})>
+      activeMovieSummariesForCategory(String categoryId) => _db
+          .select('''
+        SELECT id, title, entry_type FROM movies
+        WHERE category_id = ? AND lifecycle_state = 'active'
+          AND (entry_type = 'series'
+            OR EXISTS (SELECT 1 FROM episodes e WHERE e.movie_id = movies.id))
+        ORDER BY title COLLATE NOCASE, id
       ''', [categoryId])
-      .map((row) => row['id'] as String)
-      .toList(growable: false);
+          .map((row) => (
+                id: row['id'] as String,
+                title: row['title'] as String,
+                entryType: row['entry_type'] as String,
+              ))
+          .toList(growable: false);
+
+  List<({String movieId, String title, String sourceName, String relativePath})>
+      availableSingleVideoSourcesForCategory(String categoryId) => _db
+          .select('''
+        SELECT m.id AS movie_id, m.title, root.name AS source_name, e.relative_path
+        FROM movies m JOIN episodes e ON e.movie_id = m.id
+        JOIN media_roots root ON root.id = e.media_root_id
+        WHERE m.category_id = ? AND m.lifecycle_state = 'active'
+          AND m.entry_type = 'single' AND e.is_available = 1 AND root.is_online = 1
+        ORDER BY m.title COLLATE NOCASE, m.id, e.relative_path COLLATE NOCASE, e.id
+      ''', [categoryId])
+          .map((row) => (
+                movieId: row['movie_id'] as String,
+                title: row['title'] as String,
+                sourceName: row['source_name'] as String,
+                relativePath: row['relative_path'] as String,
+              ))
+          .toList(growable: false);
 
   String? preferredMdcngEpisodeIdForMovie(String movieId) {
     final linked = _db.select('''
