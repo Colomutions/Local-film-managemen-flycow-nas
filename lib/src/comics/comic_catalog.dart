@@ -27,6 +27,7 @@ class ComicRecord {
       required this.revision,
       required this.createdAt,
       required this.updatedAt,
+      this.coverBase64,
       required this.storageState});
 
   final String id,
@@ -39,6 +40,7 @@ class ComicRecord {
       updatedAt,
       storageState;
   final String? author;
+  final String? coverBase64;
   final int sizeBytes, revision;
 
   Map<String, Object?> toJson({bool admin = false}) => {
@@ -52,7 +54,9 @@ class ComicRecord {
         'sizeBytes': sizeBytes,
         'contentSha256': sha256,
         'canDownload': storageState == 'healthy',
-        'coverUrl': null,
+        'coverUrl': '/api/v1/comics/$id/cover?r=$revision',
+        'hasCustomCover': coverBase64 != null,
+        'canRead': storageState == 'healthy',
         'revision': revision,
         'createdAt': createdAt,
         'updatedAt': updatedAt,
@@ -63,6 +67,7 @@ class ComicRecord {
         id: row['id'] as String,
         title: row['title'] as String,
         author: row['author'] as String?,
+        coverBase64: row['cover_base64'] as String?,
         relativePath: row['relative_path'] as String,
         format: row['format'] as String,
         fileName: row['file_name'] as String,
@@ -120,6 +125,10 @@ class ComicCatalog {
         CREATE INDEX IF NOT EXISTS comic_idem_expiry ON comic_idempotency(expires_at);
       ''');
       ContentFileNames.createSchema(database);
+      final columns = database.select('PRAGMA table_info(comics)');
+      if (!columns.any((row) => row['name'] == 'cover_base64')) {
+        database.execute('ALTER TABLE comics ADD COLUMN cover_base64 TEXT');
+      }
       final integrity =
           database.select('PRAGMA quick_check').single.values.first;
       if (integrity != 'ok') throw StateError('Comic catalog integrity failed');
@@ -309,6 +318,7 @@ class ComicCatalog {
       {required String deviceId,
       required String key,
       required String semanticDigest,
+      Map<String, Object?>? metadata,
       required ComicRecord record}) {
     const path = '/api/v1/comics/upload-sessions';
     db.execute('BEGIN IMMEDIATE');
@@ -318,8 +328,10 @@ class ComicCatalog {
         db.execute('COMMIT');
         return existing;
       }
+      final updated =
+          _fillMissingCover(record, metadata?['coverBase64'] as String?);
       final body = {
-        'data': {'comic': record.toJson(), 'deduplicated': true}
+        'data': {'comic': updated.toJson(), 'deduplicated': true}
       };
       _saveReplay(
           deviceId, 'POST', path, key, semanticDigest, 200, body, record.id);
@@ -375,8 +387,10 @@ class ComicCatalog {
       if (existing != null) {
         if (existing.storageState != 'healthy')
           throw const ComicFailure('comic_existing_content_unavailable');
+        final updated =
+            _fillMissingCover(existing, metadata['coverBase64'] as String?);
         final body = {
-          'data': {'comic': existing.toJson(), 'deduplicated': true}
+          'data': {'comic': updated.toJson(), 'deduplicated': true}
         };
         _saveReplay(deviceId, 'POST', '/api/v1/comics', key, semanticDigest,
             200, body, existing.id);
@@ -414,6 +428,8 @@ class ComicCatalog {
             now,
             now
           ]);
+      db.execute('UPDATE comics SET cover_base64=? WHERE id=?',
+          [metadata['coverBase64'], id]);
       final record = find(id)!;
       final body = {
         'data': {'comic': record.toJson(), 'deduplicated': false}
@@ -464,6 +480,8 @@ class ComicCatalog {
           'remainingBytes': quotaBytes - (logicalBytes - old.sizeBytes)
         });
       final changed = old.title != title ||
+          (metadata.containsKey('coverBase64') &&
+              old.coverBase64 != metadata['coverBase64']) ||
           old.author != author ||
           old.relativePath != metadata['relativePath'] ||
           old.format != format ||
@@ -484,6 +502,10 @@ class ComicCatalog {
               DateTime.now().toUtc().toIso8601String(),
               id
             ]);
+        if (metadata.containsKey('coverBase64')) {
+          db.execute('UPDATE comics SET cover_base64=? WHERE id=?',
+              [metadata['coverBase64'], id]);
+        }
       }
       final record = find(id)!;
       final body = {
@@ -518,6 +540,20 @@ class ComicCatalog {
       db.execute('ROLLBACK');
       rethrow;
     }
+  }
+
+  ComicRecord _fillMissingCover(ComicRecord record, String? cover) {
+    final current = find(record.id);
+    if (current == null) throw const ComicFailure('resource_not_found');
+    if (current.sha256 != record.sha256 || current.format != record.format) {
+      throw const ComicFailure('comic_revision_conflict');
+    }
+    record = current;
+    if (record.coverBase64 != null || cover == null) return record;
+    db.execute(
+        'UPDATE comics SET cover_base64=?,revision=revision+1,updated_at=? WHERE id=?',
+        [cover, DateTime.now().toUtc().toIso8601String(), record.id]);
+    return find(record.id)!;
   }
 
   void markState(String sha, String state) => db.execute(

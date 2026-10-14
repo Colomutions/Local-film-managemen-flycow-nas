@@ -4,6 +4,7 @@ import 'package:crypto/crypto.dart';
 import 'package:unorm_dart/unorm_dart.dart' as unorm;
 
 import 'novel_models.dart';
+import '../reading_cover.dart';
 
 class NasNovelMetadataException implements Exception {
   const NasNovelMetadataException(this.code, this.message);
@@ -40,6 +41,7 @@ NasNovelMetadata parseNovelMetadata(
     'relativePath',
     'sizeBytes',
     'contentSha256',
+    'coverBase64',
     if (allowConflictPolicy) 'conflictPolicy',
   };
   final unknown = value.keys.where((key) => !allowed.contains(key)).toList();
@@ -116,7 +118,14 @@ NasNovelMetadata parseNovelMetadata(
     );
   }
 
+  String? cover;
+  try {
+    cover = parseReadingCover(value['coverBase64']);
+  } on FormatException {
+    throw const NasNovelMetadataException('invalid_metadata', '封面格式或大小无效');
+  }
   return NasNovelMetadata(
+    coverBase64: cover,
     title: title,
     author: author == null || author.isEmpty ? null : author,
     relativePath: relativePath,

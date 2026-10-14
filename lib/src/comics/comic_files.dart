@@ -6,6 +6,7 @@ import 'package:archive/archive_io.dart';
 import 'package:crypto/crypto.dart';
 
 import '../auth.dart';
+import '../reading_cover.dart';
 import '../content_file_names.dart';
 import '../novels/novel_metadata.dart';
 import 'comic_catalog.dart';
@@ -24,7 +25,8 @@ Map<String, Object?> parseComicMetadata(Object? decoded,
     'relativePath',
     'fileName',
     'sizeBytes',
-    'contentSha256'
+    'contentSha256',
+    'coverBase64'
   };
   final allowed = {...common, if (!replace) 'conflictPolicy'};
   if (decoded.keys.any((key) => !allowed.contains(key)))
@@ -76,6 +78,12 @@ Map<String, Object?> parseComicMetadata(Object? decoded,
     throw const ComicFailure('invalid_metadata');
   }
   final policy = replace ? 'reject' : decoded['conflictPolicy'] ?? 'reject';
+  String? cover;
+  try {
+    cover = parseReadingCover(decoded['coverBase64']);
+  } on FormatException {
+    throw const ComicFailure('invalid_metadata');
+  }
   if (policy != 'reject' && policy != 'keep_both')
     throw const ComicFailure('invalid_metadata');
   return {
@@ -86,7 +94,8 @@ Map<String, Object?> parseComicMetadata(Object? decoded,
     'fileName': fileName,
     'sizeBytes': rawSize,
     'contentSha256': rawSha,
-    'conflictPolicy': policy
+    'conflictPolicy': policy,
+    if (cover != null) 'coverBase64': cover,
   };
 }
 
@@ -336,7 +345,11 @@ class ComicFiles {
     // these directory placeholders. Never accept unzip's nonzero exit codes.
     final args = Platform.isWindows
         ? ['-xOf', file.path]
-        : ['-tqq', file.path, if (hasDirectories) ...['-x', '*/']];
+        : [
+            '-tqq',
+            file.path,
+            if (hasDirectories) ...['-x', '*/']
+          ];
     try {
       final process = await Process.start(executable, args);
       final output = process.stdout.drain<void>();

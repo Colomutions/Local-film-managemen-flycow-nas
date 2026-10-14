@@ -89,7 +89,7 @@ Future<NasNovelMultipartPayload> readNovelMultipart(
             part.headers['content-type'],
             expectedMimeType: 'application/json',
           );
-          final bytes = await _readLimited(part, 16 * 1024);
+          final bytes = await _readLimited(part, 384 * 1024);
           Object? decoded;
           try {
             decoded = jsonDecode(
@@ -192,7 +192,7 @@ Future<List<int>> _readLimited(Stream<List<int>> source, int limit) async {
   if (exceeded) {
     throw const NasNovelMultipartException(
       'payload_too_large',
-      'metadata part exceeds 16 KiB',
+      'metadata part exceeds 384 KiB',
     );
   }
   return builder.takeBytes();

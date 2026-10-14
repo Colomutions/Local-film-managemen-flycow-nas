@@ -15,11 +15,13 @@ class NasNovel {
     required this.createdAt,
     required this.updatedAt,
     this.storageState = NasNovelStorageState.healthy,
+    this.coverBase64,
   });
 
   final String id;
   final String title;
   final String? author;
+  final String? coverBase64;
   final String relativePath;
   final String fileName;
   final int sizeBytes;
@@ -39,7 +41,9 @@ class NasNovel {
         'contentSha256': contentSha256,
         'relativePath': relativePath,
         'fileName': fileName,
-        'coverUrl': null,
+        'coverUrl':
+            coverBase64 == null ? null : '/api/v1/novels/$id/cover?r=$revision',
+        'canRead': storageState == NasNovelStorageState.healthy,
         'canDownload': true,
         'revision': revision,
         'createdAt': createdAt.toUtc().toIso8601String(),
@@ -57,6 +61,7 @@ class NasNovelMetadata {
     required this.sizeBytes,
     required this.contentSha256,
     required this.conflictPolicy,
+    this.coverBase64,
   });
 
   final String title;
@@ -65,8 +70,10 @@ class NasNovelMetadata {
   final int sizeBytes;
   final String contentSha256;
   final NasNovelConflictPolicy conflictPolicy;
+  final String? coverBase64;
 
   Map<String, Object?> toPostSemanticJson() => {
+        if (coverBase64 != null) 'coverBase64': coverBase64,
         'author': author,
         'conflictPolicy': switch (conflictPolicy) {
           NasNovelConflictPolicy.reject => 'reject',
@@ -85,6 +92,7 @@ class NasNovelMetadata {
     required String expectedEtag,
   }) =>
       {
+        if (coverBase64 != null) 'coverBase64': coverBase64,
         'author': author,
         'contentSha256': contentSha256,
         'contentState': 'complete_file',

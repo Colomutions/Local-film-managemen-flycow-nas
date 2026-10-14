@@ -94,6 +94,23 @@ class NasApiRouter {
               deviceId: device.deviceId, admin: device.scope == 'admin');
     }
     final novelApi = _novelApi;
+    if ((request.method == 'GET' || request.method == 'HEAD') &&
+        request.uri.pathSegments.length >= 5 &&
+        request.uri.pathSegments[2] == 'novels') {
+      final parts = request.uri.pathSegments;
+      final action =
+          parts.length == 5 && const {'reading', 'cover'}.contains(parts[4])
+              ? parts[4]
+              : parts.length == 6 && parts[4] == 'chapters'
+                  ? parts[5]
+                  : null;
+      if (action != null) {
+        return novelApi == null
+            ? await writeApiError(request, HttpStatus.serviceUnavailable,
+                'novel_storage_unavailable')
+            : await novelApi.reading(request, parts[3], action);
+      }
+    }
     if (request.method == 'GET' && path == '/api/v1/novels') {
       return novelApi == null
           ? await writeApiError(request, HttpStatus.serviceUnavailable,

@@ -17,6 +17,7 @@ void migrateNovelSchema(Database database) {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       author TEXT,
+      cover_base64 TEXT,
       format TEXT NOT NULL CHECK(format = 'txt'),
       content_state TEXT NOT NULL CHECK(content_state = 'complete_file'),
       relative_path TEXT NOT NULL DEFAULT '',
@@ -458,8 +459,13 @@ class NasNovelRepository {
       _requireCurrentOwner(scope, ownerNonce);
       final duplicate = findHealthyByDigest(metadata.contentSha256);
       if (duplicate != null) {
+        if (duplicate.coverBase64 == null && metadata.coverBase64 != null) {
+          database.execute(
+              'UPDATE novels SET cover_base64=?,revision=revision+1,updated_at=? WHERE id=?',
+              [metadata.coverBase64, _time(timestamp), duplicate.id]);
+        }
         final result = NasNovelPostCommit(
-          novel: duplicate,
+          novel: find(duplicate.id)!,
           deduplicated: true,
           statusCode: 200,
         );
@@ -539,6 +545,8 @@ class NasNovelRepository {
            WHERE singleton_id = 1''',
         [metadata.sizeBytes, _time(timestamp)],
       );
+      database.execute('UPDATE novels SET cover_base64=? WHERE id=?',
+          [metadata.coverBase64, novelId]);
       final novel = find(novelId)!;
       final result = NasNovelPostCommit(
         novel: novel,
@@ -619,6 +627,8 @@ class NasNovelRepository {
       }
 
       final changed = current.title != metadata.title ||
+          (metadata.coverBase64 != null &&
+              current.coverBase64 != metadata.coverBase64) ||
           current.author != metadata.author ||
           current.relativePath != metadata.relativePath ||
           current.sizeBytes != metadata.sizeBytes ||
@@ -690,6 +700,8 @@ class NasNovelRepository {
            SET logical_bytes = ?, updated_at = ? WHERE singleton_id = 1''',
         [projectedUsage, _time(timestamp)],
       );
+      database.execute('UPDATE novels SET cover_base64=? WHERE id=?',
+          [metadata.coverBase64 ?? current.coverBase64, novelId]);
       final updated = find(novelId)!;
       final result = NasNovelPutCommit(
         novel: updated,
@@ -1060,6 +1072,7 @@ NasNovel _novelFromRow(Row row) => NasNovel(
       id: row['id'] as String,
       title: row['title'] as String,
       author: row['author'] as String?,
+      coverBase64: row['cover_base64'] as String?,
       relativePath: row['relative_path'] as String,
       fileName: row['file_name'] as String,
       sizeBytes: row['size_bytes'] as int,

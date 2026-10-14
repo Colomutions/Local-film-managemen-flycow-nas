@@ -6,15 +6,76 @@ import 'novel_models.dart';
 import 'novel_repository.dart';
 import 'novel_service.dart';
 import 'novel_storage.dart';
+import '../reading_content.dart';
+import '../reading_cover.dart';
 
 class NasNovelHttpApi {
   NasNovelHttpApi(this.service, {this.backgroundRead});
 
   final NasNovelService service;
+  final _reader = ReadingContent();
   final Stream<List<int>> Function(Stream<List<int>> source)? backgroundRead;
 
   bool get isReady => service.isReady;
   String? get unavailableReason => service.unavailableReason;
+
+  Future<void> reading(
+      HttpRequest request, String novelId, String action) async {
+    try {
+      service.requireReady();
+      final novel = service.repository.find(_canonicalUuid(novelId));
+      if (novel == null)
+        throw const NasNovelServiceException('resource_not_found', '小说不存在');
+      if (request.uri.queryParameters['r'] case final expected?) {
+        if (expected != '${novel.revision}') {
+          throw const NasNovelServiceException(
+              'novel_revision_conflict', '小说已更新，请重新打开');
+        }
+      }
+      await service.storage.verifyObjectMetadata(novel.contentSha256,
+          expectedSizeBytes: novel.sizeBytes);
+      if (action == 'cover') {
+        if (novel.coverBase64 == null)
+          throw const NasNovelServiceException('resource_not_found', '没有封面');
+        final bytes = base64Decode(novel.coverBase64!);
+        request.response.headers
+            .set(HttpHeaders.contentTypeHeader, readingCoverMime(bytes)!);
+        request.response.headers
+            .set(HttpHeaders.cacheControlHeader, 'private, max-age=3600');
+        request.response.contentLength = bytes.length;
+        if (request.method != 'HEAD') request.response.add(bytes);
+        await request.response.close();
+        return;
+      }
+      final file = service.storage.objectFile(novel.contentSha256);
+      final chapters = await _reader.index(file, novel.contentSha256, 'txt');
+      if (action == 'reading') {
+        return await _writeJson(request.response, 200, {
+          'data': {
+            'revision': novel.revision,
+            'chapters': chapters
+                .map((chapter) =>
+                    {'number': chapter['number'], 'title': chapter['title']})
+                .toList(),
+          }
+        });
+      }
+      final number = int.tryParse(action);
+      if (number == null || number < 0 || number >= chapters.length) {
+        throw const NasNovelServiceException('invalid_request', '章节编号无效');
+      }
+      final body = await _reader.chapter(file, chapters[number]);
+      await _writeJson(request.response, 200, {
+        'data': {
+          'number': number,
+          'title': chapters[number]['title'],
+          'body': body
+        }
+      });
+    } catch (error) {
+      await _writeError(request, _translate(error));
+    }
+  }
 
   Future<void> list(HttpRequest request) async {
     try {

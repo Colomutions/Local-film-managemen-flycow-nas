@@ -10,6 +10,8 @@ import '../range.dart';
 import 'comic_catalog.dart';
 import 'comic_files.dart';
 import 'comic_sessions.dart';
+import '../reading_content.dart';
+import '../reading_cover.dart';
 
 final _uuid = RegExp(
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$');
@@ -33,6 +35,7 @@ class ComicHttpApi {
   final Future<void> Function(int bytes)? paceRead;
   final ComicFiles files;
   final ComicCatalog catalog;
+  final _reader = ReadingContent();
   late final ComicSessions sessions;
   bool ready = false;
   String? unavailableReason;
@@ -113,6 +116,18 @@ class ComicHttpApi {
       if (!ready) throw const ComicFailure('comic_storage_unavailable');
       final path = request.uri.path;
       final parts = request.uri.pathSegments;
+      if (parts.length == 5 &&
+          parts[2] == 'comics' &&
+          const {'reading', 'cover'}.contains(parts[4]) &&
+          (request.method == 'GET' || request.method == 'HEAD')) {
+        return await _reading(request, _id(parts[3]), parts[4]);
+      }
+      if (parts.length == 6 &&
+          parts[2] == 'comics' &&
+          parts[4] == 'pages' &&
+          (request.method == 'GET' || request.method == 'HEAD')) {
+        return await _reading(request, _id(parts[3]), parts[5]);
+      }
       if (path == '/api/v1/comics' && request.method == 'GET')
         return await _list(request);
       if (path == '/api/v1/admin/comics' && request.method == 'GET')
@@ -178,6 +193,51 @@ class ComicHttpApi {
         order: q['order'] ?? 'desc',
         admin: admin);
     await _json(request.response, 200, body);
+  }
+
+  Future<void> _reading(HttpRequest request, String id, String action) async {
+    final record = catalog.find(id);
+    if (record == null) throw const ComicFailure('resource_not_found');
+    if (request.uri.queryParameters['r'] case final expected?) {
+      if (expected != '${record.revision}')
+        throw const ComicFailure('comic_revision_conflict');
+    }
+    if (await files.state(record.sha256, record.sizeBytes) != 'healthy') {
+      throw const ComicFailure('comic_content_unavailable');
+    }
+    final file = files.object(record.sha256);
+    List<int> bytes;
+    String mime;
+    if (action == 'cover' && record.coverBase64 != null) {
+      bytes = base64Decode(record.coverBase64!);
+      mime = readingCoverMime(bytes)!;
+    } else {
+      final pages = await _reader.index(file, record.sha256, record.format);
+      if (action == 'reading') {
+        return _json(request.response, 200, {
+          'data': {
+            'revision': record.revision,
+            'pages': pages.map((page) => {...page}..remove('entry')).toList(),
+          }
+        });
+      }
+      final number = action == 'cover' ? 0 : int.tryParse(action);
+      if (number == null || number < 0 || number >= pages.length) {
+        throw const ComicFailure('invalid_request');
+      }
+      bytes =
+          await _reader.comicPage(file, record.format, pages[number], number);
+      mime = pages[number]['mimeType'] as String;
+    }
+    final response = request.response;
+    response.headers.set(HttpHeaders.contentTypeHeader, mime);
+    response.headers
+        .set(HttpHeaders.cacheControlHeader, 'private, max-age=3600');
+    response.headers
+        .set(HttpHeaders.etagHeader, '"comic:$id:r${record.revision}:$action"');
+    response.contentLength = bytes.length;
+    if (request.method != 'HEAD') response.add(bytes);
+    await response.close();
   }
 
   Future<void> _detail(HttpRequest request, String id,
@@ -394,7 +454,7 @@ class ComicHttpApi {
           final bytes = <int>[];
           await for (final chunk in part) {
             bytes.addAll(chunk);
-            if (bytes.length > 16 * 1024)
+            if (bytes.length > 384 * 1024)
               throw const ComicFailure('payload_too_large');
           }
           metadata = parseComicMetadata(
@@ -445,7 +505,7 @@ class ComicHttpApi {
   Future<void> _createSession(
       HttpRequest request, String deviceId, bool admin) async {
     final key = _id(request.headers.value('Idempotency-Key') ?? '');
-    final bytes = await _readLimited(request, 16 * 1024);
+    final bytes = await _readLimited(request, 384 * 1024);
     final metadata = parseComicMetadata(
         jsonDecode(utf8.decode(bytes, allowMalformed: false)),
         admin: admin,
@@ -486,6 +546,7 @@ class ComicHttpApi {
           deviceId: deviceId,
           key: key,
           semanticDigest: semantic,
+          metadata: metadata,
           record: existing));
       await _json(request.response, result['status'] as int,
           result['body'] as Map<String, Object?>);

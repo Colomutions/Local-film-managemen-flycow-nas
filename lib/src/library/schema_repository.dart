@@ -10,7 +10,7 @@ class NasSchemaRepository {
 
   final Database Function() _connection;
   Database get _db => _connection();
-  static const currentSchemaVersion = 34;
+  static const currentSchemaVersion = 35;
 
   void migrate() {
     _db.execute('''
@@ -841,6 +841,17 @@ class NasSchemaRepository {
       _db.execute(
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [34, now()],
+      );
+    }
+    if (current < 35) {
+      if (!_db
+          .select('PRAGMA table_info(novels)')
+          .any((row) => row['name'] == 'cover_base64')) {
+        _db.execute('ALTER TABLE novels ADD COLUMN cover_base64 TEXT');
+      }
+      _db.execute(
+        'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+        [35, now()],
       );
     }
   }
