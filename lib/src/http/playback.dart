@@ -33,6 +33,26 @@ class NasPlaybackHttpApi {
   int get activeStreams => _activeStreams;
   void clearSessions() => _playbackSessions.clear();
 
+  bool hasSessionsForMovies(Set<String> movieIds) => _playbackSessions.values
+      .any((session) => movieIds.contains(session.movieId));
+
+  bool _ownsEpisode(_PlaybackSession session) =>
+      session.movieId == NasFixtureLibrary.movieId ||
+      (_libraryDatabase.findEpisode(session.episodeId)?.movieId ==
+              session.movieId &&
+          _libraryDatabase.findMovie(session.movieId) != null);
+
+  String? screenshotMovieId(HttpRequest request, String tokenHash) {
+    final session = _playbackSession(request, tokenHash);
+    if (session == null ||
+        !session.started ||
+        session.purpose != 'playback' ||
+        !_ownsEpisode(session)) {
+      return null;
+    }
+    return session.movieId;
+  }
+
   final Map<String, _PlaybackSession> _playbackSessions = {};
 
   _FixturePlaybackState? _fixturePlaybackState;
@@ -77,6 +97,14 @@ class NasPlaybackHttpApi {
       if (file == null) {
         return writeApiError(
             request, HttpStatus.notFound, 'resource_not_found');
+      }
+      // File resolution yields to other requests. A composition may have moved
+      // this episode meanwhile; never create a session with its obsolete owner.
+      if (_libraryDatabase.findEpisode(episode.id)?.movieId !=
+              databaseMovie.id ||
+          _libraryDatabase.findMovie(databaseMovie.id) == null) {
+        return writeApiError(
+            request, HttpStatus.conflict, 'collection_selection_changed');
       }
       return _writePlaybackSession(
         request,
@@ -182,8 +210,13 @@ class NasPlaybackHttpApi {
     final positionMs = (body?['positionMs'] as num?)?.toInt();
     final durationMs = (body?['durationMs'] as num?)?.toInt();
     final state = body?['state'] ?? 'playing';
-    if (session == null) {
+    if (session == null ||
+        !identical(session, _playbackSession(request, tokenHash))) {
       return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (!_ownsEpisode(session)) {
+      return writeApiError(
+          request, HttpStatus.conflict, 'collection_selection_changed');
     }
     if (positionMs == null ||
         durationMs == null ||
@@ -238,6 +271,10 @@ class NasPlaybackHttpApi {
     if (session == null) {
       return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
     }
+    if (!_ownsEpisode(session)) {
+      return writeApiError(
+          request, HttpStatus.conflict, 'collection_selection_changed');
+    }
     if (session.purpose == 'playback' && !session.streamRequested) {
       return writeApiError(request, HttpStatus.conflict, 'playback_not_ready');
     }
@@ -278,6 +315,19 @@ class NasPlaybackHttpApi {
     if (session == null)
       return writeApiError(request, 404, 'resource_not_found');
     final body = await readApiJsonBody(request);
+    // Another close request may have completed while this body was streaming.
+    // Never write progress through a captured session after its episode moves.
+    if (!identical(session, _playbackSession(request, tokenHash))) {
+      if (_closedPlayback[id] == tokenHash) {
+        request.response.statusCode = HttpStatus.noContent;
+        return request.response.close();
+      }
+      return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (!_ownsEpisode(session)) {
+      return writeApiError(
+          request, HttpStatus.conflict, 'collection_selection_changed');
+    }
     final position = body?['positionMs'];
     final duration = body?['durationMs'];
     if (position is! int || duration is! int || position < 0 || duration < 0) {

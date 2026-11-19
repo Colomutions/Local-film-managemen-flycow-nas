@@ -438,14 +438,17 @@ class NasTaxonomyRepository {
     if (movieLinks > 0 || childLinks > 0) {
       throw StateError('标签仍有关联影片或子级，只能归档');
     }
-    _db.execute('''
-      DELETE FROM movie_tag_links
-      WHERE tag_id = ? AND movie_id IN (
-        SELECT id FROM movies WHERE lifecycle_state = 'merged'
-      )
-    ''', [tagId]);
-    _db.execute('DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
-    _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
+    transaction(() {
+      _db.execute('''
+        DELETE FROM movie_tag_links
+        WHERE tag_id = ? AND movie_id IN (
+          SELECT id FROM movies WHERE lifecycle_state = 'merged'
+        )
+      ''', [tagId]);
+      _db.execute(
+          'DELETE FROM tag_parent_links WHERE child_tag_id = ?', [tagId]);
+      _db.execute('DELETE FROM tags WHERE id = ?', [tagId]);
+    });
     return true;
   }
 
@@ -1296,13 +1299,26 @@ class NasTaxonomyRepository {
       );
     }
     if (updateTagIds) {
-      _db.execute('DELETE FROM movie_tag_links WHERE movie_id = ?', [movieId]);
-      for (final tagId in tagIds) {
-        _db.execute(
-          'INSERT INTO movie_tag_links(movie_id, tag_id) VALUES (?, ?)',
-          [movieId, tagId],
-        );
-      }
+      transaction(() {
+        final existing = _db
+            .select(
+              'SELECT tag_id FROM movie_tag_links WHERE movie_id = ?',
+              [movieId],
+            )
+            .map((row) => row['tag_id'] as String)
+            .toSet();
+        final desired = tagIds.toSet();
+        for (final tagId in existing.difference(desired)) {
+          _db.execute(
+              'DELETE FROM movie_tag_links WHERE movie_id = ? AND tag_id = ?',
+              [movieId, tagId]);
+        }
+        for (final tagId in desired.difference(existing)) {
+          _db.execute(
+              'INSERT INTO movie_tag_links(movie_id, tag_id) VALUES (?, ?)',
+              [movieId, tagId]);
+        }
+      });
     }
     return true;
   }

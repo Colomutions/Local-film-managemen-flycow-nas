@@ -82,6 +82,15 @@ class NasApiRouter {
         RegExp(r'^/api/v1/playback/sessions/[^/]+/finish$').hasMatch(path)) {
       return await _playback.finishPlayback(request, tokenHash);
     }
+    if (request.method == 'POST' &&
+        RegExp(r'^/api/v1/playback/sessions/[^/]+/screenshot$')
+            .hasMatch(path)) {
+      return await _assets.uploadMovieCarouselImage(
+        request,
+        movieIdForUpload: () => _playback.screenshotMovieId(request, tokenHash),
+        allowHiddenMovie: false,
+      );
+    }
     if (path == '/api/v1/comics' ||
         path.startsWith('/api/v1/comics/') ||
         path == '/api/v1/admin/comics' ||
@@ -235,6 +244,14 @@ class NasApiRouter {
       return await _taxonomyApi.importTagManagement(request);
     }
     if (request.method == 'POST' &&
+        path == '/api/v1/admin/tag-management/cleanup') {
+      return await _taxonomyApi.cleanupTags(request);
+    }
+    if (request.method == 'POST' &&
+        path == '/api/v1/admin/tag-management/movie-associations') {
+      return await _taxonomyApi.associateMovieTags(request);
+    }
+    if (request.method == 'POST' &&
         path == '/api/v1/admin/tag-management/tags') {
       return await _taxonomyApi.createTagManagementTag(request);
     }
@@ -355,6 +372,19 @@ class NasApiRouter {
     }
     if (request.method == 'POST' && path == '/api/v1/admin/collections') {
       return await _moviesApi.createAdminCollection(request);
+    }
+    if (request.method == 'POST' &&
+        path == '/api/v1/admin/collection-compositions/preview') {
+      return await _moviesApi.composeAdminMovies(request, preview: true);
+    }
+    if (request.method == 'POST' &&
+        path == '/api/v1/admin/collection-compositions') {
+      return await _moviesApi.composeAdminMovies(request, preview: false);
+    }
+    if (request.method == 'PUT' &&
+        RegExp(r'^/api/v1/admin/collections/[^/]+/episode-order$')
+            .hasMatch(path)) {
+      return await _moviesApi.setAdminCollectionEpisodeOrder(request);
     }
     if (request.method == 'POST' &&
         RegExp(r'^/api/v1/admin/collections/[^/]+/episodes$').hasMatch(path)) {
@@ -551,7 +581,15 @@ class NasApiRouter {
       return await _taxonomyApi.tagPaths(request);
     }
     if (request.method == 'GET' && path == '/api/v1/favorites') {
-      return await _moviesApi.emptyItems(request);
+      return await _moviesApi.movies(request, favoriteOnly: true);
+    }
+    if ((request.method == 'PUT' || request.method == 'DELETE') &&
+        RegExp(r'^/api/v1/favorites/[^/]+$').hasMatch(path)) {
+      return await _moviesApi.setMovieFavorite(
+        request,
+        movieId: request.uri.pathSegments.last,
+        isFavorite: request.method == 'PUT',
+      );
     }
     if (request.method == 'GET' && path == '/api/v1/history') {
       return await _historyApi.history(request);

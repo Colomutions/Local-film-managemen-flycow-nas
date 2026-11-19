@@ -11,7 +11,6 @@ class NasCollectionsRepository {
   NasCollectionsRepository(
     this._connection, {
     required this.episodeGrouping,
-    required this.movieIdForScannedEpisode,
     required this.carouselImagesForMovie,
     required this.findCategory,
     required this.findMovieForAdmin,
@@ -23,15 +22,90 @@ class NasCollectionsRepository {
   final Database Function() _connection;
   Database get _db => _connection();
   final EpisodeGrouping Function(String path) episodeGrouping;
-  final String Function({
-    required String categoryId,
-    required String? collectionKey,
-    required String title,
-  }) movieIdForScannedEpisode;
   final List<NasCarouselImage> Function(String movieId) carouselImagesForMovie;
   final NasLibraryCategory? Function(String categoryId) findCategory;
   final NasLibraryMovie? Function(String movieId) findMovieForAdmin;
   final List<NasLibraryCategory> Function() listCategories;
+
+  String episodeSortMode(String movieId) {
+    final rows = _db.select(
+      'SELECT episode_sort_mode FROM movies WHERE id = ?',
+      [movieId],
+    );
+    return rows.isNotEmpty && rows.single['episode_sort_mode'] == 'manual'
+        ? 'manual'
+        : 'automatic';
+  }
+
+  /// The complete membership is checked inside the write transaction so a
+  /// concurrent scan cannot silently lose a newly discovered episode.
+  bool setEpisodeOrder({
+    required String movieId,
+    required String mode,
+    List<String>? episodeIds,
+  }) {
+    if (mode != 'automatic' && mode != 'manual') return false;
+    if (mode == 'manual' &&
+        (episodeIds == null ||
+            episodeIds.isEmpty ||
+            episodeIds.toSet().length != episodeIds.length)) {
+      return false;
+    }
+    _db.execute('BEGIN IMMEDIATE');
+    try {
+      final movie = _db.select('''
+        SELECT episode_sort_mode FROM movies
+        WHERE id = ? AND entry_type = 'series' AND lifecycle_state = 'active'
+      ''', [movieId]);
+      final episodes = _db.select('''
+        SELECT id, relative_path, manual_order, natural_sort_key
+        FROM episodes WHERE movie_id = ?
+      ''', [movieId]);
+      final requestedIds = episodeIds?.toSet();
+      if (movie.isEmpty ||
+          (mode == 'manual' &&
+              (episodes.length != episodeIds!.length ||
+                  !episodes.every((e) => requestedIds!.contains(e['id']))))) {
+        _db.execute('ROLLBACK');
+        return false;
+      }
+      final positions = {
+        if (mode == 'manual')
+          for (var i = 0; i < episodeIds!.length; i++) episodeIds[i]: i,
+      };
+      var changed = movie.single['episode_sort_mode'] != mode;
+      final update = _db.prepare('''
+        UPDATE episodes SET manual_order = ?, natural_sort_key = ? WHERE id = ?
+      ''');
+      try {
+        for (final episode in episodes) {
+          final order = positions[episode['id']];
+          final key = naturalSortKey(
+            (episode['relative_path'] as String)
+                .replaceAll('\\', '/')
+                .split('/')
+                .last,
+          );
+          if (episode['manual_order'] == order &&
+              episode['natural_sort_key'] == key) continue;
+          update.execute([order, key, episode['id']]);
+          changed = true;
+        }
+      } finally {
+        update.dispose();
+      }
+      if (changed) {
+        _db.execute('''
+          UPDATE movies SET episode_sort_mode = ?, updated_at = ? WHERE id = ?
+        ''', [mode, now(), movieId]);
+      }
+      _db.execute('COMMIT');
+      return true;
+    } catch (_) {
+      _db.execute('ROLLBACK');
+      rethrow;
+    }
+  }
 
   NasLibraryMovie createEmptySeries({
     required String title,
@@ -124,9 +198,20 @@ class NasCollectionsRepository {
         UPDATE playback_history SET movie_id = ?
         WHERE episode_id IN ($placeholders) AND movie_id != ?
       ''', [targetMovieId, ...episodeIds, targetMovieId]);
-      _db.execute('''
-        UPDATE episodes SET movie_id = ? WHERE id IN ($placeholders)
-      ''', [targetMovieId, ...episodeIds]);
+      final manualTarget = episodeSortMode(targetMovieId) == 'manual';
+      var nextOrder =
+          _db.select('''SELECT COALESCE(MAX(manual_order),-1)+1 AS value
+        FROM episodes WHERE movie_id=?''', [targetMovieId]).single['value']
+              as int;
+      for (final episodeId in episodeIds) {
+        _db.execute('''UPDATE episodes SET movie_id=?, manual_order=?
+          WHERE id=? AND movie_id!=?''', [
+          targetMovieId,
+          manualTarget ? nextOrder++ : null,
+          episodeId,
+          targetMovieId
+        ]);
+      }
       _db.execute('''
         UPDATE episode_playback_progress SET movie_id = ?
         WHERE episode_id IN ($placeholders)
@@ -183,12 +268,13 @@ class NasCollectionsRepository {
     _db.execute('BEGIN IMMEDIATE');
     try {
       // 必须在迁移历史关联前扣除原影集的计数，避免被已迁走的记录误算为零。
+      // 显式拆分的归属属于人工决定，原条目与拆出条目均禁止扫描重新归组。
       _db.execute('''
         UPDATE movies
         SET play_count = MAX(0, play_count - (
           SELECT COUNT(*) FROM playback_history history
           WHERE history.movie_id = movies.id AND history.episode_id IN ($placeholders)
-        ))
+        )), scan_grouping_mode = 'manual'
         WHERE id = ?
       ''', [...episodeIds, movieId]);
       for (final episode in episodes) {
@@ -198,11 +284,11 @@ class NasCollectionsRepository {
           INSERT INTO movies(
             id, title, original_title, catalog_number, publisher_id, series_id,
             summary, category_id, poster_file_name, entry_type, play_count,
-            created_at, updated_at
+            created_at, updated_at, scan_grouping_mode
           ) SELECT ?, ?, original_title, catalog_number, publisher_id, series_id,
                    summary, category_id, poster_file_name, 'single',
                    (SELECT COUNT(*) FROM playback_history WHERE movie_id = ? AND episode_id = ?),
-                   ?, ?
+                   ?, ?, 'manual'
           FROM movies WHERE id = ?
         ''', [
           id,
@@ -221,7 +307,8 @@ class NasCollectionsRepository {
           INSERT INTO movie_tag_links(movie_id, tag_id)
           SELECT ?, tag_id FROM movie_tag_links WHERE movie_id = ?
         ''', [id, movieId]);
-        _db.execute('UPDATE episodes SET movie_id = ? WHERE id = ?',
+        _db.execute(
+            'UPDATE episodes SET movie_id = ?, manual_order=NULL WHERE id = ?',
             [id, episode['id']]);
         _db.execute(
           'UPDATE episode_playback_progress SET movie_id = ? WHERE episode_id = ?',
@@ -301,10 +388,15 @@ class NasCollectionsRepository {
           );
           group.episodeIds.add(row['id'] as String);
           group.sourceMovieIds.add(row['movie_id'] as String);
+          group.hasLegacySuffix |= collectionTitleFromDirectory(
+                  path.split('/').reversed.skip(1).first) !=
+              null;
         }
       }
     }
     return groups.entries
+        .where((entry) =>
+            entry.value.episodeIds.length > 1 || entry.value.hasLegacySuffix)
         .map(
           (entry) => NasCollectionMigrationCandidate(
             key: entry.key,
@@ -316,36 +408,6 @@ class NasCollectionsRepository {
           ),
         )
         .toList(growable: false);
-  }
-
-  NasLibraryMovie? applyCollectionMigration({
-    required String key,
-    required String metadataSourceMovieId,
-  }) {
-    NasCollectionMigrationCandidate? candidate;
-    for (final item in collectionMigrationPreview()) {
-      if (item.key == key) {
-        candidate = item;
-        break;
-      }
-    }
-    if (candidate == null ||
-        !candidate.sourceMovieIds.contains(metadataSourceMovieId)) {
-      return null;
-    }
-    final id = movieIdForScannedEpisode(
-      categoryId: candidate.categoryId,
-      collectionKey: candidate.key,
-      title: candidate.title,
-    );
-    if (!mergeEpisodesIntoSeries(
-      targetMovieId: id,
-      episodeIds: candidate.episodeIds,
-      metadataSourceMovieId: metadataSourceMovieId,
-    )) {
-      return null;
-    }
-    return findMovieForAdmin(id);
   }
 
   void _copyMovieMetadataToSeries({
@@ -439,4 +501,5 @@ class _LegacyCollectionGroup {
   final String title;
   final Set<String> episodeIds = <String>{};
   final Set<String> sourceMovieIds = <String>{};
+  bool hasLegacySuffix = false;
 }

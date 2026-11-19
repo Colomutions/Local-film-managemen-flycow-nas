@@ -10,7 +10,7 @@ class NasSchemaRepository {
 
   final Database Function() _connection;
   Database get _db => _connection();
-  static const currentSchemaVersion = 35;
+  static const currentSchemaVersion = 38;
 
   void migrate() {
     _db.execute('''
@@ -853,6 +853,132 @@ class NasSchemaRepository {
         'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
         [35, now()],
       );
+    }
+    if (current < 36) {
+      _db.execute('BEGIN IMMEDIATE');
+      try {
+        final movieColumns = _db
+            .select('PRAGMA table_info(movies)')
+            .map((row) => row['name'])
+            .toSet();
+        final episodeColumns = _db
+            .select('PRAGMA table_info(episodes)')
+            .map((row) => row['name'])
+            .toSet();
+        if (movieColumns.isNotEmpty) {
+          _db.execute(
+              '''ALTER TABLE movies ADD COLUMN episode_sort_mode TEXT NOT NULL
+            DEFAULT 'automatic' CHECK(episode_sort_mode IN ('automatic', 'manual'))''');
+          _db.execute('ALTER TABLE movies ADD COLUMN scanned_title TEXT');
+          if (episodeColumns.containsAll({'movie_id', 'manual_order'})) {
+            _db.execute('''UPDATE movies SET episode_sort_mode='manual'
+              WHERE EXISTS (SELECT 1 FROM episodes e
+                WHERE e.movie_id=movies.id AND e.manual_order IS NOT NULL)''');
+          }
+        }
+        if (movieColumns.isNotEmpty &&
+            episodeColumns.containsAll({
+              'id',
+              'movie_id',
+              'manual_order',
+              'relative_path',
+              'natural_sort_key'
+            })) {
+          // Older merges could leave NULL positions after manually ordered
+          // episodes. Make that existing tail explicit before appending new
+          // segments, preserving exactly the order visible before the upgrade.
+          final rows = _db.select('''SELECT e.id,e.movie_id,e.manual_order
+            FROM episodes e JOIN movies m ON m.id=e.movie_id
+            WHERE m.episode_sort_mode='manual'
+            ORDER BY e.movie_id,e.manual_order IS NOT NULL DESC,e.manual_order,
+              e.natural_sort_key COLLATE NOCASE,e.relative_path COLLATE NOCASE,e.id''');
+          final update =
+              _db.prepare('UPDATE episodes SET manual_order=? WHERE id=?');
+          try {
+            String? movieId;
+            var position = 0;
+            for (final row in rows) {
+              if (movieId != row['movie_id']) {
+                movieId = row['movie_id'] as String;
+                position = 0;
+              }
+              if (row['manual_order'] != position)
+                update.execute([position, row['id']]);
+              position++;
+            }
+          } finally {
+            update.dispose();
+          }
+        }
+        if (episodeColumns
+            .containsAll({'id', 'relative_path', 'natural_sort_key'})) {
+          final update =
+              _db.prepare('UPDATE episodes SET natural_sort_key=? WHERE id=?');
+          try {
+            // Database records only: never read media bytes during an upgrade.
+            for (final row in _db.select(
+                'SELECT id,relative_path,natural_sort_key FROM episodes')) {
+              final key = naturalSortKey(row['relative_path'] as String);
+              if (row['natural_sort_key'] != key)
+                update.execute([key, row['id']]);
+            }
+          } finally {
+            update.dispose();
+          }
+        }
+        _db.execute(
+          'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+          [36, now()],
+        );
+        _db.execute('COMMIT');
+      } catch (_) {
+        _db.execute('ROLLBACK');
+        rethrow;
+      }
+    }
+    if (current < 37) {
+      _db.execute('BEGIN IMMEDIATE');
+      try {
+        // 扫描归组与分集排序独立；旧条目默认允许按目录自动归组。
+        if (_db.select('PRAGMA table_info(movies)').isNotEmpty) {
+          _db.execute('''
+            ALTER TABLE movies ADD COLUMN scan_grouping_mode TEXT NOT NULL
+            DEFAULT 'automatic'
+            CHECK(scan_grouping_mode IN ('automatic', 'manual'))
+          ''');
+        }
+        _db.execute(
+          'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+          [37, now()],
+        );
+        _db.execute('COMMIT');
+      } catch (_) {
+        _db.execute('ROLLBACK');
+        rethrow;
+      }
+    }
+    if (current < 38) {
+      _db.execute('BEGIN IMMEDIATE');
+      try {
+        // Distinguish an automatic composition's additive actor union from a
+        // user's explicit actor freeze. The policy is deleted with its movie.
+        _db.execute('''
+          CREATE TABLE IF NOT EXISTS composition_actor_append_policies (
+            movie_id TEXT PRIMARY KEY REFERENCES movies(id) ON DELETE CASCADE,
+            allow_append INTEGER NOT NULL CHECK(allow_append IN (0,1)),
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('composition','user')),
+            updated_at TEXT NOT NULL
+          )
+        ''');
+        _db.execute(
+          'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
+          [38, now()],
+        );
+        _db.execute('COMMIT');
+      } catch (_) {
+        _db.execute('ROLLBACK');
+        rethrow;
+      }
     }
   }
 }

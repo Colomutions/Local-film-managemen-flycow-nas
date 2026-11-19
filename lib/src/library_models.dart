@@ -400,6 +400,7 @@ class NasMovieSearchFilter {
     this.publisherIds = const {},
     this.actorIds = const {},
     this.isFavorite,
+    this.missingActors = false,
     required this.resolutions,
     required this.watchStates,
     required this.sort,
@@ -416,6 +417,7 @@ class NasMovieSearchFilter {
   final Set<String> publisherIds;
   final Set<String> actorIds;
   final bool? isFavorite;
+  final bool missingActors;
   final Set<String> resolutions;
   final Set<String> watchStates;
   final String sort;

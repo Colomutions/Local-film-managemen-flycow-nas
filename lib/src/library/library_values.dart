@@ -53,8 +53,21 @@ String? collectionTitleFromDirectory(String value) {
   return title == null || title.isEmpty ? null : title;
 }
 
-String naturalSortKey(String value) => value.toLowerCase().replaceAllMapped(
-    RegExp(r'\d+'), (match) => match.group(0)!.padLeft(16, '0'));
+String naturalSortKey(String value) => titleFromPath(value)
+        .toLowerCase()
+        .replaceAll(RegExp(r'[\s_.－—-]+'), ' ')
+        .replaceAllMapped(RegExp(r'\d+'), (match) {
+      final number = match.group(0)!.replaceFirst(RegExp(r'^0+(?=\d)'), '');
+      return '${number.length.toString().padLeft(6, '0')}:$number';
+    });
+
+/// The old suffix is an alias of the same work directory, never a new movie.
+String canonicalWorkDirectory(String path) {
+  final segments = path.split('/');
+  segments[segments.length - 1] =
+      collectionTitleFromDirectory(segments.last) ?? segments.last;
+  return segments.join('/');
+}
 
 String? normalizeRelativePath(String? value) {
   final normalized = value?.trim().replaceAll('\\', '/');

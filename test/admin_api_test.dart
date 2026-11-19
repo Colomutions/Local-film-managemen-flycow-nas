@@ -330,6 +330,49 @@ Future<void> main() async {
     );
     _expect(favorite.json['data']['isFavorite'] == true,
         'admin can persist the movie favorite state');
+    final movieId = movie['id'] as String;
+    final favoritesPath = '/api/v1/favorites/$movieId';
+    final anonymous = await _request(base, 'PUT', favoritesPath);
+    _expect(anonymous.statusCode == HttpStatus.unauthorized,
+        'favorite writes require a paired device');
+    final removedFavorite =
+        await _request(base, 'DELETE', favoritesPath, token: viewerToken);
+    _expect(
+        removedFavorite.statusCode == HttpStatus.ok &&
+            removedFavorite.json['data']['isFavorite'] == false,
+        'viewer can remove an admin favorite');
+    final emptyFavorites =
+        await _request(base, 'GET', '/api/v1/favorites', token: adminToken);
+    _expect((emptyFavorites.json['data']['items'] as List<dynamic>).isEmpty,
+        'admin sees viewer removal');
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final savedFavorite =
+          await _request(base, 'PUT', favoritesPath, token: viewerToken);
+      _expect(
+          savedFavorite.statusCode == HttpStatus.ok &&
+              savedFavorite.json['data']['isFavorite'] == true,
+          'viewer can favorite a movie repeatedly without toggling it off');
+    }
+    final listedFavorites = await _request(
+      base,
+      'GET',
+      '/api/v1/favorites?page=1&pageSize=1',
+      token: adminToken,
+    );
+    _expect(
+        listedFavorites.json['page']['total'] == 1 &&
+            (listedFavorites.json['data']['items'] as List<dynamic>)
+                    .single['id'] ==
+                movieId,
+        'both roles share the same paginated favorite list');
+    final missingFavorite = await _request(
+      base,
+      'PUT',
+      '/api/v1/favorites/missing-movie',
+      token: viewerToken,
+    );
+    _expect(missingFavorite.statusCode == HttpStatus.notFound,
+        'favorites reject an unknown movie');
     final publisherDetails = await _request(
       base,
       'GET',

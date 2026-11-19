@@ -14,7 +14,8 @@ Future<void> main() async {
     'traceId': logger.newId('t'),
     'requestId': logger.newId('r'),
     'authorization': 'Bearer secret-value',
-    'route': nasRouteTemplate('/api/v1/movies/12345678-1234-1234-1234-123456789abc'),
+    'route':
+        nasRouteTemplate('/api/v1/movies/12345678-1234-1234-1234-123456789abc'),
     'error': 'C:\\media\\private.mp4\nBearer another-secret',
   });
   await Future<void>.delayed(Duration.zero);
@@ -23,9 +24,12 @@ Future<void> main() async {
   _expect(record['schemaVersion'] == 1, 'schema version is present');
   _expect(record['ts'].toString().endsWith('Z'), 'timestamp is UTC');
   _expect(record['authorization'] == '[redacted]', 'authorization is redacted');
-  _expect(record['route'] == '/api/v1/movies/:id', 'normalized routes remain readable');
-  _expect(!memory.lines.single.contains('secret'), 'secrets never reach a sink');
-  _expect(!memory.lines.single.contains('private.mp4'), 'absolute paths are redacted');
+  _expect(record['route'] == '/api/v1/movies/:id',
+      'normalized routes remain readable');
+  _expect(
+      !memory.lines.single.contains('secret'), 'secrets never reach a sink');
+  _expect(!memory.lines.single.contains('private.mp4'),
+      'absolute paths are redacted');
   _expect(!memory.lines.single.contains('\n'), 'JSONL has no literal newlines');
 
   final failing = NasDiagnosticLogger(stdoutSink: _FailingSink());
@@ -44,12 +48,37 @@ Future<void> main() async {
   _expect(bounded.droppedDebugEvents == 1, 'full queue drops DEBUG only');
   blocked.release();
 
-  final directory = await Directory.systemTemp.createTemp('mujing-nas-log-test-');
+  final directory =
+      await Directory.systemTemp.createTemp('mujing-nas-log-test-');
   try {
-    final sink = NasRotatingFileLogSink(directory, maxBytes: 10, retentionFiles: 1);
+    final buffered = NasRotatingFileLogSink(directory,
+        flushInterval: const Duration(seconds: 30));
+    final pending = [for (var i = 0; i < 40; i++) buffered.write('{"i":$i}')];
+    final logFile =
+        File('${directory.path}${Platform.pathSeparator}mujing-nas.jsonl');
+    _expect(
+        !await logFile.exists(), 'a log burst stays buffered before flushing');
+    await buffered.flush();
+    await Future.wait(pending);
+    final lines = await logFile.readAsLines();
+    _expect(
+        lines.length == 40 &&
+            jsonDecode(lines.first)['i'] == 0 &&
+            jsonDecode(lines.last)['i'] == 39,
+        'explicit shutdown flush preserves ordering and all records');
+    await buffered.write('{"level":"ERROR","event":"test"}');
+    _expect((await logFile.readAsLines()).length == 41,
+        'errors immediately flush the log buffer');
+    await logFile.delete();
+    final sink =
+        NasRotatingFileLogSink(directory, maxBytes: 10, retentionFiles: 1);
     await sink.write('{"a":1}');
     await sink.write('{"b":2}');
-    _expect(await File('${directory.path}${Platform.pathSeparator}mujing-nas.jsonl.1').exists(), 'file sink rotates');
+    _expect(
+        await File(
+                '${directory.path}${Platform.pathSeparator}mujing-nas.jsonl.1')
+            .exists(),
+        'file sink rotates');
   } finally {
     await directory.delete(recursive: true);
   }
@@ -64,7 +93,8 @@ class _MemorySink implements NasLogSink {
 
 class _FailingSink implements NasLogSink {
   @override
-  Future<void> write(String line) => Future<void>.error(StateError('sink unavailable'));
+  Future<void> write(String line) =>
+      Future<void>.error(StateError('sink unavailable'));
 }
 
 class _BlockedSink implements NasLogSink {

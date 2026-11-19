@@ -120,13 +120,19 @@ NasMovieSearchFilter? nasMovieSearchFilter(Map<String, dynamic>? body) {
     'publisherIds',
     'actorIds',
   };
-  const fields = {...requiredFields, 'isFavorite', ...entityFields};
+  const fields = {
+    ...requiredFields,
+    'isFavorite',
+    'missingActors',
+    ...entityFields,
+  };
   if (body == null ||
       body.keys.any((key) => !fields.contains(key)) ||
       !body.keys.toSet().containsAll(requiredFields) ||
       body['q'] is! String ||
       (body['categoryId'] != null && body['categoryId'] is! String) ||
       (body['isFavorite'] != null && body['isFavorite'] is! bool) ||
+      (body.containsKey('missingActors') && body['missingActors'] is! bool) ||
       body['resolutions'] is! List ||
       body['watchStates'] is! List ||
       body['sort'] is! String ||
@@ -235,6 +241,7 @@ NasMovieSearchFilter? nasMovieSearchFilter(Map<String, dynamic>? body) {
     publisherIds: entityIds['publisherIds']!,
     actorIds: entityIds['actorIds']!,
     isFavorite: body['isFavorite'] as bool?,
+    missingActors: body['missingActors'] as bool? ?? false,
     resolutions: resolutions.cast<String>().toSet(),
     watchStates: watchStates.cast<String>().toSet(),
     sort: body['sort'] as String,

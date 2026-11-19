@@ -174,8 +174,10 @@ extension NasScrapeDatabase on NasLibraryDatabase {
       int nextAt = 0,
       Map<String, dynamic>? result,
       List<Object?>? conflicts}) {
-    if(status=='pending'){
-      _db.execute("UPDATE scrape_tasks SET attempts=MAX(0,attempts-1) WHERE id=? AND status='running'",[id]);
+    if (status == 'pending') {
+      _db.execute(
+          "UPDATE scrape_tasks SET attempts=MAX(0,attempts-1) WHERE id=? AND status='running'",
+          [id]);
     }
     _db.execute(
         '''UPDATE scrape_tasks SET status=?,error=?,next_at=?,
@@ -320,8 +322,11 @@ extension NasScrapeDatabase on NasLibraryDatabase {
       {bool overwrite = false, bool scannedTitle = false}) {
     if (proposed == null || proposed == '' || proposed == '[]') return false;
     if (overwrite) return true;
-    if (kind == 'actor' && actorHasMdcngSource(id) &&
-        current != null && current != '' && current != '[]') return false;
+    if (kind == 'actor' &&
+        actorHasMdcngSource(id) &&
+        current != null &&
+        current != '' &&
+        current != '[]') return false;
     final source = _db.select(
         'SELECT value,manual FROM scrape_fields WHERE kind=? AND entity_id=? AND field=?',
         [kind, id, field]);
@@ -370,17 +375,23 @@ extension NasScrapeDatabase on NasLibraryDatabase {
     }
     final name = entity['name'] as String;
     final matches = kind == 'actor'
-        ? findActorsByExactNames([name, ...List<String>.from(entity['aliases'] as List? ?? const [])],
-            includeArchived: true)
+        ? findActorsByExactNames([
+            name,
+            ...List<String>.from(entity['aliases'] as List? ?? const [])
+          ], includeArchived: true)
         : const <NasActor>[];
-    if (matches.length > 1 || matches.any((actor) => actor.archivedAt != null) ||
-        (matches.length == 1 && _db.select(
-          "SELECT 1 FROM scrape_sources WHERE kind='actor' AND entity_id=? AND source_key!=? LIMIT 1",
-          [matches.single.id, key]).isNotEmpty)) {
+    if (matches.length > 1 ||
+        matches.any((actor) => actor.archivedAt != null) ||
+        (matches.length == 1 &&
+            _db.select(
+                "SELECT 1 FROM scrape_sources WHERE kind='actor' AND entity_id=? AND source_key!=? LIMIT 1",
+                [matches.single.id, key]).isNotEmpty)) {
       throw ArgumentError('演员“$name”存在重名或已归档档案，请核对并选择正确演员；已归档的档案需先恢复');
     }
     final id = kind == 'actor'
-        ? (matches.isEmpty ? createActor(stageName: name).id : matches.single.id)
+        ? (matches.isEmpty
+            ? createActor(stageName: name).id
+            : matches.single.id)
         : createPublisher(displayName: name).id;
     _db.execute(
         'INSERT INTO scrape_sources(source_key,kind,entity_id,source_url,updated_at) VALUES (?,?,?,?,?)',
@@ -394,29 +405,45 @@ extension NasScrapeDatabase on NasLibraryDatabase {
 
   /// MDCNG 负责已有资料；内置来源仍可补充空白，不能自动接管姓名或头像。
   bool actorHasMdcngSource(String id) => _db.select(
-      'SELECT 1 FROM mdcng_actor_source_links WHERE actor_id=? LIMIT 1', [id]).isNotEmpty;
+      'SELECT 1 FROM mdcng_actor_source_links WHERE actor_id=? LIMIT 1',
+      [id]).isNotEmpty;
 
   /// 只根据影片保存的出演名单补关联，绝不将演员名字当作影片搜索条件。
   int reconcileScrapeActorMovies([String? actorId]) {
-    final actors = {for (final actor in listActors(includeArchived: true)) actor.id: actor};
-    if (actors.isEmpty || (actorId != null &&
-        (actors[actorId] == null || actors[actorId]!.archivedAt != null))) return 0;
+    final actors = {
+      for (final actor in listActors(includeArchived: true)) actor.id: actor
+    };
+    if (actors.isEmpty ||
+        (actorId != null &&
+            (actors[actorId] == null || actors[actorId]!.archivedAt != null)))
+      return 0;
     final names = <String, Set<String>>{};
     void addName(String id, String? value) {
       final name = value?.trim().toLowerCase();
-      if (name != null && name.isNotEmpty) names.putIfAbsent(name, () => {}).add(id);
+      if (name != null && name.isNotEmpty)
+        names.putIfAbsent(name, () => {}).add(id);
     }
+
     for (final actor in actors.values) {
-      for (final name in [actor.stageName, actor.originalName, actor.translatedName, ...actor.aliases]) {
+      for (final name in [
+        actor.stageName,
+        actor.originalName,
+        actor.translatedName,
+        ...actor.aliases
+      ]) {
         addName(actor.id, name);
       }
     }
-    for (final row in _db.select('SELECT actor_id,source_name FROM mdcng_actor_source_links')) {
-      if (actors.containsKey(row['actor_id'])) addName(row['actor_id'] as String, row['source_name'] as String);
+    for (final row in _db
+        .select('SELECT actor_id,source_name FROM mdcng_actor_source_links')) {
+      if (actors.containsKey(row['actor_id']))
+        addName(row['actor_id'] as String, row['source_name'] as String);
     }
-    final sourceKeys = <String, Set<String>>{}, sourceUrls = <String, Set<String>>{};
+    final sourceKeys = <String, Set<String>>{},
+        sourceUrls = <String, Set<String>>{};
     final sourceActors = <String>{};
-    for (final row in _db.select("SELECT source_key,source_url,entity_id FROM scrape_sources WHERE kind='actor'")) {
+    for (final row in _db.select(
+        "SELECT source_key,source_url,entity_id FROM scrape_sources WHERE kind='actor'")) {
       final id = row['entity_id'] as String;
       if (!actors.containsKey(id)) continue;
       sourceActors.add(id);
@@ -424,39 +451,57 @@ extension NasScrapeDatabase on NasLibraryDatabase {
       sourceUrls.putIfAbsent(row['source_url'] as String, () => {}).add(id);
     }
     var count = 0;
-    for (final row in _db.select('''SELECT p.movie_id,p.metadata FROM scrape_movie_profiles p
-      JOIN movies m ON m.id=p.movie_id WHERE m.lifecycle_state='active'
-      AND NOT EXISTS(SELECT 1 FROM movie_metadata_field_sources f
-        WHERE f.movie_id=m.id AND f.field_key='actors' AND f.source_kind='manual')''')) {
-      final movieId = row['movie_id'] as String;
-      final linked = _db.select('SELECT actor_id FROM movie_actor_links WHERE movie_id=?', [movieId])
-          .map((row) => row['actor_id'] as String).toSet();
+    for (final row in _db
+        .select('''SELECT p.movie_id,p.metadata FROM scrape_movie_profiles p
+      JOIN movies m ON m.id=p.movie_id''')) {
+      final sourceMovieId = row['movie_id'] as String;
+      final movieId =
+          _actorAppendOwner(sourceMovieId, respectManualFreeze: true);
+      if (movieId == null) continue;
+      final linked = _db
+          .select('SELECT actor_id FROM movie_actor_links WHERE movie_id=?',
+              [movieId])
+          .map((row) => row['actor_id'] as String)
+          .toSet();
       if (actorId != null && linked.contains(actorId)) continue;
       final metadata = jsonDecode(row['metadata'] as String) as Map;
-      final cast = (metadata['actorSources'] ?? metadata['actors']) as List? ?? const [];
+      final cast =
+          (metadata['actorSources'] ?? metadata['actors']) as List? ?? const [];
       for (final entry in cast.whereType<Map>()) {
         final url = entry['url'] as String?;
         var key = entry['provisional'] == true ? null : entry['id'] as String?;
         // 旧版影片只保存演员 URL，按相同规则恢复 WhatsAV 稳定身份。
         final uri = url == null ? null : Uri.tryParse(url);
-        if (key == null && uri != null && uri.host == 'whatsav.net' &&
-            uri.pathSegments.length == 3 && uri.pathSegments[1] == 'actor') {
-          key = 'actor_${sha256Hex(jsonEncode(['whatsav', 'actor', 'actor', uri.pathSegments.last])).substring(0, 32)}';
+        if (key == null &&
+            uri != null &&
+            uri.host == 'whatsav.net' &&
+            uri.pathSegments.length == 3 &&
+            uri.pathSegments[1] == 'actor') {
+          key = 'actor_${sha256Hex(jsonEncode([
+                'whatsav',
+                'actor',
+                'actor',
+                uri.pathSegments.last
+              ])).substring(0, 32)}';
         }
         final mapped = <String>{...?sourceKeys[key], ...?sourceUrls[url]};
-        final matches = mapped.isNotEmpty ? mapped
-            : names[(entry['name'] as String? ?? '').trim().toLowerCase()] ?? <String>{};
+        final matches = mapped.isNotEmpty
+            ? mapped
+            : names[(entry['name'] as String? ?? '').trim().toLowerCase()] ??
+                <String>{};
         if (matches.length != 1) continue;
         final resolved = matches.single;
-        if (actors[resolved]!.archivedAt != null || linked.contains(resolved) ||
+        if (actors[resolved]!.archivedAt != null ||
+            linked.contains(resolved) ||
             (actorId != null && actorId != resolved)) continue;
         if (mapped.isEmpty && key != null && url != null) {
           if (sourceActors.contains(resolved)) continue;
-          _db.execute('''INSERT INTO scrape_sources(source_key,kind,entity_id,source_url,updated_at)
+          _db.execute(
+              '''INSERT INTO scrape_sources(source_key,kind,entity_id,source_url,updated_at)
             VALUES (?,'actor',?,?,?) ON CONFLICT(source_key) DO UPDATE SET
             kind='actor',entity_id=excluded.entity_id,source_url=excluded.source_url,
             profile=NULL,updated_at=excluded.updated_at''',
-            [key, resolved, url, NasLibraryDatabase._now()]);
+              [key, resolved, url, NasLibraryDatabase._now()]);
           sourceKeys[key] = {resolved};
           sourceUrls.putIfAbsent(url, () => {}).add(resolved);
           sourceActors.add(resolved);
@@ -466,7 +511,11 @@ extension NasScrapeDatabase on NasLibraryDatabase {
         count++;
       }
     }
-    return count + reconcileSupplementCast(actorId: actorId);
+    return count +
+        reconcileSupplementCast(
+            actorId: actorId,
+            respectManualFreeze: true,
+            allowDirectNonEmptyManual: actorId != null);
   }
 
   void saveScrapeProfile(String key, Map<String, dynamic> result) =>
@@ -536,15 +585,27 @@ extension NasScrapeDatabase on NasLibraryDatabase {
       if (value == null || value == '' || value == '[]') continue;
       final previous = current.single[field];
       if (previous == value) continue;
-      if (kind == 'actor' && actorHasMdcngSource(id) && !overwrite.contains(field)) {
-        final date = current.single['birth_date'], month = current.single['birth_month'];
-        if (field == 'birth_date' && month is String && month.isNotEmpty &&
-            value is String && !value.startsWith(month)) continue;
-        if (field == 'birth_month' && date is String && date.isNotEmpty &&
-            value is String && !date.startsWith(value)) continue;
+      if (kind == 'actor' &&
+          actorHasMdcngSource(id) &&
+          !overwrite.contains(field)) {
+        final date = current.single['birth_date'],
+            month = current.single['birth_month'];
+        if (field == 'birth_date' &&
+            month is String &&
+            month.isNotEmpty &&
+            value is String &&
+            !value.startsWith(month)) continue;
+        if (field == 'birth_month' &&
+            date is String &&
+            date.isNotEmpty &&
+            value is String &&
+            !date.startsWith(value)) continue;
       }
-      if (kind == 'actor' && actorHasMdcngSource(id) &&
-          previous != null && previous != '' && previous != '[]' &&
+      if (kind == 'actor' &&
+          actorHasMdcngSource(id) &&
+          previous != null &&
+          previous != '' &&
+          previous != '[]' &&
           !overwrite.contains(field)) continue;
       if (scrapeFieldAllowed(kind, id, field, previous, value,
           overwrite: overwrite.contains(field),
@@ -604,10 +665,17 @@ extension NasScrapeDatabase on NasLibraryDatabase {
           ]);
       final code = work['code'];
       if (code is! String) continue;
+      // 先在 SQLite 内按番号筛选，避免每个演员作品都扫描整库影片；
+      // 归并链和分类边界再由 _actorAppendOwner 统一校验。
       final rows = _db.select(
-          "SELECT id FROM movies WHERE catalog_number IS NOT NULL AND lifecycle_state='active' AND lower(replace(replace(replace(catalog_number,'-',''),'_',''),' ',''))=?",
+          "SELECT id FROM movies WHERE catalog_number IS NOT NULL AND lower(replace(replace(replace(catalog_number,'-',''),'_',''),' ',''))=?",
           [_normalizeCatalogNumber(code)]);
-      for (final row in rows) linkScrapeActors(row['id'] as String, [actorId]);
+      for (final row in rows) {
+        final owner =
+            _actorAppendOwner(row['id'] as String, respectManualFreeze: true);
+        if (owner == null) continue;
+        linkScrapeActors(owner, [actorId]);
+      }
     }
   }
 
@@ -639,21 +707,36 @@ extension NasScrapeDatabase on NasLibraryDatabase {
       throw ArgumentError('审核字段无效');
     transaction(() {
       for (final mapping in actorMappings.entries) {
-        final choices = conflicts.where((conflict) => conflict['field'] == 'identity' &&
-            conflict['sourceKey'] == mapping.key).toList();
+        final choices = conflicts
+            .where((conflict) =>
+                conflict['field'] == 'identity' &&
+                conflict['sourceKey'] == mapping.key)
+            .toList();
         final actor = findActor(mapping.value);
-        if (choices.isEmpty || actor == null || actor.archivedAt != null ||
-            !choices.every((choice) => (choice['candidates'] as List? ?? const [])
-                .whereType<Map>().any((candidate) => candidate['id'] == actor.id))) {
+        if (choices.isEmpty ||
+            actor == null ||
+            actor.archivedAt != null ||
+            !choices.every((choice) =>
+                (choice['candidates'] as List? ?? const [])
+                    .whereType<Map>()
+                    .any((candidate) => candidate['id'] == actor.id))) {
           throw ArgumentError('演员选择已失效，请重新刮削核对');
         }
-        final existing = _db.select('SELECT entity_id FROM scrape_sources WHERE source_key=?', [mapping.key]);
+        final existing = _db.select(
+            'SELECT entity_id FROM scrape_sources WHERE source_key=?',
+            [mapping.key]);
         if (existing.isNotEmpty && existing.single['entity_id'] != actor.id) {
           throw ArgumentError('来源已绑定其他演员，请重新刮削核对');
         }
-        _db.execute('''INSERT OR IGNORE INTO scrape_sources
+        _db.execute(
+            '''INSERT OR IGNORE INTO scrape_sources
           (source_key,kind,entity_id,source_url,updated_at) VALUES (?,'actor',?,?,?)''',
-          [mapping.key, actor.id, choices.first['sourceUrl'], NasLibraryDatabase._now()]);
+            [
+              mapping.key,
+              actor.id,
+              choices.first['sourceUrl'],
+              NasLibraryDatabase._now()
+            ]);
         reconcileScrapeActorMovies(actor.id);
       }
       for (final conflict
@@ -673,18 +756,32 @@ extension NasScrapeDatabase on NasLibraryDatabase {
             overwrite: {field});
       }
       final warnings = (task['result'] as Map?)?['warnings'] as List? ?? [];
-      final identities = conflicts.where((conflict) => conflict['field'] == 'identity' &&
-          !actorMappings.containsKey(conflict['sourceKey'])).toList();
-      if (actorMappings.isNotEmpty && _db.select('''SELECT 1 FROM scrape_tasks
+      final identities = conflicts
+          .where((conflict) =>
+              conflict['field'] == 'identity' &&
+              !actorMappings.containsKey(conflict['sourceKey']))
+          .toList();
+      if (actorMappings.isNotEmpty &&
+          _db.select('''SELECT 1 FROM scrape_tasks
           WHERE task_key=? AND id!=? AND status IN ('pending','running','retry')''',
-          [task['task_key'], taskId]).isNotEmpty) {
+              [task['task_key'], taskId]).isNotEmpty) {
         throw ArgumentError('同一来源正在另一个任务中采集，请完成后重新核对');
       }
-      finishScrapeTask(taskId, actorMappings.isNotEmpty ? 'pending'
-          : identities.isNotEmpty ? 'review' : warnings.isEmpty ? 'done' : 'partial',
-          conflicts: identities, error: identities.isNotEmpty
+      finishScrapeTask(
+          taskId,
+          actorMappings.isNotEmpty
+              ? 'pending'
+              : identities.isNotEmpty
+                  ? 'review'
+                  : warnings.isEmpty
+                      ? 'done'
+                      : 'partial',
+          conflicts: identities,
+          error: identities.isNotEmpty
               ? '演员身份仍需核对，请选择正确演员；无候选时可导入 MDCNG 资料后重试'
-              : warnings.isEmpty ? null : warnings.join('；'));
+              : warnings.isEmpty
+                  ? null
+                  : warnings.join('；'));
     });
   }
 }

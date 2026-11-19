@@ -1,8 +1,14 @@
 # 幕境 NAS 服务
 
+扫描支持按作品目录自动识别影集、重扫自动归并同目录旧独立条目、旧 `-影集` 目录去后缀后的索引迁移，以及自动/手动分集排序；显式人工拆分会保留。PC、平板增加未关联演员影片（排除 AI）和零影片演员筛选。schema 升级至 v37，先更新 NAS 再更新客户端。规则、接口和二次部署命令见 [目录影集与管理筛选](docs/目录影集与管理筛选.md)。
+
 这是飞牛 NAS 的无界面影片服务。它提供健康检查、持久 `serverId`、viewer/admin 配对、受 token 保护的影片浏览、播放会话、Range 流和观看历史，并以 SQLite 管理媒体根、扫描结果、影片/分集元数据、分类、标签、海报、设备与备份。管理员影片 PATCH 已支持译名、原名、番号、结构化演员、简介、分类和标签；可选的受控源文件同目录改名默认关闭。
 
 第一次部署请先阅读 [`docs/飞牛NAS小白部署指南.md`](docs/飞牛NAS小白部署指南.md)，其中包含目录说明、`.env`、镜像加速、最小启动、只读媒体挂载、扫描和常见故障处理。
+
+管理员标签管理增加批量清空关联、批量删除与影片标签对照导入接口，减少逐条请求和数据库提交；诊断文件日志按短时间批次刷盘。需先更新 NAS，再更新 Windows 与 Android 平板。性能优化见 [机械硬盘性能与影集合并评估](docs/机械硬盘性能与影集合并评估.md)。
+
+PC 与平板管理详情支持“组成影集”：同分类跨盘、可选主资料、演员/标签/收藏/截图合并、分集顺序预览，原影片隐藏；视频不搬迁，进度和历史保留。NAS 以事务完成合并，并校验播放、任务及资料冲突。规则、限制与 API 见 [详情页组成影集](docs/详情页组成影集.md)。手机普通详情页没有此管理入口。
 
 ## 技术选型
 
@@ -193,7 +199,7 @@ MDCNG NFO 可导入单视频影片或包含多个视频的影集。预览会列�
 - `GET /api/v1/movies/{movieId}`：返回影片详情与已扫描分集。
 - `GET /api/v1/tag-paths`：返回当前标签层级路径。
 - `GET` / `HEAD /api/v1/assets/posters/{movieId}`：受 Bearer token 保护，使用相对 `posterUrl`。
-- `GET /api/v1/favorites`：当前返回空列表；`GET /api/v1/history`：返回持久化观看历史。
+- `GET /api/v1/history` 返回持久化观看历史。
 
 生产配置不会向浏览 API 暴露协议 fixture，也不会返回宿主机路径或容器内媒体路径。fixture 只保留给隔离的协议测试构造。
 
@@ -207,8 +213,10 @@ MUJING_FIXTURE_MEDIA_RELATIVE_PATH=disk1/相对于媒体目录的/test.mp4
 
 服务端只接受相对路径，拒绝绝对路径、`..` 路径逃逸，并在每次流请求时解析符号链接，确保最终文件仍位于容器 `/media` 根内。该配置可在部署时手动提供；本任务没有配置页面，也不会把宿主机路径返回给客户端。
 
+- `GET /api/v1/favorites` 按影片列表的分页格式返回 NAS 收藏。已配对的浏览设备和管理设备可通过 `PUT /api/v1/favorites/{movieId}` 收藏，或通过 `DELETE /api/v1/favorites/{movieId}` 取消。收藏状态与管理端共用，重复操作结果一致。
 - `POST /api/v1/playback/sessions`：viewer 创建直接播放会话，返回相对流 URL。
 - `PATCH /api/v1/playback/sessions/{id}/progress`：viewer 写入当前进度，并更新持久化观看历史。
+- `POST /api/v1/playback/sessions/{id}/screenshot` 将 JPEG、PNG 或 WebP 图片加入会话对应影片的预览图，单张最多 10 MiB。请求使用创建该会话的配对令牌，会话须已开始正式播放。响应返回截图 ID 和图片地址。
 - `DELETE /api/v1/playback/sessions/{id}`：关闭会话。
 - `GET` / `HEAD /api/v1/playback/sessions/{id}/stream`：支持无 Range 的 `200`、单 Range 的 `206` 和非法 Range 的 `416`，不把整文件读入内存。
 - `POST /api/v1/movies/search`：在 SQLite 内完成关键词、标签、观看状态、分辨率和资料实体筛选后分页返回。兼容旧的单分类 `categoryId`；可选 `categoryIds`、`seriesIds`、`publisherIds`、`actorIds` 字符串数组，同一数组内按任一匹配，不同维度及其他条件之间按同时满足匹配。可选数组不存在时表示不限；字段一旦出现就必须包含 1 至 80 个现有实体 ID，空数组、空值、重复、畸形、超限或不存在的 ID 返回 `400 invalid_request`。

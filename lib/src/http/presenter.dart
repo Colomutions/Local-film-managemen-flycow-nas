@@ -231,6 +231,9 @@ class NasLibraryPresenter {
       ...databaseSummary(movie),
       'organizations': _libraryDatabase.movieCompanies(movie.id),
       'sourceMetadata': _libraryDatabase.scrapeMovieProfile(movie.id),
+      'compositionSources': movie.entryType == 'series'
+          ? _libraryDatabase.compositionSourcesForMovie(movie.id)
+          : const [],
       'actors':
           movie.actors.map(_movieActorDetailsPayload).toList(growable: false),
       'summary': movie.summary,

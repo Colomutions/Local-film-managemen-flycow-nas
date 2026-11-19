@@ -6,7 +6,9 @@ import '../auth.dart';
 import '../library_models.dart';
 import '../media_service.dart';
 import '../metadata_probe.dart';
+import 'collection_composition_repository.dart';
 import 'library_values.dart';
+import 'scan_directory_index.dart';
 
 /// Owns source enumeration and scan writes, preserving their existing order.
 class NasScanRepository {
@@ -16,6 +18,7 @@ class NasScanRepository {
     required this.findCategory,
     required this.findMovieForAdmin,
     required this.mediaSourcesForCategory,
+    required this.composeScannedMovies,
     required this.transaction,
   });
 
@@ -26,6 +29,11 @@ class NasScanRepository {
   final NasLibraryMovie? Function(String movieId) findMovieForAdmin;
   final List<NasCategoryMediaSource> Function(String categoryId)
       mediaSourcesForCategory;
+  final Future<String> Function({
+    required List<String> movieIds,
+    required String metadataSourceMovieId,
+    String? scannedTitle,
+  }) composeScannedMovies;
   final T Function<T>(T Function() action) transaction;
 
   NasMediaRoot ensureConfiguredMediaRoot({
@@ -389,6 +397,105 @@ class NasScanRepository {
     final prefix = listedDirectory.endsWith(Platform.pathSeparator)
         ? listedDirectory
         : '$listedDirectory${Platform.pathSeparator}';
+    final paths = <String, File>{};
+    final directoryCounts = <String, int>{};
+    final pathsByWork = <String, List<String>>{};
+    final directorySpellings = <String, Set<String>>{};
+    for (final file in files) {
+      final absolute = file.absolute.path;
+      if (!absolute.startsWith(prefix)) continue;
+      final path = absolute
+          .substring(prefix.length)
+          .replaceAll(Platform.pathSeparator, '/');
+      paths[path] = file;
+      final work = NasScanDirectoryIndex.workDirectory(path);
+      if (work != null) {
+        directoryCounts.update(work, (count) => count + 1, ifAbsent: () => 1);
+        pathsByWork.putIfAbsent(work, () => []).add(path);
+        directorySpellings
+            .putIfAbsent(work, () => {})
+            .add(path.substring(0, path.lastIndexOf('/')));
+      }
+    }
+    final categorySources = mediaSourcesForCategory(categoryId);
+    var index =
+        NasScanDirectoryIndex(_db, categoryId, categorySources, mediaRoot.id);
+    final currentPaths =
+        paths.keys.map((path) => '${source.relativePath}/$path').toSet();
+    final initialRenames = index.suffixRenameCandidates(currentPaths);
+    final fileStats = <String, FileStat>{};
+    final conflicts = <String>[];
+    final failedAutomaticGroups = <String>{};
+    var composedAny = false;
+    for (final work in directoryCounts.keys.toList()..sort()) {
+      if ((directorySpellings[work]?.length ?? 0) > 1 ||
+          episodeGrouping('$work/segment.mp4').isConflict) continue;
+      final movieIds = index.automaticSingleMovieIds(work);
+      if (movieIds.isEmpty) continue;
+      // Do not change ownership before an old suffix rename is known to be
+      // unambiguous. Reuse these stats below instead of touching the file twice.
+      var renameConflict = false;
+      for (final path in pathsByWork[work]!) {
+        final fullPath = '${source.relativePath}/$path';
+        final candidates = initialRenames[fullPath] ?? const [];
+        if (index.episodesByPath.containsKey(fullPath)) {
+          // 新路径已有分集时，不能把旧后缀记录当作同一文件一起归并。
+          if (candidates.isNotEmpty) {
+            renameConflict = true;
+            break;
+          }
+          continue;
+        }
+        if (candidates.isEmpty) continue;
+        if (candidates.length != 1) {
+          renameConflict = true;
+          break;
+        }
+        final stat = await paths[path]!.stat();
+        fileStats[path] = stat;
+        if (candidates.single['file_size'] != stat.size ||
+            candidates.single['media_modified_at'] !=
+                stat.modified.microsecondsSinceEpoch) {
+          renameConflict = true;
+          break;
+        }
+      }
+      if (renameConflict) {
+        failedAutomaticGroups.add(work);
+        continue;
+      }
+      await beforeFile?.call();
+      try {
+        await composeScannedMovies(
+          movieIds: movieIds,
+          metadataSourceMovieId: movieIds.first,
+          scannedTitle: episodeGrouping('$work/segment.mp4').displayTitle,
+        );
+        composedAny = true;
+      } on NasCollectionCompositionConflict catch (error) {
+        final reason = switch (error.code) {
+          'collection_playback_active' => '影片正在播放，暂不自动合并',
+          'collection_task_active' => '影片资料任务尚未完成，暂不自动合并',
+          'collection_episode_limit' => '分集数量超过自动合并限制',
+          _ => '影片资料或分集已变化，暂不自动合并',
+        };
+        conflicts
+            .add('${source.sourceName}/${source.relativePath}/$work（$reason）');
+        failedAutomaticGroups.add(work);
+      } on FormatException {
+        conflicts.add(
+            '${source.sourceName}/${source.relativePath}/$work（影片或分集数量不符合自动合并条件）');
+        failedAutomaticGroups.add(work);
+      }
+    }
+    if (composedAny) {
+      // Composition moves existing episode IDs and metadata as one transaction.
+      // Refresh all owner rows before scanning so their former singles can never
+      // be recreated, including when another source disk supplied a segment.
+      index =
+          NasScanDirectoryIndex(_db, categoryId, categorySources, mediaRoot.id);
+    }
+    final renames = index.suffixRenameCandidates(currentPaths);
     // 成功穷举后才标记不可用，避免挂载中断导致“离线即删除”。
     final seenPaths = <String>{};
     final changes = <void Function()>[];
@@ -403,14 +510,14 @@ class NasScanRepository {
     }
 
     var scannedFiles = 0;
-    final conflicts = <String>[];
-    for (final entity in files) {
+    final sortedPaths = paths.keys.toList()
+      ..sort((a, b) {
+        final byName = naturalSortKey(a).compareTo(naturalSortKey(b));
+        return byName != 0 ? byName : a.compareTo(b);
+      });
+    final directoryMovieIds = <String, String>{};
+    for (final inCategoryPath in sortedPaths) {
       await beforeFile?.call();
-      final listedFile = entity.absolute.path;
-      if (!listedFile.startsWith(prefix)) continue;
-      final inCategoryPath = listedFile
-          .substring(prefix.length)
-          .replaceAll(Platform.pathSeparator, '/');
       final grouping = episodeGrouping(inCategoryPath);
       if (grouping.isConflict) {
         conflicts.add(
@@ -419,39 +526,94 @@ class NasScanRepository {
       }
       final relativePath = '${source.relativePath}/$inCategoryPath';
       seenPaths.add(relativePath);
-      final checked = NasMediaFile(File(listedFile), relativePath);
-      final stat = await checked.file.stat();
-      final existing = _db.select('''
-        SELECT e.id, e.movie_id, e.file_size, e.media_modified_at,
-               e.duration_ms, e.video_width, e.video_height, e.resolution_label,
-               e.metadata_probed_at, e.is_available,
-               m.collection_key
-        FROM episodes e JOIN movies m ON m.id = e.movie_id
-        WHERE e.media_root_id = ? AND e.relative_path = ?
-      ''', [mediaRoot.id, relativePath]);
-      final collectionKey =
-          grouping.rootPath == null ? null : '$categoryId:${grouping.rootPath}';
-      final existingCollectionKey = existing.isEmpty
-          ? null
-          : existing.single['collection_key'] as String?;
-      if (collectionKey != null &&
-          existing.isNotEmpty &&
-          existingCollectionKey != collectionKey) {
-        // 旧逐文件数据和管理员手工归组只能在预览确认后迁移。
-        _markExistingEpisodeAvailable(existing.single['id'] as String);
-        conflicts.add(
-            '${source.sourceName}/${source.relativePath}/${grouping.rootPath}');
-        continue;
+      final checked = NasMediaFile(paths[inCategoryPath]!, relativePath);
+      final stat = fileStats[inCategoryPath] ?? await checked.file.stat();
+      var existing = index.episodesByPath[relativePath];
+      final work = grouping.rootPath;
+      final spellingConflict = (directorySpellings[work]?.length ?? 0) > 1;
+      final renameCandidates = renames[relativePath] ?? const [];
+      if (existing != null && renameCandidates.isNotEmpty) {
+        conflicts
+            .add('${source.sourceName}/$relativePath（去后缀目标已对应其他分集，保留原有索引）');
+        if (work != null) failedAutomaticGroups.add(work);
+      }
+      if (existing == null && renameCandidates.isNotEmpty) {
+        if (spellingConflict ||
+            renameCandidates.length != 1 ||
+            renameCandidates.single['file_size'] != stat.size ||
+            renameCandidates.single['media_modified_at'] !=
+                stat.modified.microsecondsSinceEpoch) {
+          conflicts.add('${source.sourceName}/$relativePath（去后缀路径匹配不唯一或文件已变更）');
+          continue;
+        }
+        existing = renameCandidates.single;
+        final episodeId = existing['id'] as String;
+        changes.add(() => _db.execute('''UPDATE episodes
+          SET relative_path=?, natural_sort_key=?, updated_at=? WHERE id=?''',
+            [relativePath, naturalSortKey(inCategoryPath), now(), episodeId]));
+      }
+      final owners =
+          work == null ? <String>{} : (index.owners[work] ?? <String>{});
+      final ambiguous = work != null && (spellingConflict || owners.length > 1);
+      if (ambiguous) {
+        if (!failedAutomaticGroups.contains(work)) {
+          conflicts.add(
+              '${source.sourceName}/${source.relativePath}/$work（目录对应多个条目或新旧目录同时存在）');
+        }
+        // Existing manual splits are respected. Only an unassigned new segment
+        // needs an explicit ownership decision before it can enter the index.
+        if (existing == null) continue;
+      }
+      String movieId;
+      if (existing != null) {
+        movieId = existing['movie_id'] as String;
+      } else if (owners.length == 1) {
+        movieId = owners.single;
+      } else if (work != null && directoryMovieIds.containsKey(work)) {
+        movieId = directoryMovieIds[work]!;
+      } else {
+        movieId = newUuidV4();
+        final timestamp = now();
+        final isSeries = work != null &&
+            ((directoryCounts[work] ?? 0) > 1 ||
+                collectionTitleFromDirectory(
+                        inCategoryPath.split('/').reversed.skip(1).first) !=
+                    null);
+        // Reserve a directory owner immediately; the writes remain batched.
+        if (work != null) {
+          directoryMovieIds[work] = movieId;
+          index.owners.putIfAbsent(work, () => {}).add(movieId);
+        }
+        final initialTitle = isSeries
+            ? grouping.displayTitle ?? titleFromPath(inCategoryPath)
+            : titleFromPath(inCategoryPath);
+        changes.add(() => _db.execute('''INSERT INTO movies
+          (id,title,scanned_title,category_id,entry_type,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?)''', [
+              movieId,
+              initialTitle,
+              initialTitle,
+              categoryId,
+              isSeries ? 'series' : 'single',
+              timestamp,
+              timestamp
+            ]));
       }
       final fileSize = stat.size;
       final modifiedAt = stat.modified.microsecondsSinceEpoch;
-      final unchanged = existing.isNotEmpty &&
-          existing.single['file_size'] == fileSize &&
-          existing.single['media_modified_at'] == modifiedAt &&
-          existing.single['metadata_probed_at'] != null;
+      final unchanged = existing != null &&
+          existing['file_size'] == fileSize &&
+          existing['media_modified_at'] == modifiedAt &&
+          existing['metadata_probed_at'] != null;
       if (unchanged) {
-        if (existing.single['is_available'] != 1) {
-          final id = existing.single['id'] as String;
+        if (existing['natural_sort_key'] != naturalSortKey(inCategoryPath)) {
+          final id = existing['id'] as String;
+          changes.add(() => _db.execute(
+              'UPDATE episodes SET natural_sort_key=? WHERE id=?',
+              [naturalSortKey(inCategoryPath), id]));
+        }
+        if (existing['is_available'] != 1) {
+          final id = existing['id'] as String;
           changes.add(() => _markExistingEpisodeAvailable(id));
         }
         scannedFiles++;
@@ -459,20 +621,16 @@ class NasScanRepository {
         continue;
       }
       final metadata = await metadataProbe.probe(checked);
-      final movieId = existing.isNotEmpty
-          ? existing.single['movie_id'] as String
-          : movieIdForScannedEpisode(
-              categoryId: categoryId,
-              collectionKey: collectionKey,
-              title: grouping.displayTitle ?? titleFromPath(inCategoryPath),
-            );
       final timestamp = now();
       changes.add(() => _db.execute('''
         INSERT INTO episodes(
           id, movie_id, media_root_id, title, relative_path, duration_ms,
           video_width, video_height, resolution_label, metadata_probed_at,
-          media_modified_at, file_size, is_available, natural_sort_key, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          media_modified_at, file_size, is_available, natural_sort_key, manual_order, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?,
+          CASE WHEN (SELECT episode_sort_mode FROM movies WHERE id=?)='manual'
+            THEN (SELECT COALESCE(MAX(manual_order),-1)+1 FROM episodes WHERE movie_id=?)
+            ELSE NULL END, ?)
         ON CONFLICT(media_root_id, relative_path) DO UPDATE SET
           duration_ms = excluded.duration_ms,
           video_width = excluded.video_width,
@@ -490,22 +648,27 @@ class NasScanRepository {
             mediaRoot.id,
             titleFromPath(inCategoryPath),
             relativePath,
-            unchanged ? existing.single['duration_ms'] : metadata?.durationMs,
-            unchanged ? existing.single['video_width'] : metadata?.width,
-            unchanged ? existing.single['video_height'] : metadata?.height,
-            unchanged
-                ? existing.single['resolution_label']
-                : metadata?.resolutionLabel,
-            unchanged ? existing.single['metadata_probed_at'] : timestamp,
+            metadata?.durationMs,
+            metadata?.width,
+            metadata?.height,
+            metadata?.resolutionLabel,
+            timestamp,
             modifiedAt,
             fileSize,
             naturalSortKey(inCategoryPath),
+            movieId,
+            movieId,
             timestamp,
           ]));
       if (changes.length >= 100) flushChanges();
       scannedFiles++;
     }
     flushChanges();
+    // Upgrade in place, including when a second disk supplies the new segment.
+    _db.execute('''UPDATE movies SET entry_type='series',updated_at=?
+      WHERE category_id=? AND lifecycle_state='active' AND entry_type='single'
+        AND (SELECT COUNT(*) FROM episodes WHERE movie_id=movies.id)>1''',
+        [now(), categoryId]);
     _markUnavailableEpisodesForSource(categoryId, source, seenPaths: seenPaths);
     _markRootScanned(mediaRoot.id);
     return NasScanResult(
@@ -556,12 +719,20 @@ class NasScanRepository {
     required String? collectionKey,
     required String title,
   }) {
+    String? storedCollectionKey = collectionKey;
     if (collectionKey != null) {
       final existing = _db.select(
-        'SELECT id FROM movies WHERE collection_key = ?',
+        'SELECT id,lifecycle_state FROM movies WHERE collection_key = ?',
         [collectionKey],
       );
-      if (existing.isNotEmpty) return existing.single['id'] as String;
+      if (existing.isNotEmpty) {
+        if (existing.single['lifecycle_state'] == 'active') {
+          return existing.single['id'] as String;
+        }
+        // Keep audit aliases on hidden sources without reviving them or
+        // violating the legacy unique key when the directory is regrouped.
+        storedCollectionKey = null;
+      }
     }
     final id = newUuidV4();
     final timestamp = now();
@@ -574,7 +745,7 @@ class NasScanRepository {
       title,
       categoryId,
       collectionKey == null ? 'single' : 'series',
-      collectionKey,
+      storedCollectionKey,
       timestamp,
       timestamp,
     ]);
@@ -594,11 +765,12 @@ class NasScanRepository {
         conflictPath: segments.take(roots.last.index + 1).join('/'),
       );
     }
-    if (roots.isEmpty) return const EpisodeGrouping();
-    final root = roots.single;
+    final directory = segments.take(segments.length - 1).join('/');
     return EpisodeGrouping(
-      rootPath: segments.take(root.index + 1).join('/'),
-      displayTitle: root.title,
+      rootPath: canonicalWorkDirectory(directory),
+      displayTitle:
+          collectionTitleFromDirectory(segments[segments.length - 2]) ??
+              segments[segments.length - 2],
     );
   }
 

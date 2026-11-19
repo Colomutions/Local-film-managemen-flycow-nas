@@ -444,6 +444,7 @@ class NasProfilesRepository {
     String query = '',
     String? gender,
     bool includeArchived = false,
+    bool unlinkedOnly = false,
   }) {
     final rows = _db.select('''
       SELECT a.id, a.profile_identity, a.stage_name, a.original_name, a.translated_name,
@@ -459,9 +460,15 @@ class NasProfilesRepository {
        LEFT JOIN movies linked_movie ON linked_movie.id = l.movie_id
       WHERE (? = 1 OR a.archived_at IS NULL)
         AND (? IS NULL OR a.gender = ?)
+        AND (? = 0 OR NOT EXISTS (
+          SELECT 1 FROM movie_actor_links active_link
+          JOIN movies active_movie ON active_movie.id = active_link.movie_id
+          WHERE active_link.actor_id = a.id
+            AND active_movie.lifecycle_state = 'active'
+        ))
       GROUP BY a.id
       ORDER BY a.created_at DESC, a.id DESC
-    ''', [includeArchived ? 1 : 0, gender, gender]);
+    ''', [includeArchived ? 1 : 0, gender, gender, unlinkedOnly ? 1 : 0]);
     final normalizedQuery = normalizeActorSearch(query);
     return rows
         .map(_mapActor)

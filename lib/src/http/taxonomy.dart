@@ -5,6 +5,7 @@ import '../artwork_service.dart';
 import '../config.dart';
 import '../fixture_library.dart';
 import '../library/taxonomy_transfer.dart';
+import '../library/tag_batch_repository.dart';
 import '../library_database.dart';
 import '../media_service.dart';
 
@@ -504,6 +505,40 @@ class NasTaxonomyHttpApi {
         request,
         _libraryDatabase.importTagTaxonomy(NasTagTaxonomyTransfer.decode(body)),
       );
+    } on FormatException {
+      await writeApiError(request, HttpStatus.badRequest, 'invalid_taxonomy');
+    }
+  }
+
+  Future<void> cleanupTags(HttpRequest request) async {
+    final body = await readApiJsonBody(request, maximumBytes: 1024);
+    if (body == null ||
+        body.length != 1 ||
+        !{'clearMovieLinks', 'deleteTags'}.contains(body['operation'])) {
+      return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      final result = body['operation'] == 'clearMovieLinks'
+          ? _libraryDatabase.clearMovieTagLinks()
+          : _libraryDatabase.deleteActiveTags();
+      await writeApiJson(request.response, HttpStatus.ok, {'data': result});
+    } on StateError {
+      await writeApiError(
+          request, HttpStatus.conflict, 'tag_taxonomy_conflict');
+    }
+  }
+
+  Future<void> associateMovieTags(HttpRequest request) async {
+    final body = await readApiJsonBody(request, maximumBytes: 2 * 1024 * 1024);
+    if (body == null ||
+        body['format'] != 'mujing-adult-tag-enrichment-review' ||
+        body['version'] != 1) {
+      return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    try {
+      final films = NasMovieTagAssociation.decode(body['films']);
+      final result = _libraryDatabase.associateMovieTags(films);
+      await writeApiJson(request.response, HttpStatus.ok, {'data': result});
     } on FormatException {
       await writeApiError(request, HttpStatus.badRequest, 'invalid_taxonomy');
     }

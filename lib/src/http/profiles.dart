@@ -29,8 +29,10 @@ class NasProfilesHttpApi {
     final parameters = request.uri.queryParameters;
     final gender = parameters['gender'];
     final includeArchived = parameters['includeArchived'] == 'true';
+    final unlinkedOnly = parameters['unlinkedOnly'] == 'true';
     final allowedGenders = const {'female', 'intersex', 'male'};
-    if (gender != null && !allowedGenders.contains(gender)) {
+    if ((gender != null && !allowedGenders.contains(gender)) ||
+        !nasIsValidFavoriteFilter(parameters['unlinkedOnly'])) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
     final page = int.tryParse(parameters['page'] ?? '1') ?? 0;
@@ -50,6 +52,7 @@ class NasProfilesHttpApi {
           query: parameters['q'] ?? '',
           gender: gender,
           includeArchived: includeArchived,
+          unlinkedOnly: unlinkedOnly,
         )
         .toList();
     actors.sort((left, right) => nasCompareActors(left, right, sort, order));

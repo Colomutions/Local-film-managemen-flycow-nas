@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import '../artwork_service.dart';
@@ -6,6 +7,8 @@ import '../config.dart';
 import '../fixture_library.dart';
 import '../library_database.dart';
 import '../media_service.dart';
+import '../disk_work_queue.dart';
+import '../library/collection_composition_repository.dart';
 
 import 'response.dart';
 import 'validation.dart';
@@ -20,11 +23,17 @@ class NasMoviesHttpApi {
     required this.config,
     required NasLibraryPresenter presenter,
     required NasArtworkService artworkService,
+    required bool Function(Set<String>) hasActivePlayback,
+    required DiskWorkQueue diskWork,
   })  : _libraryDatabase = libraryDatabase,
         _library = library,
         _mediaService = mediaService,
         _presenter = presenter,
-        _artworkService = artworkService;
+        _artworkService = artworkService,
+        _hasActivePlayback = hasActivePlayback,
+        _diskWork = diskWork;
+  final bool Function(Set<String>) _hasActivePlayback;
+  final DiskWorkQueue _diskWork;
   final NasLibraryDatabase _libraryDatabase;
   final NasConfig config;
   final NasLibraryPresenter _presenter;
@@ -33,7 +42,7 @@ class NasMoviesHttpApi {
   final NasMediaService _mediaService;
   final NasArtworkService _artworkService;
 
-  Future<void> movies(HttpRequest request) {
+  Future<void> movies(HttpRequest request, {bool favoriteOnly = false}) {
     final hasDatabaseLibrary =
         config.managedCategoryLibrary || _libraryDatabase.hasScannedMediaRoots;
     final parameters = request.uri.queryParameters;
@@ -43,7 +52,9 @@ class NasMoviesHttpApi {
     final sort = parameters['sort'] ?? 'title';
     final order = parameters['order'] ?? 'asc';
     final categoryId = parameters['categoryId'];
-    final isFavorite = nasFavoriteFilter(parameters['isFavorite']);
+    final isFavorite =
+        favoriteOnly ? true : nasFavoriteFilter(parameters['isFavorite']);
+    final missingActors = parameters['missingActors'] == 'true';
     final tagIds = parameters['tagIds']
         ?.split(',')
         .where((value) => value.isNotEmpty)
@@ -58,18 +69,22 @@ class NasMoviesHttpApi {
         !const {'title', 'updatedAt', 'durationMs', 'recent'}.contains(sort) ||
         !const {'asc', 'desc'}.contains(order) ||
         !nasIsValidFavoriteFilter(parameters['isFavorite']) ||
+        !nasIsValidFavoriteFilter(parameters['missingActors']) ||
         (hasDatabaseLibrary &&
             categoryId != null &&
             _libraryDatabase.findCategory(categoryId) == null) ||
         (!hasDatabaseLibrary &&
             (categoryId != null ||
-                isFavorite != null ||
+                (!favoriteOnly && isFavorite != null) ||
+                missingActors ||
                 (tagIds?.isNotEmpty ?? false) ||
                 (resolutions?.isNotEmpty ?? false)))) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
     if (!hasDatabaseLibrary) {
-      final items = _library.listMovies(query: query);
+      final items = favoriteOnly
+          ? const <Map<String, Object?>>[]
+          : _library.listMovies(query: query);
       final offset = (page - 1) * pageSize;
       final paged = offset >= items.length
           ? const <Map<String, Object?>>[]
@@ -88,6 +103,7 @@ class NasMoviesHttpApi {
       query: query,
       categoryId: categoryId,
       isFavorite: isFavorite,
+      missingActors: missingActors,
       resolutions: resolutions ?? const {},
       watchStates: const {},
       sort: sort,
@@ -219,6 +235,7 @@ class NasMoviesHttpApi {
     if (!hasDatabaseLibrary) {
       if (filter.hasEntityConditions ||
           filter.isFavorite != null ||
+          filter.missingActors ||
           filter.resolutions.isNotEmpty ||
           filter.watchStates.isNotEmpty ||
           filter.tagConditions.isNotEmpty) {
@@ -395,6 +412,7 @@ class NasMoviesHttpApi {
       );
       await writeApiJson(request.response, HttpStatus.ok, {
         'data': {
+          'sortMode': _libraryDatabase.collectionEpisodeSortMode(movieId),
           'items': result.items
               .map(_presenter.episodePayload)
               .toList(growable: false),
@@ -600,10 +618,14 @@ class NasMoviesHttpApi {
     if (body == null || body.keys.length != 1 || isFavorite is! bool) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
+    return setMovieFavorite(request,
+        movieId: request.uri.pathSegments[4], isFavorite: isFavorite);
+  }
+
+  Future<void> setMovieFavorite(HttpRequest request,
+      {required String movieId, required bool isFavorite}) async {
     final movie = _libraryDatabase.setMovieFavorite(
-      movieId: request.uri.pathSegments[4],
-      isFavorite: isFavorite,
-    );
+        movieId: movieId, isFavorite: isFavorite);
     if (movie == null) {
       return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
     }
@@ -713,6 +735,59 @@ class NasMoviesHttpApi {
     }
   }
 
+  Future<void> composeAdminMovies(HttpRequest request,
+      {required bool preview}) async {
+    final body = await readApiJsonBody(request, maximumBytes: 64 * 1024);
+    final ids = body?['movieIds'];
+    final source = body?['metadataSourceMovieId'];
+    final order = body?['episodeOrder'];
+    final token = body?['previewToken'];
+    final sortMode = body?['sortMode'] ?? 'automatic';
+    final allowed = {
+      'movieIds',
+      'metadataSourceMovieId',
+      if (!preview) ...['episodeOrder', 'previewToken', 'sortMode']
+    };
+    if (body == null ||
+        body.keys.any((k) => !allowed.contains(k)) ||
+        ids is! List ||
+        ids.any((id) => id is! String || id.isEmpty || id.length > 100) ||
+        source is! String ||
+        (!preview &&
+            (!const {'automatic', 'manual'}.contains(sortMode) ||
+                token is! String ||
+                token.length != 64 ||
+                order is! List ||
+                order.length > 500 ||
+                order.any((id) => id is! String)))) {
+      return writeApiError(request, 400, 'invalid_request');
+    }
+    try {
+      if (preview) {
+        final plan = await _libraryDatabase.previewMovieComposition(
+            movieIds: ids.cast<String>(), metadataSourceMovieId: source);
+        return await writeApiJson(request.response, 200, {'data': plan});
+      }
+      // Serialize with scans/imports, then revalidate the confirmed snapshot.
+      final movieId = await _diskWork.run(
+          'compose:${token as String}:$sortMode:${jsonEncode(order)}',
+          () => _libraryDatabase.composeMovies(
+              movieIds: ids.cast<String>(),
+              metadataSourceMovieId: source,
+              previewToken: token,
+              episodeOrder: (order as List).cast<String>(),
+              sortMode: sortMode as String,
+              hasActivePlayback: _hasActivePlayback));
+      await writeApiJson(request.response, 201, {
+        'data': {'movieId': movieId}
+      });
+    } on FormatException {
+      await writeApiError(request, 400, 'invalid_request');
+    } on NasCollectionCompositionConflict catch (error) {
+      await writeApiError(request, 409, error.code);
+    }
+  }
+
   Future<void> mergeAdminCollectionEpisodes(HttpRequest request) async {
     final body = await readApiJsonBody(request);
     final episodeIds = body?['episodeIds'];
@@ -725,11 +800,15 @@ class NasMoviesHttpApi {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
     final targetMovieId = request.uri.pathSegments[4];
-    if (!_libraryDatabase.mergeEpisodesIntoSeries(
-      targetMovieId: targetMovieId,
-      episodeIds: episodeIds.cast<String>(),
-      metadataSourceMovieId: metadataSourceMovieId,
-    )) {
+    final merged = await _diskWork.run(
+      'collection-merge:$targetMovieId:${jsonEncode(body)}',
+      () async => _libraryDatabase.mergeEpisodesIntoSeries(
+        targetMovieId: targetMovieId,
+        episodeIds: episodeIds.cast<String>(),
+        metadataSourceMovieId: metadataSourceMovieId,
+      ),
+    );
+    if (!merged) {
       return writeApiError(
           request, HttpStatus.conflict, 'collection_merge_conflict');
     }
@@ -749,9 +828,12 @@ class NasMoviesHttpApi {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
     final movieId = request.uri.pathSegments[4];
-    final movies = _libraryDatabase.splitEpisodesIntoSingles(
-      movieId: movieId,
-      episodeIds: episodeIds.cast<String>(),
+    final movies = await _diskWork.run(
+      'collection-split:$movieId:${jsonEncode(body)}',
+      () async => _libraryDatabase.splitEpisodesIntoSingles(
+        movieId: movieId,
+        episodeIds: episodeIds.cast<String>(),
+      ),
     );
     if (movies == null) {
       return writeApiError(
@@ -799,17 +881,27 @@ class NasMoviesHttpApi {
         metadataSourceMovieId is! String) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
-    final movie = _libraryDatabase.applyCollectionMigration(
-      key: key,
-      metadataSourceMovieId: metadataSourceMovieId,
-    );
-    if (movie == null) {
-      return writeApiError(
+    try {
+      final movie = await _diskWork.run(
+        'collection-migration:$key:${jsonEncode(body)}',
+        () => _libraryDatabase.applyCollectionMigration(
+          key: key,
+          metadataSourceMovieId: metadataSourceMovieId,
+        ),
+      );
+      if (movie == null) {
+        return await writeApiError(
+            request, HttpStatus.conflict, 'collection_migration_conflict');
+      }
+      await writeApiJson(request.response, HttpStatus.ok, {
+        'data': await _presenter.databaseDetails(movie),
+      });
+    } on NasCollectionCompositionConflict catch (error) {
+      await writeApiError(request, HttpStatus.conflict, error.code);
+    } on FormatException {
+      await writeApiError(
           request, HttpStatus.conflict, 'collection_migration_conflict');
     }
-    await writeApiJson(request.response, HttpStatus.ok, {
-      'data': await _presenter.databaseDetails(movie),
-    });
   }
 
   Future<void> renameAdminEpisodeSource(HttpRequest request) async {
@@ -825,14 +917,34 @@ class NasMoviesHttpApi {
     }
     final segments = request.uri.pathSegments;
     final episodeId = segments[segments.length - 2];
+    final result = await _diskWork.run(
+      'source-rename:$episodeId:${jsonEncode(sourceName)}',
+      () => _renameEpisodeSource(episodeId, sourceName),
+    );
+    if (result.error != null) {
+      return writeApiError(request, result.status, result.error!);
+    }
+    await writeApiJson(request.response, result.status, {'data': result.data});
+  }
+
+  Future<({int status, String? error, Map<String, Object?>? data})>
+      _renameEpisodeSource(String episodeId, String sourceName) async {
     final episode = _libraryDatabase.findEpisode(episodeId);
     if (episode == null) {
-      return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+      return (
+        status: HttpStatus.notFound,
+        error: 'resource_not_found',
+        data: null
+      );
     }
     NasMediaFile? renamed;
     final mediaRoot = _libraryDatabase.findMediaRoot(episode.mediaRootId);
     if (mediaRoot == null) {
-      return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+      return (
+        status: HttpStatus.notFound,
+        error: 'resource_not_found',
+        data: null
+      );
     }
     try {
       renamed = await _mediaService.renameFileInPlace(
@@ -852,18 +964,20 @@ class NasMoviesHttpApi {
       );
       if (updated == null)
         throw StateError('episode disappeared during rename');
-      await writeApiJson(request.response, HttpStatus.ok, {
-        'data': _presenter.adminEpisodePayload(updated),
-      });
+      return (
+        status: HttpStatus.ok,
+        error: null,
+        data: _presenter.adminEpisodePayload(updated)
+      );
     } on NasMediaRenameException catch (error) {
-      return writeApiError(
-        request,
-        error.code == 'source_name_conflict'
+      return (
+        status: error.code == 'source_name_conflict'
             ? HttpStatus.conflict
             : error.code == 'resource_not_found'
                 ? HttpStatus.notFound
                 : HttpStatus.badRequest,
-        error.code,
+        error: error.code,
+        data: null,
       );
     } on Object {
       if (renamed != null) {
@@ -875,16 +989,46 @@ class NasMoviesHttpApi {
               : mediaRoot.containerPath,
         );
       }
-      return writeApiError(request, HttpStatus.internalServerError,
-          'source_metadata_update_failed');
+      return (
+        status: HttpStatus.internalServerError,
+        error: 'source_metadata_update_failed',
+        data: null
+      );
     }
   }
 
-  Future<void> emptyItems(HttpRequest request) => writeApiJson(
-        request.response,
-        HttpStatus.ok,
-        {
-          'data': {'items': const []},
-        },
-      );
+  Future<void> setAdminCollectionEpisodeOrder(HttpRequest request) async {
+    final body = await readApiJsonBody(request, maximumBytes: 1024 * 1024);
+    final mode = body?['mode'];
+    final ids = body?['episodeIds'];
+    if (body == null ||
+        !const {'automatic', 'manual'}.contains(mode) ||
+        body.keys.any((key) => key != 'mode' && key != 'episodeIds') ||
+        (mode == 'automatic' && body.containsKey('episodeIds')) ||
+        (mode == 'manual' &&
+            (ids is! List ||
+                ids.isEmpty ||
+                ids.length > 10000 ||
+                ids.any(
+                    (id) => id is! String || id.isEmpty || id.length > 100)))) {
+      return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    final movieId = request.uri.pathSegments[4];
+    final saved = await _diskWork.run(
+      'episode-order:$movieId:${jsonEncode(body)}',
+      () async => _libraryDatabase.setCollectionEpisodeOrder(
+        movieId: movieId,
+        mode: mode as String,
+        episodeIds: mode == 'manual' ? (ids as List).cast<String>() : null,
+      ),
+    );
+    if (!saved) {
+      return writeApiError(
+          request, HttpStatus.conflict, 'collection_episode_order_conflict');
+    }
+    final movie = _libraryDatabase.findMovieForAdmin(movieId)!;
+    await writeApiJson(request.response, HttpStatus.ok, {
+      'data': await _presenter.databaseDetails(movie),
+    });
+  }
 }

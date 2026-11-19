@@ -58,6 +58,15 @@ Future<void> main() async {
       'duplicate jobs share result');
   check(await queue.run('after', () async => 4) == 4,
       'failed jobs do not poison queue');
+  try {
+    await queue.run<void>('failure', () async => throw StateError('expected'));
+    throw StateError('failed storage job unexpectedly succeeded');
+  } on StateError catch (error) {
+    check(error.message == 'expected', 'the caller receives the job error');
+  }
+  await queue.drain();
+  check(await queue.run('after-failure', () async => 5) == 5,
+      'a rejected job has no second unhandled error and queue continues');
 
   final root = await Directory.systemTemp.createTemp('mujing-io-test-');
   final media = Directory('${root.path}/media');

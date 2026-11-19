@@ -101,6 +101,49 @@ Future<void> main() async {
     _expect(carousel.bytes.toString() == _pngOne.toString(),
         'carousel returns uploaded bytes');
 
+    final movieDetail = await _request(
+        base, 'GET', '/api/v1/movies/${movie['id']}',
+        token: viewerToken);
+    final episodeId =
+        (movieDetail.json['data']['episodes'] as List).single['id'] as String;
+    final playback = await _request(base, 'POST', '/api/v1/playback/sessions',
+        token: viewerToken,
+        body: {'contentId': movie['id'], 'episodeId': episodeId});
+    final playbackPath =
+        '/api/v1/playback/sessions/${playback.json['data']['sessionId']}';
+    final screenshotPath = '$playbackPath/screenshot';
+    Future<_Response> screenshot(String token) =>
+        _request(base, 'POST', screenshotPath,
+            token: token, bytes: _pngTwo, contentType: 'image/png');
+    _expectError(await screenshot(viewerToken), HttpStatus.notFound,
+        'resource_not_found');
+    final stream =
+        await _request(base, 'GET', '$playbackPath/stream', token: viewerToken);
+    _expect(stream.statusCode == HttpStatus.ok, 'viewer requests media stream');
+    final started = await _request(base, 'POST', '$playbackPath/started',
+        token: viewerToken);
+    _expect(started.statusCode == HttpStatus.ok, 'viewer starts playback');
+    _expectError(await screenshot(adminToken), HttpStatus.notFound,
+        'resource_not_found');
+    final added = await screenshot(viewerToken);
+    _expect(added.statusCode == HttpStatus.created,
+        'viewer can add image for owned playback');
+    final screenshotUrl = added.json['data']['url'] as String;
+    final readScreenshot =
+        await _request(base, 'GET', screenshotUrl, token: viewerToken);
+    _expect(readScreenshot.bytes.toString() == _pngTwo.toString(),
+        'saved screenshot is readable');
+    final withScreenshot = await _request(
+        base, 'GET', '/api/v1/movies/${movie['id']}',
+        token: viewerToken);
+    _expect(
+        (withScreenshot.json['data']['carouselImages'] as List)
+            .any((image) => image['url'] == screenshotUrl),
+        'movie detail contains new screenshot');
+    await _request(base, 'DELETE', playbackPath, token: viewerToken);
+    _expectError(await screenshot(viewerToken), HttpStatus.notFound,
+        'resource_not_found');
+
     final replaced = await _request(base, 'POST', posterPath,
         token: adminToken, bytes: _pngTwo, contentType: 'image/png');
     _expect(replaced.statusCode == HttpStatus.ok, 'admin replaces poster');

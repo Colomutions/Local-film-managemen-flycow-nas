@@ -16,6 +16,8 @@ import 'library/queries_repository.dart';
 import 'library/scan_repository.dart';
 import 'library/schema_repository.dart';
 import 'library/taxonomy_repository.dart';
+import 'library/tag_batch_repository.dart';
+import 'library/collection_composition_repository.dart';
 import 'library/taxonomy_transfer.dart';
 import 'media_service.dart';
 import 'metadata_probe.dart';
@@ -32,7 +34,9 @@ String _normalizeCatalogNumber(String value) => normalizeCatalogNumber(value);
 class NasLibraryDatabase {
   static const currentSchemaVersion = NasSchemaRepository.currentSchemaVersion;
 
-  NasLibraryDatabase(this.dataDir);
+  NasLibraryDatabase(this.dataDir, {this.hasActivePlayback});
+
+  bool Function(Set<String>)? hasActivePlayback;
 
   late final _schema = NasSchemaRepository(() => _db);
 
@@ -43,6 +47,7 @@ class NasLibraryDatabase {
     findMovieForAdmin: findMovieForAdmin,
     mediaSourcesForCategory: mediaSourcesForCategory,
     transaction: transaction,
+    composeScannedMovies: _composeScannedMovies,
   );
 
   late final _queries = NasQueriesRepository(
@@ -88,7 +93,6 @@ class NasLibraryDatabase {
   late final _collections = NasCollectionsRepository(
     () => _db,
     episodeGrouping: _episodeGrouping,
-    movieIdForScannedEpisode: _movieIdForScannedEpisode,
     carouselImagesForMovie: carouselImagesForMovie,
     findCategory: findCategory,
     findMovieForAdmin: findMovieForAdmin,
@@ -104,6 +108,20 @@ class NasLibraryDatabase {
     listMediaRoots: listMediaRoots,
     transaction: transaction,
   );
+
+  late final _tagBatch =
+      NasTagBatchRepository(() => _db, transaction: transaction);
+
+  Map<String, Object?> clearMovieTagLinks() => _tagBatch.clearMovieLinks();
+
+  Map<String, Object?> deleteActiveTags() {
+    final violations = _taxonomy.taxonomyViolations();
+    if (violations.isNotEmpty) throw StateError(violations.join('\n'));
+    return _tagBatch.deleteActiveTags();
+  }
+
+  Map<String, Object?> associateMovieTags(List<NasMovieTagAssociation> films) =>
+      _tagBatch.associateMovies(films);
 
   late final _playback = NasPlaybackRepository(() => _db);
 
@@ -264,14 +282,6 @@ class NasLibraryDatabase {
           mediaRootId: mediaRootId,
           mediaService: mediaService,
           metadataProbe: metadataProbe);
-
-  String _movieIdForScannedEpisode({
-    required String categoryId,
-    required String? collectionKey,
-    required String title,
-  }) =>
-      _scan.movieIdForScannedEpisode(
-          categoryId: categoryId, collectionKey: collectionKey, title: title);
 
   EpisodeGrouping _episodeGrouping(String path) => _scan.episodeGrouping(path);
 
@@ -451,9 +461,13 @@ class NasLibraryDatabase {
     String query = '',
     String? gender,
     bool includeArchived = false,
+    bool unlinkedOnly = false,
   }) =>
       _profiles.listActors(
-          query: query, gender: gender, includeArchived: includeArchived);
+          query: query,
+          gender: gender,
+          includeArchived: includeArchived,
+          unlinkedOnly: unlinkedOnly);
 
   NasActor? findActor(String actorId) => _profiles.findActor(actorId);
 
@@ -740,6 +754,17 @@ class NasLibraryDatabase {
   List<NasLibraryEpisode> episodesForMovie(String movieId) =>
       _queries.episodesForMovie(movieId);
 
+  String collectionEpisodeSortMode(String movieId) =>
+      _collections.episodeSortMode(movieId);
+
+  bool setCollectionEpisodeOrder({
+    required String movieId,
+    required String mode,
+    List<String>? episodeIds,
+  }) =>
+      _collections.setEpisodeOrder(
+          movieId: movieId, mode: mode, episodeIds: episodeIds);
+
   NasEpisodePage episodePageForMovie({
     required String movieId,
     String query = '',
@@ -767,6 +792,64 @@ class NasLibraryDatabase {
   }) =>
       _collections.createEmptySeries(title: title, categoryId: categoryId);
 
+  late final _composition =
+      NasCollectionCompositionRepository(() => _db, transaction: transaction);
+
+  List<Map<String, Object?>> compositionSourcesForMovie(String movieId) =>
+      _composition.sourcesForMovie(movieId);
+
+  Future<Map<String, Object?>> previewMovieComposition({
+    required List<String> movieIds,
+    required String metadataSourceMovieId,
+  }) =>
+      _composition.preview(
+          movieIds: movieIds,
+          metadataSourceMovieId: metadataSourceMovieId,
+          dataDir: dataDir);
+
+  Future<String> composeMovies({
+    required List<String> movieIds,
+    required String metadataSourceMovieId,
+    required String previewToken,
+    required List<String> episodeOrder,
+    String sortMode = 'automatic',
+    String? scannedTitle,
+    bool automaticGrouping = false,
+    required bool Function(Set<String>) hasActivePlayback,
+  }) =>
+      _composition.compose(
+          movieIds: movieIds,
+          metadataSourceMovieId: metadataSourceMovieId,
+          previewToken: previewToken,
+          episodeOrder: episodeOrder,
+          sortMode: sortMode,
+          scannedTitle: scannedTitle,
+          automaticGrouping: automaticGrouping,
+          dataDir: dataDir,
+          hasActivePlayback: hasActivePlayback);
+
+  /// 扫描和旧数据迁移共用完整影片合并规则，保留各来源的关系、截图与记录。
+  Future<String> _composeScannedMovies({
+    required List<String> movieIds,
+    required String metadataSourceMovieId,
+    String? scannedTitle,
+    bool automaticGrouping = true,
+  }) async {
+    final plan = await previewMovieComposition(
+        movieIds: movieIds, metadataSourceMovieId: metadataSourceMovieId);
+    return composeMovies(
+        movieIds: movieIds,
+        metadataSourceMovieId: metadataSourceMovieId,
+        previewToken: plan['previewToken'] as String,
+        episodeOrder: (plan['episodes'] as List<Map<String, Object?>>)
+            .map((episode) => episode['id'] as String)
+            .toList(growable: false),
+        scannedTitle:
+            hasDefaultScannedTitle(metadataSourceMovieId) ? scannedTitle : null,
+        automaticGrouping: automaticGrouping,
+        hasActivePlayback: hasActivePlayback ?? (_) => false);
+  }
+
   bool mergeEpisodesIntoSeries({
     required String targetMovieId,
     required List<String> episodeIds,
@@ -787,12 +870,38 @@ class NasLibraryDatabase {
   List<NasCollectionMigrationCandidate> collectionMigrationPreview() =>
       _collections.collectionMigrationPreview();
 
-  NasLibraryMovie? applyCollectionMigration({
+  Future<NasLibraryMovie?> applyCollectionMigration({
     required String key,
     required String metadataSourceMovieId,
-  }) =>
-      _collections.applyCollectionMigration(
-          key: key, metadataSourceMovieId: metadataSourceMovieId);
+  }) async {
+    final candidate = collectionMigrationPreview()
+        .where((item) => item.key == key)
+        .firstOrNull;
+    if (candidate == null ||
+        !candidate.sourceMovieIds.contains(metadataSourceMovieId)) return null;
+    final episodeIds = candidate.episodeIds.toSet();
+    final actualEpisodes = candidate.sourceMovieIds
+        .expand(episodesForMovie)
+        .map((episode) => episode.id)
+        .toSet();
+    if (actualEpisodes.length != episodeIds.length ||
+        !actualEpisodes.containsAll(episodeIds)) return null;
+    if (candidate.sourceMovieIds.length == 1) {
+      if (hasActivePlayback?.call({metadataSourceMovieId}) ?? false) {
+        throw const NasCollectionCompositionConflict(
+            'collection_playback_active');
+      }
+      transaction(() => _db.execute('''UPDATE movies
+        SET entry_type='series',updated_at=? WHERE id=?''',
+          [now(), metadataSourceMovieId]));
+      return findMovieForAdmin(metadataSourceMovieId);
+    }
+    final targetId = await _composeScannedMovies(
+        movieIds: candidate.sourceMovieIds,
+        metadataSourceMovieId: metadataSourceMovieId,
+        automaticGrouping: true);
+    return findMovieForAdmin(targetId);
+  }
 
   NasLibraryEpisode? findEpisode(String episodeId) =>
       _queries.findEpisode(episodeId);

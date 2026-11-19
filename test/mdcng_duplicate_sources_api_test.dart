@@ -16,7 +16,9 @@ Future<void> main() async {
   String mediaPath(String path) =>
       '${media.path}${Platform.pathSeparator}${path.replaceAll('/', Platform.pathSeparator)}';
   final oldVideo = File(mediaPath('disk1/av/PGD/PGD-889/PGD-889.avi'));
-  final newVideo = File(mediaPath('disk2/AV/PGD/PGD-889/pgd-889.avi'));
+  // Different work directories retain separate entries. Matching complete
+  // work-directory paths now intentionally share one movie across disks.
+  final newVideo = File(mediaPath('disk2/AV/PGD/PGD-889-other/pgd-889.avi'));
   await oldVideo.parent.create(recursive: true);
   await oldVideo.writeAsBytes([1, 2, 3]);
   await newVideo.parent.create(recursive: true);
@@ -106,7 +108,7 @@ Future<void> main() async {
         unavailable['movieId'] == oldMovie.id &&
             matching['movieId'] == newMovie.id &&
             matching['sourceName'] == 'disk2' &&
-            matching['relativePath'] == 'AV/PGD/PGD-889/pgd-889.avi',
+            matching['relativePath'] == 'AV/PGD/PGD-889-other/pgd-889.avi',
         '问题旧记录列出同分类同文件名的 disk2 记录，忽略文件名大小写');
     final batch = await request(base, 'POST', '/api/v1/admin/mdcng-import-jobs',
         token: token, body: {'categoryId': categoryId});

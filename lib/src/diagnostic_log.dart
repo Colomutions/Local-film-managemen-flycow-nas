@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -18,22 +19,65 @@ class NasStdoutLogSink implements NasLogSink {
 }
 
 class NasRotatingFileLogSink implements NasLogSink {
-  NasRotatingFileLogSink(this.directory, {this.maxBytes = 2 * 1024 * 1024, this.retentionFiles = 3});
+  NasRotatingFileLogSink(this.directory,
+      {this.maxBytes = 2 * 1024 * 1024,
+      this.retentionFiles = 3,
+      this.flushInterval = const Duration(milliseconds: 250),
+      this.maxBatchBytes = 64 * 1024});
 
   final Directory directory;
   final int maxBytes;
   final int retentionFiles;
+  final Duration flushInterval;
+  final int maxBatchBytes;
   Future<void> _tail = Future<void>.value();
+  final List<String> _pending = [];
+  int _pendingBytes = 0;
+  Completer<void>? _pendingCompletion;
+  Timer? _timer;
 
   @override
   Future<void> write(String line) {
-    _tail = _tail.then((_) => _write(line)).catchError((_) {});
-    return _tail;
+    final bytes = utf8.encode(line).length + 1;
+    final limit = min(maxBatchBytes, maxBytes);
+    if (_pending.isNotEmpty && _pendingBytes + bytes > limit) {
+      unawaited(flush().catchError((_) {}));
+    }
+    final completion = _pendingCompletion ??= Completer<void>();
+    _pending.add(line);
+    _pendingBytes += bytes;
+    if (_pendingBytes >= limit || line.contains('"level":"ERROR"')) {
+      unawaited(flush().catchError((_) {}));
+    } else {
+      _timer ??= Timer(flushInterval, () {
+        unawaited(flush().catchError((_) {}));
+      });
+    }
+    return completion.future;
+  }
+
+  Future<void> flush() {
+    _timer?.cancel();
+    _timer = null;
+    if (_pending.isEmpty) return _tail;
+    final lines = _pending.join('\n');
+    final completion = _pendingCompletion!;
+    _pending.clear();
+    _pendingBytes = 0;
+    _pendingCompletion = null;
+    final result = _tail.then((_) => _write(lines));
+    // A failed write must not prevent the next batch from being attempted.
+    _tail = result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    unawaited(result.then<void>((_) => completion.complete(),
+        onError: (Object error, StackTrace stack) =>
+            completion.completeError(error, stack)));
+    return result;
   }
 
   Future<void> _write(String line) async {
     await directory.create(recursive: true);
-    final file = File('${directory.path}${Platform.pathSeparator}mujing-nas.jsonl');
+    final file =
+        File('${directory.path}${Platform.pathSeparator}mujing-nas.jsonl');
     final bytes = utf8.encode('$line\n');
     if (await file.exists() && await file.length() + bytes.length > maxBytes) {
       for (var index = retentionFiles - 1; index >= 1; index--) {
@@ -75,22 +119,36 @@ class NasDiagnosticLogger {
   int _pendingWrites = 0;
   final Map<String, (DateTime, int)> _warningBursts = {};
 
-  factory NasDiagnosticLogger.forConfig(String dataDir, {
+  Future<void> flush() async {
+    final sink = _fileSink;
+    if (sink is NasRotatingFileLogSink) {
+      try {
+        await sink.flush();
+      } catch (_) {
+        failures++;
+      }
+    }
+  }
+
+  factory NasDiagnosticLogger.forConfig(
+    String dataDir, {
     required String minimumLevel,
     required bool diagnosticMode,
     required int maxBytes,
     required int retentionFiles,
-  }) => NasDiagnosticLogger(
-    minimumLevel: minimumLevel,
-    diagnosticMode: diagnosticMode,
-    fileSink: NasRotatingFileLogSink(
-      Directory('$dataDir${Platform.pathSeparator}logs'),
-      maxBytes: maxBytes,
-      retentionFiles: retentionFiles,
-    ),
-  );
+  }) =>
+      NasDiagnosticLogger(
+        minimumLevel: minimumLevel,
+        diagnosticMode: diagnosticMode,
+        fileSink: NasRotatingFileLogSink(
+          Directory('$dataDir${Platform.pathSeparator}logs'),
+          maxBytes: maxBytes,
+          retentionFiles: retentionFiles,
+        ),
+      );
 
-  String newId(String prefix) => '$prefix-${List<String>.generate(12, (_) => _alphabet[_random.nextInt(_alphabet.length)]).join()}';
+  String newId(String prefix) =>
+      '$prefix-${List<String>.generate(12, (_) => _alphabet[_random.nextInt(_alphabet.length)]).join()}';
 
   void event(
     String event, {
@@ -105,15 +163,18 @@ class NasDiagnosticLogger {
     try {
       var suppressed = 0;
       if (level == 'WARN' && event == 'http.response.end') {
-        final key = '${fields['method']}:${fields['route']}:${fields['status']}';
+        final key =
+            '${fields['method']}:${fields['route']}:${fields['status']}';
         final previous = _warningBursts[key];
         final now = _now();
-        if (previous != null && now.difference(previous.$1) < const Duration(seconds: 30)) {
+        if (previous != null &&
+            now.difference(previous.$1) < const Duration(seconds: 30)) {
           _warningBursts[key] = (previous.$1, previous.$2 + 1);
           return;
         }
         suppressed = previous?.$2 ?? 0;
-        if (_warningBursts.length >= 256) _warningBursts.remove(_warningBursts.keys.first);
+        if (_warningBursts.length >= 256)
+          _warningBursts.remove(_warningBursts.keys.first);
         _warningBursts[key] = (now, 0);
       }
       final record = <String, Object?>{
@@ -207,6 +268,7 @@ String nasShortId(String? value) {
 String nasRouteTemplate(String path) {
   final segments = path.split('/');
   return segments
-      .map((segment) => RegExp(r'^[0-9a-fA-F-]{8,}$').hasMatch(segment) ? ':id' : segment)
+      .map((segment) =>
+          RegExp(r'^[0-9a-fA-F-]{8,}$').hasMatch(segment) ? ':id' : segment)
       .join('/');
 }

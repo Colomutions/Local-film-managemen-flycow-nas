@@ -190,7 +190,12 @@ class NasScrapeService {
       throw NasScrapeException('unavailable', '需要更新包含内置刮削组件的 NAS 镜像');
     final kind = body['kind'];
     if (!['movies', 'actors'].contains(kind)) throw ArgumentError('任务类型无效');
-    for (final key in ['refresh', 'movieImages', 'filmography', 'supplementOnly']) {
+    for (final key in [
+      'refresh',
+      'movieImages',
+      'filmography',
+      'supplementOnly'
+    ]) {
       if (body[key] != null && body[key] is! bool)
         throw ArgumentError('采集选项无效');
     }
@@ -246,7 +251,9 @@ class NasScrapeService {
           database.enqueueScrapeTask(
               [job],
               'movie',
-              supplement ? 'supplement:$id' : 'movie:$id:${options['movieImages']}:$gallery',
+              supplement
+                  ? 'supplement:$id'
+                  : 'movie:$id:${options['movieImages']}:$gallery',
               {'movieId': id, 'name': movie.title, ...options},
               refresh: refresh || needsPoster || supplement);
         }
@@ -335,7 +342,8 @@ class NasScrapeService {
         payload['code'] =
             database.scrapeMovieCode(payload['movieId'] as String);
         if (payload['supplementOnly'] == true) {
-          payload['movieImages'] = await _needsSupplementGallery(payload['movieId'] as String);
+          payload['movieImages'] =
+              await _needsSupplementGallery(payload['movieId'] as String);
           payload['galleryOnly'] = true;
         }
       }
@@ -499,7 +507,8 @@ class NasScrapeService {
       database.transaction(() {
         database.saveScrapeMovieProfile(movieId, {
           ...metadata,
-          'actorSources': entities.where((entity) => entity['kind'] == 'actor').toList(),
+          'actorSources':
+              entities.where((entity) => entity['kind'] == 'actor').toList(),
         });
         conflicts.addAll(database.applyScrapeFields('movie', movieId, fields,
             overwrite: overwrite));
@@ -545,8 +554,11 @@ class NasScrapeService {
         final file = await _saveImage(
             Map<String, dynamic>.from(entry.value as Map), 'gallery', movieId);
         database.addScrapeGallery(movieId, file);
-        final image = database.carouselImagesForMovie(movieId).singleWhere((i) => i.fileName == file);
-        database.recordGalleryOrigin(image.id, entry.key == 'cover' ? 'whatsav_cover' : 'whatsav_screenshot');
+        final image = database
+            .carouselImagesForMovie(movieId)
+            .singleWhere((i) => i.fileName == file);
+        database.recordGalleryOrigin(image.id,
+            entry.key == 'cover' ? 'whatsav_cover' : 'whatsav_screenshot');
       }
       return conflicts;
     }
@@ -585,9 +597,11 @@ class NasScrapeService {
           };
     final image =
         (result['assets'] as Map?)?[kind == 'actor' ? 'avatar' : 'logo'];
-    if (image is Map && !(kind == 'actor' && database.actorHasMdcngSource(entityId) &&
-        database.findActor(entityId)!.photoAssetId != null &&
-        !overwrite.contains('photo_asset_id'))) {
+    if (image is Map &&
+        !(kind == 'actor' &&
+            database.actorHasMdcngSource(entityId) &&
+            database.findActor(entityId)!.photoAssetId != null &&
+            !overwrite.contains('photo_asset_id'))) {
       final asset = await _saveImage(
           Map<String, dynamic>.from(image), sourceKind, entityId);
       values[kind == 'actor' ? 'photo_asset_id' : 'logo_asset_id'] = asset;
@@ -627,20 +641,34 @@ class NasScrapeService {
   }
 
   /// 重名保留为可审核结果，不让单个演员阻止影片其它字段保存。
-  String? _resolveEntity(Map<String, dynamic> entity, List<Map<String, dynamic>> conflicts) {
+  String? _resolveEntity(
+      Map<String, dynamic> entity, List<Map<String, dynamic>> conflicts) {
     try {
       return database.scrapeEntity(entity);
     } on ArgumentError catch (error) {
       conflicts.add({
-        'field': 'identity', 'proposed': entity['name'], 'current': null,
+        'field': 'identity',
+        'proposed': entity['name'],
+        'current': null,
         'message': error.message.toString(),
         if (entity['kind'] == 'actor' && entity['provisional'] != true) ...{
-          'sourceKey': entity['id'], 'sourceUrl': entity['url'],
-          'candidates': database.findActorsByExactNames([
-            entity['name'] as String,
-            ...List<String>.from(entity['aliases'] as List? ?? const []),
-          ]).map((actor) => {'id': actor.id, 'name': actor.stageName ?? actor.originalName ?? actor.translatedName ?? '未命名演员',
-              'originalName': actor.originalName, 'movieCount': actor.movieCount}).toList(),
+          'sourceKey': entity['id'],
+          'sourceUrl': entity['url'],
+          'candidates': database
+              .findActorsByExactNames([
+                entity['name'] as String,
+                ...List<String>.from(entity['aliases'] as List? ?? const []),
+              ])
+              .map((actor) => {
+                    'id': actor.id,
+                    'name': actor.stageName ??
+                        actor.originalName ??
+                        actor.translatedName ??
+                        '未命名演员',
+                    'originalName': actor.originalName,
+                    'movieCount': actor.movieCount
+                  })
+              .toList(),
         },
       });
       return null;
@@ -700,9 +728,10 @@ class NasScrapeService {
     return assetId;
   }
 
-  Future<Map<String, dynamic>> resolve(
-      String taskId, List<String> fields, {Map<String, String> actorMappings = const {}}) async {
-    database.resolveScrapeConflicts(taskId, fields, actorMappings: actorMappings);
+  Future<Map<String, dynamic>> resolve(String taskId, List<String> fields,
+      {Map<String, String> actorMappings = const {}}) async {
+    database.resolveScrapeConflicts(taskId, fields,
+        actorMappings: actorMappings);
     return database.scrapeTask(taskId)!;
   }
 
@@ -713,19 +742,26 @@ class NasScrapeService {
     final images = database.carouselImagesForMovie(movieId);
     if (images.isEmpty) return true;
     final poster = await artwork.poster(movie.posterFileName);
-    final posterHash = poster == null ? null : sha256.convert(await poster.file.readAsBytes()).toString();
+    final posterHash = poster == null
+        ? null
+        : sha256.convert(await poster.file.readAsBytes()).toString();
     for (final image in images) {
-      if (const {'mdcng_cover', 'whatsav_cover'}.contains(database.galleryOrigin(image.id))) continue;
+      if (const {'mdcng_cover', 'whatsav_cover'}
+          .contains(database.galleryOrigin(image.id))) continue;
       final file = await artwork.carouselImage(image.fileName);
-      if (posterHash != null && file != null &&
-          sha256.convert(await file.file.readAsBytes()).toString() == posterHash) continue;
+      if (posterHash != null &&
+          file != null &&
+          sha256.convert(await file.file.readAsBytes()).toString() ==
+              posterHash) continue;
       return false;
     }
     return true;
   }
 
-  Future<List<Map<String, dynamic>>> _applySupplement(String movieId,
-      Map<String, dynamic> payload, Map<String, dynamic> result,
+  Future<List<Map<String, dynamic>>> _applySupplement(
+      String movieId,
+      Map<String, dynamic> payload,
+      Map<String, dynamic> result,
       List<Map<String, dynamic>> entities) async {
     final metadata = result['metadata'] as Map;
     if (metadata['code'] != payload['code']) throw ArgumentError('来源番号不一致，请核对');
@@ -737,7 +773,9 @@ class NasScrapeService {
       try {
         // 只读取异名线索，不创建档案，不下载头像，不采集作品列表。
         final profile = await worker.execute({
-          'type': 'actor', 'url': entity['url'], 'identityOnly': true,
+          'type': 'actor',
+          'url': entity['url'],
+          'identityOnly': true,
           'minIntervalSeconds': database.scrapeSettings['minIntervalSeconds'],
           'maxIntervalSeconds': database.scrapeSettings['maxIntervalSeconds'],
         });
@@ -748,56 +786,78 @@ class NasScrapeService {
           ...List<String>.from(details['aliases'] as List? ?? []),
         }.toList();
       } on NasScrapeException catch (error) {
-        if (['cancelled', 'limited', 'blocked', 'redirect'].contains(error.code)) rethrow;
-        result['warnings'] = [...?result['warnings'] as List?, '${entity['name']}：异名读取失败，可手动关联'];
+        if (['cancelled', 'limited', 'blocked', 'redirect']
+            .contains(error.code)) rethrow;
+        result['warnings'] = [
+          ...?result['warnings'] as List?,
+          '${entity['name']}：异名读取失败，可手动关联'
+        ];
       }
     }
-    if (database.findMovieForAdmin(movieId) == null || database.scrapeMovieCode(movieId) != payload['code']) {
+    if (database.findMovieForAdmin(movieId) == null ||
+        database.scrapeMovieCode(movieId) != payload['code']) {
       throw ArgumentError('影片已移除或番号已变更');
     }
     database.transaction(() {
-      database.saveSupplementCast(movieId, entities.where((e) => e['kind'] == 'actor').toList());
-      database.reconcileSupplementCast(movieId: movieId);
+      database.saveSupplementCast(
+          movieId, entities.where((e) => e['kind'] == 'actor').toList());
+      // 补全任务由用户主动发起：已有非空的人工演员名单允许追加候选，
+      // 但明确清空的名单以及已隐藏的归并来源仍由冻结策略拦截。
+      database.reconcileSupplementCast(
+          movieId: movieId, allowDirectNonEmptyManual: true);
       database.supplementSummary(movieId, metadata['summary'] as String?);
     });
     final pending = database.supplementPending(movieId);
     // 同一批图片一起提交；重试时可继续下载失败项，但不追加到已有实际截图。
     if (!await _needsSupplementGallery(movieId)) return pending;
-    if ((result['warnings'] as List? ?? []).any((warning) => warning.toString().startsWith('gallery-'))) {
+    if ((result['warnings'] as List? ?? [])
+        .any((warning) => warning.toString().startsWith('gallery-'))) {
       return pending;
     }
-    final before = database.carouselImagesForMovie(movieId).map((i) => i.id).toSet();
+    final before =
+        database.carouselImagesForMovie(movieId).map((i) => i.id).toSet();
     final hashes = <String>{};
     final movie = database.findMovieForAdmin(movieId)!;
     final poster = await artwork.poster(movie.posterFileName);
-    if (poster != null) hashes.add(sha256.convert(await poster.file.readAsBytes()).toString());
+    if (poster != null)
+      hashes.add(sha256.convert(await poster.file.readAsBytes()).toString());
     for (final image in database.carouselImagesForMovie(movieId)) {
       final file = await artwork.carouselImage(image.fileName);
-      if (file != null) hashes.add(sha256.convert(await file.file.readAsBytes()).toString());
+      if (file != null)
+        hashes.add(sha256.convert(await file.file.readAsBytes()).toString());
     }
     final files = <String>[];
     try {
       for (final entry in (result['assets'] as Map? ?? {}).entries) {
-        if (!(entry.key as String).startsWith('gallery-') || entry.value is! Map) continue;
+        if (!(entry.key as String).startsWith('gallery-') ||
+            entry.value is! Map) continue;
         final asset = Map<String, dynamic>.from(entry.value as Map);
         if (hashes.contains(asset['sha256'])) continue;
         files.add(await _saveImage(asset, 'gallery', movieId));
         hashes.add(asset['sha256'] as String);
       }
-      if (database.findMovieForAdmin(movieId) == null || database.scrapeMovieCode(movieId) != payload['code']) {
+      if (database.findMovieForAdmin(movieId) == null ||
+          database.scrapeMovieCode(movieId) != payload['code']) {
         throw ArgumentError('影片已移除或番号已变更');
       }
-      final current = database.carouselImagesForMovie(movieId).map((i) => i.id).toSet();
-      if (before.length != current.length || !before.containsAll(current)) return pending;
+      final current =
+          database.carouselImagesForMovie(movieId).map((i) => i.id).toSet();
+      if (before.length != current.length || !before.containsAll(current))
+        return pending;
       database.transaction(() {
         for (final file in files) {
           database.addScrapeGallery(movieId, file);
-          final image = database.carouselImagesForMovie(movieId).singleWhere((i) => i.fileName == file);
+          final image = database
+              .carouselImagesForMovie(movieId)
+              .singleWhere((i) => i.fileName == file);
           database.recordGalleryOrigin(image.id, 'whatsav_screenshot');
         }
       });
     } finally {
-      final used = database.carouselImagesForMovie(movieId).map((i) => i.fileName).toSet();
+      final used = database
+          .carouselImagesForMovie(movieId)
+          .map((i) => i.fileName)
+          .toSet();
       for (final file in files.where((f) => !used.contains(f))) {
         await artwork.deleteCarouselImage(file);
       }

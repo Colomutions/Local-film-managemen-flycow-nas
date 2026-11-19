@@ -342,6 +342,18 @@ class NasQueriesRepository {
 
     addIdSetClause('m.category_id', filter.effectiveCategoryIds);
     addIdSetClause('m.series_id', filter.seriesIds);
+    if (filter.missingActors) {
+      clauses.add('''NOT EXISTS (
+        SELECT 1 FROM movie_actor_links linked_actor
+        WHERE linked_actor.movie_id = m.id
+      )''');
+      // AI 的归档状态不改变已有影片关联的含义，只识别名称恰好为 AI 的标签。
+      clauses.add('''NOT EXISTS (
+        SELECT 1 FROM movie_tag_links ai_link
+        JOIN tags ai_tag ON ai_tag.id = ai_link.tag_id
+        WHERE ai_link.movie_id = m.id AND ai_tag.normalized_name = 'ai'
+      )''');
+    }
     if (filter.publisherIds.isNotEmpty) {
       final ids = filter.publisherIds.toList()..sort();
       final placeholders = List.filled(ids.length, '?').join(',');
@@ -581,13 +593,15 @@ class NasQueriesRepository {
 
   bool hasDefaultScannedTitle(String movieId) {
     final rows = _db.select('''
-      SELECT m.title, m.entry_type, m.collection_key,
+      SELECT m.title, m.entry_type, m.collection_key, m.scanned_title,
              (SELECT e.relative_path FROM episodes e
               WHERE e.movie_id = m.id ORDER BY e.id LIMIT 1) AS relative_path
       FROM movies m WHERE m.id = ?
     ''', [movieId]);
     if (rows.isEmpty) return false;
     final row = rows.single;
+    if (row['scanned_title'] != null)
+      return row['title'] == row['scanned_title'];
     final collectionKey = row['collection_key'] as String?;
     if (collectionKey != null) {
       final folder = collectionKey

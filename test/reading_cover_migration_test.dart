@@ -26,7 +26,7 @@ Future<void> main() async {
         novels
                 .select('SELECT MAX(version) AS n FROM schema_migrations')
                 .single['n'] ==
-            35,
+            NasSchemaRepository.currentSchemaVersion,
         'migration records version');
     NasSchemaRepository(() => novels).migrate();
 

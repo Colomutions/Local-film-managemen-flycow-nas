@@ -53,7 +53,11 @@ class DiskWorkQueue {
     final result = _tail.then((_) => action());
     _pending[key] = result;
     _tail = result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
-    unawaited(_tail.then((_) => _pending.remove(key)));
+    unawaited(_tail.then((_) {
+      // Do not return the removed Future: then() would adopt a failed job a
+      // second time and emit an unhandled error after its caller handled it.
+      _pending.remove(key);
+    }));
     return result;
   }
 

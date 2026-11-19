@@ -24,7 +24,8 @@ class NasMoviesRepository {
     required String movieId,
     required bool isFavorite,
   }) {
-    if (findMovie(movieId) == null) return null;
+    final movie = findMovie(movieId);
+    if (movie == null || movie.isFavorite == isFavorite) return movie;
     _db.execute(
       'UPDATE movies SET is_favorite = ?, updated_at = ? WHERE id = ?',
       [isFavorite ? 1 : 0, now(), movieId],
@@ -57,6 +58,9 @@ class NasMoviesRepository {
     _db.execute("DELETE FROM scrape_fields WHERE kind='movie' AND entity_id=?",
         [movieId]);
     _db.execute("DELETE FROM scrape_sources WHERE kind='movie' AND entity_id=?",
+        [movieId]);
+    _db.execute(
+        'DELETE FROM composition_actor_append_policies WHERE movie_id=?',
         [movieId]);
     _db.execute('DELETE FROM movies WHERE id = ?', [movieId]);
     return NasRemovedMovieIndex(
@@ -163,13 +167,14 @@ class NasMoviesRepository {
       _db.execute(
         '''UPDATE episodes
            SET relative_path = ?, title = ?, file_size = ?, media_modified_at = ?,
-               is_available = 1, updated_at = ?
+               is_available = 1, natural_sort_key = ?, updated_at = ?
            WHERE id = ?''',
         [
           relativePath,
           title,
           fileSize,
           mediaModifiedAt,
+          naturalSortKey(relativePath),
           now(),
           episodeId,
         ],

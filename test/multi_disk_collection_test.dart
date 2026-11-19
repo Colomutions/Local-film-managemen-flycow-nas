@@ -400,7 +400,7 @@ Future<void> main() async {
       !singleEpisodeMigration.requiresMetadataChoice,
       '单文件迁移不需要在多个资料来源之间选择',
     );
-    final migratedSingleEpisode = database.applyCollectionMigration(
+    final migratedSingleEpisode = await database.applyCollectionMigration(
       key: singleEpisodeMigration.key,
       metadataSourceMovieId: singleEpisodeMigration.sourceMovieIds.single,
     );

@@ -4,9 +4,23 @@ import 'dart:io';
 
 import '../library/taxonomy_transfer.dart';
 
-Future<Map<String, dynamic>?> readApiJsonBody(HttpRequest request) async {
+Future<Map<String, dynamic>?> readApiJsonBody(HttpRequest request,
+    {int? maximumBytes}) async {
   try {
-    final value = jsonDecode(await utf8.decoder.bind(request).join());
+    final String text;
+    if (maximumBytes == null) {
+      text = await utf8.decoder.bind(request).join();
+    } else {
+      var length = 0;
+      final bytes = <int>[];
+      await for (final chunk in request) {
+        length += chunk.length;
+        if (length <= maximumBytes) bytes.addAll(chunk);
+      }
+      if (length > maximumBytes) return null;
+      text = utf8.decode(bytes);
+    }
+    final value = jsonDecode(text);
     if (value is! Map) return null;
     return value.map((key, value) => MapEntry(key.toString(), value));
   } on FormatException {
@@ -29,6 +43,11 @@ Future<void> writeApiError(HttpRequest request, int statusCode, String code) {
     'authentication_required': 'A valid device token is required.',
     'insufficient_scope': 'This device does not have the required scope.',
     'invalid_request': 'The request is invalid.',
+    'collection_selection_changed': '参与影片的资料或分集已变化，请重新预览。',
+    'collection_category_mismatch': '只能合并同一分类的影片。',
+    'collection_episode_limit': '每部影片至少需要一个分集，合计不能超过 500 个分集。',
+    'collection_playback_active': '参与影片正在播放或预览，请先停止播放。',
+    'collection_task_active': '参与影片有未完成的采集或资料任务，请待任务结束。',
     'invalid_taxonomy': 'The taxonomy definition file is invalid.',
     'invalid_profile_package': '资料包格式或内容不合法。',
     'profile_package_failed': '资料包生成失败。',

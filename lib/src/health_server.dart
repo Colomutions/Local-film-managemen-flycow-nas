@@ -78,7 +78,10 @@ class NasHealthServer {
         _mdcngActorSource = mdcngActorSource ??
             (config.mdcngDataDir == null
                 ? null
-                : NasMdcngActorSource(config.mdcngDataDir!));
+                : NasMdcngActorSource(config.mdcngDataDir!)) {
+    _libraryDatabase.hasActivePlayback =
+        (ids) => _playback.hasSessionsForMovies(ids);
+  }
 
   final NasConfig config;
 
@@ -320,6 +323,7 @@ class NasHealthServer {
     _comicApi?.close();
     _comicApi = null;
     _restoreActivation = null;
+    await _logger.flush();
   }
 
   Future<void> _serve(HttpServer server) async {
@@ -556,6 +560,8 @@ class NasHealthServer {
     config: config,
     presenter: _presenter,
     artworkService: _artworkService,
+    hasActivePlayback: (ids) => _playback.hasSessionsForMovies(ids),
+    diskWork: _diskWork,
   );
   late final _profilesApi = NasProfilesHttpApi(
     libraryDatabase: _libraryDatabase,

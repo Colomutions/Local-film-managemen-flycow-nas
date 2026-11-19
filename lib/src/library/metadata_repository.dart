@@ -153,6 +153,16 @@ class NasMetadataRepository {
             source_content_hash = NULL,
             updated_at = excluded.updated_at
         ''', [movieId, fieldKey, timestamp]);
+        if (fieldKey == 'actors') {
+          // A direct PATCH is an explicit freeze. Automatic composition uses
+          // a separate composition policy so its union may still receive
+          // additive cast associations.
+          _db.execute('''INSERT INTO composition_actor_append_policies
+            (movie_id,allow_append,source_kind,updated_at) VALUES (?,0,'user',?)
+            ON CONFLICT(movie_id) DO UPDATE SET
+              allow_append=0,source_kind='user',updated_at=excluded.updated_at''',
+              [movieId, timestamp]);
+        }
       }
       _db.execute('COMMIT');
       return true;

@@ -242,12 +242,25 @@ class NasArtworkHttpApi {
     });
   }
 
-  Future<void> uploadAdminMovieCarouselImage(HttpRequest request) async {
-    final movieId = request.uri.pathSegments[4];
-    final movie = _libraryDatabase.findMovieForAdmin(movieId);
+  Future<void> uploadAdminMovieCarouselImage(HttpRequest request) =>
+      uploadMovieCarouselImage(
+        request,
+        movieIdForUpload: () => request.uri.pathSegments[4],
+      );
+
+  Future<void> uploadMovieCarouselImage(
+    HttpRequest request, {
+    required String? Function() movieIdForUpload,
+    bool allowHiddenMovie = true,
+  }) async {
+    final movieId = movieIdForUpload();
+    final findMovie = allowHiddenMovie
+        ? _libraryDatabase.findMovieForAdmin
+        : _libraryDatabase.findMovie;
     final mimeType = request.headers.contentType?.mimeType;
-    if (movie == null)
+    if (movieId == null || findMovie(movieId) == null) {
       return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+    }
     final bytes = await _readArtworkBytes(request, mimeType);
     if (bytes == null || mimeType == null) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
@@ -259,6 +272,14 @@ class NasArtworkHttpApi {
         mimeType: mimeType,
         bytes: bytes,
       );
+      if (movieIdForUpload() != movieId || findMovie(movieId) == null) {
+        await _artworkService.deleteCarouselImage(fileName);
+        return await writeApiError(
+          request,
+          HttpStatus.notFound,
+          'resource_not_found',
+        );
+      }
       final image = _libraryDatabase.addCarouselImage(
         movieId: movieId,
         fileName: fileName,
