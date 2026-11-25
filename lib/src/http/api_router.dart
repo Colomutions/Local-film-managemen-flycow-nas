@@ -294,6 +294,11 @@ class NasApiRouter {
         RegExp(r'^/api/v1/admin/movies/[^/]+/poster$').hasMatch(path)) {
       return await _assets.uploadAdminMoviePoster(request);
     }
+    if (request.method == 'GET' &&
+        RegExp(r'^/api/v1/admin/movies/[^/]+/episodes/[^/]+/video-poster$')
+            .hasMatch(path)) {
+      return await _assets.previewVideoPoster(request);
+    }
     if (request.method == 'POST' &&
         RegExp(r'^/api/v1/admin/movies/[^/]+/carousel-images$')
             .hasMatch(path)) {

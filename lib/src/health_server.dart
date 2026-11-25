@@ -496,6 +496,7 @@ class NasHealthServer {
         'playback': true,
         'watchHistory': true,
         'transcoding': false,
+        'videoPoster': true,
         'management': true,
         'categories': true,
         'actors': true,
@@ -552,6 +553,7 @@ class NasHealthServer {
     library: _library,
     config: config,
     presenter: _presenter,
+    media: _media,
   );
   late final _moviesApi = NasMoviesHttpApi(
     libraryDatabase: _libraryDatabase,

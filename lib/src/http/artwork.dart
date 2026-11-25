@@ -6,7 +6,9 @@ import '../auth.dart';
 import '../config.dart';
 import '../fixture_library.dart';
 import '../library_database.dart';
+import '../video_poster.dart';
 
+import 'media_resolver.dart';
 import 'response.dart';
 import 'presenter.dart';
 
@@ -18,15 +20,86 @@ class NasArtworkHttpApi {
     required NasFixtureLibrary library,
     required this.config,
     required NasLibraryPresenter presenter,
+    required NasMediaResolver media,
   })  : _libraryDatabase = libraryDatabase,
         _artworkService = artworkService,
         _library = library,
-        _presenter = presenter;
+        _presenter = presenter,
+        _media = media;
   final NasLibraryDatabase _libraryDatabase;
   final NasConfig config;
   final NasFixtureLibrary _library;
   final NasArtworkService _artworkService;
   final NasLibraryPresenter _presenter;
+  final NasMediaResolver _media;
+  final _videoPoster = NasVideoPoster();
+
+  Future<void> previewVideoPoster(HttpRequest request) async {
+    final segments = request.uri.pathSegments;
+    final movieId = segments[4];
+    final episodeId = segments[6];
+    final query = request.uri.queryParameters;
+    int? read(String key) => int.tryParse(query[key] ?? '');
+    final startMs = read('startMs');
+    final durationMs = read('durationMs') ?? 0;
+    VideoPosterCrop? crop;
+    if (startMs == null || startMs < 0 || startMs > 7 * 24 * 3600000) {
+      return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
+    }
+    if (query.containsKey('durationMs')) {
+      final x = read('x');
+      final y = read('y');
+      final width = read('width');
+      final height = read('height');
+      if (durationMs < 1000 ||
+          durationMs > 8000 ||
+          x == null ||
+          y == null ||
+          width == null ||
+          height == null ||
+          x < 0 ||
+          y < 0 ||
+          width < 600 ||
+          height < 900 ||
+          x + width > 16384 ||
+          y + height > 16384 ||
+          width * 3 != height * 2) {
+        return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
+      }
+      crop = (x: x, y: y, width: width, height: height);
+    }
+    final episode = _libraryDatabase.findEpisode(episodeId);
+    if (episode == null ||
+        episode.movieId != movieId ||
+        !episode.isAvailable ||
+        _libraryDatabase.findMovie(movieId) == null) {
+      return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    final file = await _media.fileForEpisode(episode);
+    if (file == null) {
+      return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
+    }
+    if (_videoPoster.busy) {
+      return writeApiError(request, HttpStatus.conflict, 'video_poster_busy');
+    }
+    final image = await _videoPoster.render(file.file,
+        startMs: startMs, durationMs: durationMs, crop: crop);
+    if (image == null) {
+      return writeApiError(
+          request, HttpStatus.badRequest, 'video_poster_failed');
+    }
+    if (_libraryDatabase.findEpisode(episodeId)?.movieId != movieId) {
+      return writeApiError(
+          request, HttpStatus.conflict, 'collection_selection_changed');
+    }
+    request.response.headers
+      ..contentType =
+          ContentType.parse(crop == null ? 'image/png' : 'image/webp')
+      ..contentLength = image.length
+      ..set(HttpHeaders.cacheControlHeader, 'no-store');
+    request.response.add(image);
+    await request.response.close();
+  }
 
   Future<NasManagedAsset?> saveManagedImage(
     HttpRequest request,

@@ -43,6 +43,8 @@ Future<void> writeApiError(HttpRequest request, int statusCode, String code) {
     'authentication_required': 'A valid device token is required.',
     'insufficient_scope': 'This device does not have the required scope.',
     'invalid_request': 'The request is invalid.',
+    'video_poster_busy': 'NAS 正在生成另一个动态海报，请稍后重试。',
+    'video_poster_failed': '无法生成预览。请检查 NAS 的 FFmpeg，或换一段较短的画面。',
     'collection_selection_changed': '参与影片的资料或分集已变化，请重新预览。',
     'collection_category_mismatch': '只能合并同一分类的影片。',
     'collection_episode_limit': '每部影片至少需要一个分集，合计不能超过 500 个分集。',

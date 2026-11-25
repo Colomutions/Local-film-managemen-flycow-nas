@@ -4,13 +4,16 @@ import 'dart:io';
 import '../lib/mujing_nas.dart';
 
 Future<void> main() async {
+  final ffmpeg = Platform.environment['MUJING_TEST_FFMPEG'];
   final directory =
       await Directory.systemTemp.createTemp('mujing-nas-artwork-test-');
   final mediaRoot =
       Directory('${directory.path}${Platform.pathSeparator}media');
   final video = File('${mediaRoot.path}${Platform.pathSeparator}sample.mp4');
   await video.parent.create(recursive: true);
-  await video.writeAsBytes(List<int>.generate(12, (index) => index));
+  if (ffmpeg == null) {
+    await video.writeAsBytes(List<int>.generate(12, (index) => index));
+  }
   final config = NasConfig(
     bindHost: '127.0.0.1',
     port: 0,
@@ -27,6 +30,23 @@ Future<void> main() async {
   var server = NasHealthServer(config);
 
   try {
+    if (ffmpeg != null) {
+      final generated = await Process.run(ffmpeg, [
+        '-v',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc2=size=1920x1080:rate=12',
+        '-t',
+        '3',
+        '-c:v',
+        'mpeg4',
+        video.path,
+      ]);
+      _expect(
+          generated.exitCode == 0, 'creates sample video: ${generated.stderr}');
+    }
     await server.start();
     var base = Uri.parse('http://127.0.0.1:${server.port}');
     final info = await _request(base, 'GET', '/api/v1/server-info');
@@ -106,6 +126,54 @@ Future<void> main() async {
         token: viewerToken);
     final episodeId =
         (movieDetail.json['data']['episodes'] as List).single['id'] as String;
+    final previewPath =
+        '/api/v1/admin/movies/${movie['id']}/episodes/$episodeId/video-poster';
+    _expectError(
+        await _request(base, 'GET', '$previewPath?startMs=0',
+            token: viewerToken),
+        HttpStatus.forbidden,
+        'insufficient_scope');
+    _expectError(
+        await _request(base, 'GET', '$previewPath?startMs=0&durationMs=9000',
+            token: adminToken),
+        HttpStatus.badRequest,
+        'invalid_request');
+    if (ffmpeg != null) {
+      final frame = await _request(base, 'GET', '$previewPath?startMs=500',
+          token: adminToken);
+      _expect(frame.statusCode == 200 && frame.contentType == 'image/png',
+          'admin can preview source frame: ${frame.json}');
+      final animation = await _request(
+        base,
+        'GET',
+        '$previewPath?startMs=500&durationMs=2000&x=600&y=0&width=720&height=1080',
+        token: adminToken,
+      );
+      _expect(
+          animation.statusCode == 200 && animation.contentType == 'image/webp',
+          'admin can render animated poster: ${animation.json}');
+      final container = latin1.decode(animation.bytes);
+      _expect(
+          'ANMF'.allMatches(container).length > 1, 'WebP has multiple frames');
+      final canvas = container.indexOf('VP8X');
+      _expect(canvas == 12, 'animated WebP has extended canvas');
+      int u24(int index) =>
+          animation.bytes[index] |
+          (animation.bytes[index + 1] << 8) |
+          (animation.bytes[index + 2] << 16);
+      _expect(u24(canvas + 12) == 599 && u24(canvas + 15) == 899,
+          'animated WebP canvas is 600 by 900');
+      final animatedUpload = await _request(base, 'POST', posterPath,
+          token: adminToken, bytes: animation.bytes, contentType: 'image/webp');
+      _expect(animatedUpload.statusCode == 200, 'admin saves animated poster');
+      final saved = await _request(
+          base, 'GET', '/api/v1/assets/posters/${movie['id']}',
+          token: viewerToken);
+      _expect(
+          saved.contentType == 'image/webp' &&
+              saved.bytes.toString() == animation.bytes.toString(),
+          'saved poster keeps animation bytes');
+    }
     final playback = await _request(base, 'POST', '/api/v1/playback/sessions',
         token: viewerToken,
         body: {'contentId': movie['id'], 'episodeId': episodeId});
