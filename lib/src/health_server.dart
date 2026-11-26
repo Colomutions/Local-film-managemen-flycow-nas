@@ -497,6 +497,7 @@ class NasHealthServer {
         'watchHistory': true,
         'transcoding': false,
         'videoPoster': true,
+        'videoPosterSmallCrop': true,
         'management': true,
         'categories': true,
         'actors': true,

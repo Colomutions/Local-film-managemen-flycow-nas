@@ -37,7 +37,7 @@ Future<void> main() async {
         '-f',
         'lavfi',
         '-i',
-        'testsrc2=size=1920x1080:rate=12',
+        'testsrc2=size=1280x720:rate=12',
         '-t',
         '3',
         '-c:v',
@@ -146,7 +146,7 @@ Future<void> main() async {
       final animation = await _request(
         base,
         'GET',
-        '$previewPath?startMs=500&durationMs=2000&x=600&y=0&width=720&height=1080',
+        '$previewPath?startMs=500&durationMs=2000&x=400&y=0&width=480&height=720',
         token: adminToken,
       );
       _expect(

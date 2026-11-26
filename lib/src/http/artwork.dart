@@ -59,8 +59,12 @@ class NasArtworkHttpApi {
           height == null ||
           x < 0 ||
           y < 0 ||
-          width < 600 ||
-          height < 900 ||
+          x > 16384 ||
+          y > 16384 ||
+          width < 2 ||
+          height < 3 ||
+          width > 16384 ||
+          height > 16384 ||
           x + width > 16384 ||
           y + height > 16384 ||
           width * 3 != height * 2) {
