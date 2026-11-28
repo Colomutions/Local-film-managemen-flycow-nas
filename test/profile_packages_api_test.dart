@@ -117,7 +117,14 @@ Future<void> main() async {
     final actors = await _request(baseUrl, 'GET', '/api/v1/actors', token: adminToken);
     final actor = (actors.json['data']['items'] as List<dynamic>).single as Map<String, dynamic>;
     _expect(actor['photoAsset'] != null, '演员导入图片写入受管理资产');
-    _expect((actor['publishers'] as List<dynamic>).single['displayName'] == '资料发行商', '演员可以按发行商名称建立关系');
+    _expect((actor['publishers'] as List<dynamic>).isEmpty,
+        '尚未关联影片的演员不会显示历史手工发行商');
+    final actorExport = await _request(baseUrl, 'GET',
+        '/api/v1/admin/profile-packages/actor/export', token: adminToken);
+    final decodedActor = NasProfilePackageCodec.decode(
+        expectedKind: NasProfilePackageKind.actor, bytes: actorExport.bytes);
+    _expect(decodedActor.entries.single.fields['publisherNames'] == '资料发行商',
+        '历史手工发行商关系仍然保留并可导出');
 
     final repeatedActor = await _import(
       baseUrl,

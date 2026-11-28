@@ -363,6 +363,9 @@ class NasLibraryDatabase {
 
   NasSeries? findSeries(String seriesId) => _profiles.findSeries(seriesId);
 
+  NasLibraryMovie? firstPosterMovieForSeries(String seriesId) =>
+      _profiles.firstPosterMovieForSeries(seriesId);
+
   NasSeries? findSeriesByProfileIdentity(String profileIdentity) =>
       _profiles.findSeriesByProfileIdentity(profileIdentity);
 

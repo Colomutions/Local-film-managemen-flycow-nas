@@ -80,8 +80,8 @@ Future<void> main() async {
         'full birth date is saved when creating an actor');
     _expect(actor['movieCount'] == 0, 'new actor has no movie relation');
     _expect(
-      (actor['publishers'] as List<dynamic>).single['id'] == publisherId,
-      'actor stores publisher entity IDs instead of text',
+      (actor['publishers'] as List<dynamic>).isEmpty,
+      'manual publisher links do not appear without an associated movie',
     );
 
     final searched = await _request(

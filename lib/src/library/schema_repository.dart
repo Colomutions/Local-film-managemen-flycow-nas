@@ -10,7 +10,7 @@ class NasSchemaRepository {
 
   final Database Function() _connection;
   Database get _db => _connection();
-  static const currentSchemaVersion = 39;
+  static const currentSchemaVersion = 40;
 
   void migrate() {
     _db.execute('''
@@ -989,6 +989,45 @@ class NasSchemaRepository {
           media_root_id TEXT NOT NULL, relative_path TEXT NOT NULL
         )''');
         _db.execute('INSERT INTO schema_migrations VALUES (?, ?)', [39, now()]);
+        _db.execute('COMMIT');
+      } catch (_) {
+        _db.execute('ROLLBACK');
+        rethrow;
+      }
+    }
+    if (current < 40) {
+      _db.execute('BEGIN IMMEDIATE');
+      try {
+        _db.execute('ALTER TABLE movies ADD COLUMN series_link_order INTEGER');
+        // Historical associations have no join order. Use their library order.
+        _db.execute('''WITH ranked AS (
+          SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY series_id ORDER BY created_at, id
+          ) AS position FROM movies WHERE series_id IS NOT NULL
+        ) UPDATE movies SET series_link_order = (
+          SELECT position FROM ranked WHERE ranked.id = movies.id
+        ) WHERE series_id IS NOT NULL''');
+        _db.execute('''CREATE INDEX movies_series_link_order_idx
+          ON movies(series_id, series_link_order, id)''');
+        _db.execute('''CREATE TRIGGER movie_series_order_insert
+          AFTER INSERT ON movies WHEN NEW.series_id IS NOT NULL
+          BEGIN
+            UPDATE movies SET series_link_order = (
+              SELECT COALESCE(MAX(series_link_order), 0) + 1
+              FROM movies WHERE series_id = NEW.series_id AND id != NEW.id
+            ) WHERE id = NEW.id;
+          END''');
+        _db.execute('''CREATE TRIGGER movie_series_order_update
+          AFTER UPDATE OF series_id ON movies
+          WHEN NEW.series_id IS NOT OLD.series_id
+          BEGIN
+            UPDATE movies SET series_link_order = CASE
+              WHEN NEW.series_id IS NULL THEN NULL
+              ELSE (SELECT COALESCE(MAX(series_link_order), 0) + 1
+                FROM movies WHERE series_id = NEW.series_id AND id != NEW.id)
+              END WHERE id = NEW.id;
+          END''');
+        _db.execute('INSERT INTO schema_migrations VALUES (?, ?)', [40, now()]);
         _db.execute('COMMIT');
       } catch (_) {
         _db.execute('ROLLBACK');

@@ -65,6 +65,9 @@ class NasLibraryPresenter {
     final poster = series.posterAssetId == null
         ? null
         : _libraryDatabase.findManagedAsset(series.posterAssetId!);
+    final posterMovie = poster == null
+        ? _libraryDatabase.firstPosterMovieForSeries(series.id)
+        : null;
     return {
       ..._seriesReferencePayload(series),
       'originalName': series.originalName,
@@ -73,6 +76,9 @@ class NasLibraryPresenter {
           publisher == null ? null : _publisherReferencePayload(publisher),
       'releaseDate': series.releaseDate,
       'posterAsset': poster == null ? null : managedAssetPayload(poster),
+      'posterUrl': posterMovie == null
+          ? null
+          : '/api/v1/assets/posters/${posterMovie.id}?v=${Uri.encodeQueryComponent(posterMovie.updatedAt)}',
       'movieCount': series.movieCount,
       'episodeCount': series.episodeCount,
       'durationMs': series.durationMs,

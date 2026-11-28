@@ -15,8 +15,11 @@ void mainMigration(int version, void Function(Database) body) {
     raw.execute('''
       CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT);
       INSERT INTO schema_migrations VALUES($version, 'fixture');
-      CREATE TABLE movies(id TEXT PRIMARY KEY, title TEXT NOT NULL);
-      INSERT INTO movies VALUES('old', '旧影片');
+      CREATE TABLE movies(
+        id TEXT PRIMARY KEY, title TEXT NOT NULL,
+        series_id TEXT, created_at TEXT NOT NULL DEFAULT '2026-01-01'
+      );
+      INSERT INTO movies(id,title) VALUES('old', '旧影片');
     ''');
     body(raw);
   } finally {
@@ -72,15 +75,15 @@ void _upgrade36() {
         raw
                 .select('SELECT MAX(version) AS v FROM schema_migrations')
                 .single['v'] ==
-            37,
-        '迁移记录到 v37');
+            NasSchemaRepository.currentSchemaVersion,
+        '迁移记录到当前版本');
   });
 }
 
 void _upgrade35() {
   mainMigration(35, (raw) {
     raw.execute('''
-      INSERT INTO movies VALUES('automatic', '自动排序');
+      INSERT INTO movies(id,title) VALUES('automatic', '自动排序');
       CREATE TABLE episodes(
         id TEXT PRIMARY KEY, movie_id TEXT, relative_path TEXT,
         natural_sort_key TEXT, manual_order INTEGER

@@ -235,6 +235,14 @@ class NasProfilesRepository {
     return rows.isEmpty ? null : findSeries(rows.single['id'] as String);
   }
 
+  NasLibraryMovie? firstPosterMovieForSeries(String seriesId) {
+    final rows = _db.select('''SELECT id FROM movies
+      WHERE series_id = ? AND lifecycle_state = 'active'
+        AND poster_file_name IS NOT NULL AND trim(poster_file_name) != ''
+      ORDER BY series_link_order, created_at, id LIMIT 1''', [seriesId]);
+    return rows.isEmpty ? null : findMovieForAdmin(rows.single['id'] as String);
+  }
+
   bool seriesDisplayNameExists(String displayName) => _db.select(
         'SELECT 1 FROM series WHERE lower(display_name) = lower(?) LIMIT 1',
         [displayName.trim()],
@@ -333,12 +341,13 @@ class NasProfilesRepository {
 
   List<NasRelatedActor> actorsForPublisher(String publisherId) =>
       _relatedActorsForMovies(
-          '(m.publisher_id = ? OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=?))',
-          [publisherId, publisherId]);
+          '(m.publisher_id = ? OR EXISTS(SELECT 1 FROM series s WHERE s.id=m.series_id AND s.publisher_id=?) OR EXISTS(SELECT 1 FROM movie_company_links cl WHERE cl.movie_id=m.id AND cl.company_id=?))',
+          [publisherId, publisherId, publisherId]);
 
   List<NasRelatedActor> actorsForSeries(String seriesId) =>
       _relatedActorsForMovies('m.series_id = ?', [seriesId]);
 
+  /// 历史手工关联继续保留，资料包导出仍可读取；页面展示使用影片推导的关系。
   List<String> publisherIdsForActor(String actorId) => _db
       .select('''
         SELECT publisher_id FROM actor_publisher_links
@@ -347,8 +356,27 @@ class NasProfilesRepository {
       .map((row) => row['publisher_id'] as String)
       .toList(growable: false);
 
+  List<String> relatedPublisherIdsForActor(String actorId) => _db.select('''
+    WITH actor_movies AS (
+      SELECT m.id, m.publisher_id, s.publisher_id AS series_publisher_id
+      FROM movie_actor_links l
+      JOIN movies m ON m.id = l.movie_id
+      LEFT JOIN series s ON s.id = m.series_id
+      WHERE l.actor_id = ? AND m.lifecycle_state = 'active'
+    ), related_publishers AS (
+      SELECT publisher_id AS id FROM actor_movies
+      UNION SELECT series_publisher_id FROM actor_movies
+      UNION SELECT cl.company_id FROM movie_company_links cl
+        JOIN actor_movies m ON m.id = cl.movie_id
+    )
+    SELECT p.id FROM publishers p
+    JOIN related_publishers r ON r.id = p.id
+    WHERE p.archived_at IS NULL
+    ORDER BY lower(p.display_name), p.id
+  ''', [actorId]).map((row) => row['id'] as String).toList(growable: false);
+
   List<NasPublisher> publishersForActor(String actorId) =>
-      publisherIdsForActor(actorId)
+      relatedPublisherIdsForActor(actorId)
           .map(findPublisher)
           .whereType<NasPublisher>()
           .toList(growable: false);
@@ -1029,7 +1057,7 @@ class NasProfilesRepository {
         officialSiteUrl: row['official_site_url'] as String?,
         photoAssetId: row['photo_asset_id'] as String?,
         backdropAssetId: row['backdrop_asset_id'] as String?,
-        publisherIds: publisherIdsForActor(row['id'] as String),
+        publisherIds: relatedPublisherIdsForActor(row['id'] as String),
         movieCount: row['movie_count'] as int,
         createdAt: row['created_at'] as String,
         updatedAt: row['updated_at'] as String,
