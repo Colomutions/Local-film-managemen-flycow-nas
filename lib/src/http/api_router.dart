@@ -286,6 +286,10 @@ class NasApiRouter {
         RegExp(r'^/api/v1/admin/movies/[^/]+/favorite$').hasMatch(path)) {
       return await _moviesApi.updateAdminMovieFavorite(request);
     }
+    if ((request.method == 'GET' || request.method == 'POST') &&
+        RegExp(r'^/api/v1/admin/movies/[^/]+/source-deletion$').hasMatch(path)) {
+      return await _moviesApi.deleteMovieSources(request);
+    }
     if (request.method == 'DELETE' &&
         RegExp(r'^/api/v1/admin/movies/[^/]+$').hasMatch(path)) {
       return await _moviesApi.removeAdminMovieFromIndex(request);

@@ -11,6 +11,7 @@ class NasConfig {
     required this.scanOnStart,
     this.managedCategoryLibrary = false,
     this.allowSourceRename = false,
+    this.allowSourceDelete = false,
     required this.dataDir,
     required this.mediaDir,
     required this.timezone,
@@ -58,6 +59,7 @@ class NasConfig {
         false,
       ),
       dataDir: _value(environment, 'MUJING_DATA_DIR', '/data'),
+      allowSourceDelete: _boolValue(environment, 'MUJING_ALLOW_SOURCE_DELETE', false),
       mediaDir: _value(environment, 'MUJING_MEDIA_DIR', '/media'),
       timezone: _value(environment, 'MUJING_TIMEZONE', 'Asia/Shanghai'),
       mdcngDataDir: _absoluteDirectory(environment, 'MUJING_MDCNG_DATA_DIR'),
@@ -114,6 +116,7 @@ class NasConfig {
   /// Source media writes require an explicit deployment opt-in.  The default
   /// media overlay remains read-only even when this flag is present.
   final bool allowSourceRename;
+  final bool allowSourceDelete;
   final String dataDir;
   final String mediaDir;
   final String timezone;

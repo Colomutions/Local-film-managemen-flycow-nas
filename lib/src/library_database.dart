@@ -8,6 +8,7 @@ import 'library_models.dart';
 import 'library/assets_repository.dart';
 import 'library/collections_repository.dart';
 import 'library/library_values.dart';
+import 'library/mdcng_nfo.dart';
 import 'library/metadata_repository.dart';
 import 'library/movies_repository.dart';
 import 'library/playback_repository.dart';
@@ -28,6 +29,7 @@ export 'library_models.dart';
 
 part 'library/scrape_database.dart';
 part 'library/supplement_database.dart';
+part 'library/source_deletion.dart';
 
 String _normalizeCatalogNumber(String value) => normalizeCatalogNumber(value);
 
@@ -597,6 +599,9 @@ class NasLibraryDatabase {
 
   Map<String, String> mdcngProfileKeysForSource(String sourceId) =>
       _profiles.mdcngProfileKeysForSource(sourceId);
+
+  Set<String> mdcngEmbyIdsForActor(String sourceId, String actorId) =>
+      _profiles.mdcngEmbyIdsForActor(sourceId, actorId);
 
   void linkActorToMdcngSource({
     required String sourceId,

@@ -510,6 +510,7 @@ class NasHealthServer {
         'mdcngActors': mdcngActorAvailability.isAvailable,
         'profilePackages': true,
         'sourceRename': config.allowSourceRename,
+        'sourceDelete': config.allowSourceDelete,
         'novels': novelReady,
         'novelUpload': novelReady,
         'novelReading': novelReady,

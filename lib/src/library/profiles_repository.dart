@@ -779,6 +779,12 @@ class NasProfilesRepository {
     };
   }
 
+  Set<String> mdcngEmbyIdsForActor(String sourceId, String actorId) => _db
+      .select('''SELECT emby_id FROM mdcng_actor_source_links
+        WHERE source_id = ? AND actor_id = ?''', [sourceId, actorId])
+      .map((row) => row['emby_id'] as String)
+      .toSet();
+
   void linkActorToMdcngSource({
     required String sourceId,
     required String embyId,

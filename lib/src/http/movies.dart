@@ -634,6 +634,31 @@ class NasMoviesHttpApi {
     });
   }
 
+  Future<void> deleteMovieSources(HttpRequest request) async {
+    if (!config.allowSourceDelete) {
+      return writeApiError(request, HttpStatus.forbidden, 'source_delete_disabled');
+    }
+    final movieId = request.uri.pathSegments[4];
+    String? token;
+    if (request.method == 'POST') {
+      final body = await readApiJsonBody(request, maximumBytes: 1024);
+      final value = body?['previewToken'];
+      if (body?.length != 1 || value is! String || !RegExp(r'^[a-f0-9]{64}$').hasMatch(value)) {
+        return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
+      }
+      token = value;
+    }
+    try {
+      final data = await _diskWork.run('source-delete:$movieId:$token', () async =>
+        _libraryDatabase.movieSourceDeletion(movieId: movieId, mediaDir: config.mediaDir, previewToken: token));
+      await writeApiJson(request.response, HttpStatus.ok, {'data': data});
+    } on SourceDeletionException catch (e) {
+      await writeApiError(request, e.code == 'resource_not_found' ? HttpStatus.notFound : HttpStatus.conflict, e.code);
+    } on FileSystemException {
+      await writeApiError(request, HttpStatus.conflict, 'source_delete_io');
+    }
+  }
+
   Future<void> removeAdminMovieFromIndex(HttpRequest request) async {
     final removed = _libraryDatabase.removeMovieFromIndex(
       request.uri.pathSegments.last,

@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart' as crypto;
+
 import '../artwork_service.dart';
 import '../auth.dart';
 import '../config.dart';
@@ -217,6 +219,25 @@ class NasArtworkHttpApi {
     return _serveArtwork(request, artwork);
   }
 
+  Future<bool> matchesManagedImage(String? assetId, File? source) async {
+    if (assetId == null || source == null) return false;
+    final asset = _libraryDatabase.findManagedAsset(assetId);
+    try {
+      final stored = await _artworkService.managedAsset(asset?.fileName);
+      if (stored == null ||
+          await stored.file.length() != await source.length()) {
+        return false;
+      }
+      final digests = await Future.wait([
+        crypto.sha256.bind(stored.file.openRead()).first,
+        crypto.sha256.bind(source.openRead()).first,
+      ]);
+      return digests.first == digests.last;
+    } on FileSystemException {
+      return false;
+    }
+  }
+
   Future<void> _serveArtwork(
       HttpRequest request, NasArtworkFile artwork) async {
     final stat = await artwork.file.stat();
@@ -305,9 +326,13 @@ class NasArtworkHttpApi {
       posterFileName: fileName,
     );
     if (updatedMovie == null) {
+      if (!_libraryDatabase.posterUsedByOtherMovie(fileName, movieId)) {
+        await _artworkService.deletePoster(fileName);
+      }
       return writeApiError(request, HttpStatus.notFound, 'resource_not_found');
     }
-    if (movie.posterFileName != null && movie.posterFileName != fileName) {
+    if (movie.posterFileName != null && movie.posterFileName != fileName &&
+        !_libraryDatabase.posterUsedByOtherMovie(movie.posterFileName!, movieId)) {
       await _artworkService.deletePoster(movie.posterFileName);
     }
     _libraryDatabase.markMovieMetadataFieldsManual(

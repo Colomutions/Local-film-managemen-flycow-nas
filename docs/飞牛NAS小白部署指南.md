@@ -1,6 +1,6 @@
 # 幕境飞牛 NAS 小白部署指南
 
-本指南用于把幕境 NAS 无界面服务部署到家中的飞牛 NAS。视频目录默认以只读方式挂载；只有改用独立的可写媒体覆盖并显式开启风险开关后，服务才允许受校验的同目录改名，始终不提供任意移动或删除源视频的能力。
+本指南用于在飞牛 NAS 部署幕境服务。视频目录默认只读。管理员可以分别开启分集源文件改名和影片源文件永久删除。
 
 ## 1. 先分清三个目录
 
@@ -262,6 +262,16 @@ sudo docker inspect mujing-nas \
 ```
 
 `RW=false` 表示媒体只读。
+
+已有双盘部署还可以在原 `.env` 中追加第三个媒体目录。比如要绑定 `/vol3/1000/正经影视`，设置 `MEDIA_ROOT_DISK3=/vol3/1000/正经影视` 和 `MEDIA_DISK3_FOLDER=正经影视`。通过原入口 `sh bin/mujing-compose` 重建后，在分类管理中选择 `disk3/正经影视` 或其子目录。第三盘跟随现有部署模式的读写权限。宿主机目录需事先存在。
+
+### 在 Windows 和平板管理端启用永久删除
+
+更新 NAS 服务和管理端。在 NAS 项目目录的 `.env` 里设置 `MUJING_ALLOW_SOURCE_DELETE=true`。原模式是 `dual` 时改为 `dual-writable`，原模式是 `dual-mdcng` 时改为 `dual-writable-mdcng`。单盘使用相应的 `single-writable` 或 `single-writable-mdcng`。可单独开启删除，改名开关按需设置。容器的 PUID/PGID 需要能写入目标目录。
+
+在 NAS 项目目录运行 `sudo sh bin/mujing-compose up -d --build`，重新连接 Windows 或平板。在影片详情点「从列表删除」→「同时删除源文件…」，核对涉及的盘、分集、NFO、海报和截图后点「确认永久删除」。文件永久删除，空间由文件系统回收。只想移除片库记录时，选择「仅移除索引」。
+
+幕境上传海报、动态 WebP 和已登记截图随片清理，共享的海报保留。作品专属目录可清理通用命名的海报和常见截图子目录里的图片。共享目录中的通用图片保留。影集按当前关联的全部分集处理。遇到离线或权限不足时可修复后重新预览。
 
 重要：启用媒体后，`MUJING_DEPLOYMENT_MODE=dual` 会被固定入口保留在每次构建、创建、重建或重启中。不要绕过 `sh bin/mujing-compose` 直接执行基础 `docker compose up`，否则新的容器不会挂载 `/media`，API 中的 `isAvailable` 会变回 `false`。
 

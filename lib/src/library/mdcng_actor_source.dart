@@ -47,15 +47,22 @@ class NasMdcngActorSource {
 
   Future<List<NasMdcngActorSourceRecord>> readCompletedActors({
     Map<String, String> selectedProfileKeys = const {},
+    Map<String, String> savedProfilesByEmbyId = const {},
+    Set<String>? embyIds,
+    String? taskId,
     bool forceRefresh = false,
   }) async {
     final snapshot = await _loadSnapshot(forceRefresh: forceRefresh);
     return snapshot.tasks
+        .where((task) =>
+            (embyIds == null || embyIds.contains(task.embyId)) &&
+            (taskId == null || task.id == taskId))
         .map(
           (task) => _recordFor(
             task: task,
             lookup: snapshot.lookup,
-            selectedProfileKey: selectedProfileKeys[task.id],
+            selectedProfileKey: selectedProfileKeys[task.id] ??
+                savedProfilesByEmbyId[task.embyId],
           ),
         )
         .toList(growable: false);

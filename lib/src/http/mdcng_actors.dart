@@ -61,7 +61,12 @@ class NasMdcngActorsHttpApi {
   /// Lists only completed MDCNG actor tasks.  The NAS returns safe summaries;
   /// host paths, source URLs, and MDCNG credentials never cross this API.
   Future<void> listMdcngActorImports(HttpRequest request) async {
-    final records = await _readMdcngActorRecords(request);
+    final actorId = request.uri.queryParameters['actorId'];
+    final records = await _readMdcngActorRecords(request,
+        embyIds: actorId == null
+            ? null
+            : _libraryDatabase.mdcngEmbyIdsForActor(
+                config.mdcngSourceId, actorId));
     if (records == null) return;
     final deferred = _libraryDatabase.mdcngDeferredEmbyIdsForSource(
       config.mdcngSourceId,
@@ -77,6 +82,15 @@ class NasMdcngActorsHttpApi {
         'embyId': record.embyId,
         'sourceName': record.sourceName,
         'profileName': record.profile?.name,
+        'searchNames': <String?>{
+          record.profile?.roma,
+          ...?record.profile?.aliases,
+          linked?.stageName,
+          linked?.originalName,
+          linked?.translatedName,
+          linked?.romanizedName,
+          ...?linked?.aliases,
+        }.whereType<String>().toList(),
         'profileResolution': record.profileResolution,
         'candidates': _mdcngActorCandidatePayloads(record),
         'completedAt': record.completedAt,
@@ -99,6 +113,7 @@ class NasMdcngActorsHttpApi {
         'schemaVersion': 1,
         'mode': 'preview_only',
         'sourceId': config.mdcngSourceId,
+        if (actorId != null) 'actorId': actorId,
         'items': items,
       },
     });
@@ -389,6 +404,7 @@ class NasMdcngActorsHttpApi {
     }
     final records = await _readMdcngActorRecords(
       request,
+      taskId: taskId,
       selectedProfileKeys:
           selectedProfileKey == null ? const {} : {taskId: selectedProfileKey},
     );
@@ -436,6 +452,15 @@ class NasMdcngActorsHttpApi {
       return writeApiError(request, HttpStatus.conflict,
           'mdcng_actor_target_resolution_required');
     }
+    final matchingImages = <String>{};
+    if (await _assets.matchesManagedImage(
+        comparisonActor?.photoAssetId, record.photo?.file)) {
+      matchingImages.add('photo');
+    }
+    if (await _assets.matchesManagedImage(
+        comparisonActor?.backdropAssetId, record.backdrop?.file)) {
+      matchingImages.add('backdrop');
+    }
     await writeApiJson(request.response, HttpStatus.ok, {
       'data': {
         'schemaVersion': 1,
@@ -467,7 +492,8 @@ class NasMdcngActorsHttpApi {
             : matches.isEmpty
                 ? 'create'
                 : 'resolve',
-        'fieldDiffs': _mdcngActorFieldDiffs(record, comparisonActor),
+        'fieldDiffs': _mdcngActorFieldDiffs(record, comparisonActor,
+            matchingImages: matchingImages),
       },
     });
   }
@@ -475,6 +501,8 @@ class NasMdcngActorsHttpApi {
   Future<List<NasMdcngActorSourceRecord>?> _readMdcngActorRecords(
     HttpRequest request, {
     Map<String, String> selectedProfileKeys = const {},
+    Set<String>? embyIds,
+    String? taskId,
     bool forceRefresh = false,
   }) async {
     final source = _mdcngActorSource;
@@ -489,10 +517,11 @@ class NasMdcngActorsHttpApi {
     try {
       return await source.readCompletedActors(
         forceRefresh: forceRefresh,
-        selectedProfileKeys: {
-          ..._libraryDatabase.mdcngProfileKeysForSource(config.mdcngSourceId),
-          ...selectedProfileKeys,
-        },
+        embyIds: embyIds,
+        taskId: taskId,
+        savedProfilesByEmbyId:
+            _libraryDatabase.mdcngProfileKeysForSource(config.mdcngSourceId),
+        selectedProfileKeys: selectedProfileKeys,
       );
     } on NasMdcngActorSourceException catch (error) {
       _logger.event('mdcng.source.read_failed', level: 'WARN', fields: {
@@ -550,8 +579,9 @@ class NasMdcngActorsHttpApi {
 
   List<Map<String, Object?>> _mdcngActorFieldDiffs(
     NasMdcngActorSourceRecord record,
-    NasActor? current,
-  ) {
+    NasActor? current, {
+    Set<String> matchingImages = const {},
+  }) {
     final proposed = <String, Object?>{
       'stageName': record.sourceName,
       'originalName': record.profile?.name,
@@ -596,12 +626,13 @@ class NasMdcngActorsHttpApi {
           entry.key,
           values[entry.key],
         );
-        final unchanged = available &&
-            _mdcngActorValuesEqual(
-              entry.key,
-              currentValue,
-              entry.value,
-            );
+        final unchanged = matchingImages.contains(entry.key) ||
+            available &&
+                _mdcngActorValuesEqual(
+                  entry.key,
+                  currentValue,
+                  entry.value,
+                );
         final needsConfirmation = available &&
             !unchanged &&
             _mdcngActorHasValue(currentValue) &&
@@ -672,6 +703,8 @@ class NasMdcngActorsHttpApi {
     final rawOverwriteFieldKeys = body?['overwriteFieldKeys'];
     final targetActorId = body?['targetActorId'];
     final createNew = body?['createNew'];
+    final requireLinkedTarget = body?['requireLinkedTarget'] ?? false;
+    final expectedTargetUpdatedAt = body?['expectedTargetUpdatedAt'];
     final selectedProfileKey = body?['selectedProfileKey'];
     const allowedFields = {
       'stageName',
@@ -703,6 +736,8 @@ class NasMdcngActorsHttpApi {
             key != 'overwriteFieldKeys' &&
             key != 'targetActorId' &&
             key != 'createNew' &&
+            key != 'requireLinkedTarget' &&
+            key != 'expectedTargetUpdatedAt' &&
             key != 'selectedProfileKey') ||
         taskId is! String ||
         taskId.isEmpty ||
@@ -717,7 +752,12 @@ class NasMdcngActorsHttpApi {
             (targetActorId is! String || targetActorId.isEmpty)) ||
         (selectedProfileKey != null &&
             (selectedProfileKey is! String || selectedProfileKey.isEmpty)) ||
-        createNew is! bool) {
+        createNew is! bool ||
+        requireLinkedTarget is! bool ||
+        (requireLinkedTarget &&
+            (targetActorId == null ||
+                createNew ||
+                expectedTargetUpdatedAt is! String))) {
       return writeApiError(request, HttpStatus.badRequest, 'invalid_request');
     }
     final fieldKeys = rawFieldKeys.cast<String>();
@@ -734,6 +774,7 @@ class NasMdcngActorsHttpApi {
     final records = await _readMdcngActorRecords(
       request,
       forceRefresh: true,
+      taskId: taskId,
       selectedProfileKeys:
           selectedProfileKey == null ? const {} : {taskId: selectedProfileKey},
     );
@@ -766,12 +807,17 @@ class NasMdcngActorsHttpApi {
       sourceId: config.mdcngSourceId,
       embyId: record.embyId,
     );
-    if (linked?.archivedAt != null ||
+    if ((requireLinkedTarget && linked == null) ||
+        linked?.archivedAt != null ||
         (linked != null &&
             targetActorId != null &&
             targetActorId != linked.id)) {
       return writeApiError(request, HttpStatus.conflict,
           'mdcng_actor_target_resolution_required');
+    }
+    if (requireLinkedTarget && linked?.updatedAt != expectedTargetUpdatedAt) {
+      return writeApiError(
+          request, HttpStatus.conflict, 'mdcng_actor_preview_stale');
     }
     NasActor? target = linked;
     if (target == null && !createNew && targetActorId != null) {
@@ -878,6 +924,8 @@ class NasMdcngActorsHttpApi {
       final targetChanged = target != null &&
           (latestTarget == null ||
               latestTarget.archivedAt != null ||
+              (requireLinkedTarget &&
+                  latestTarget.updatedAt != expectedTargetUpdatedAt) ||
               fields.any((field) => !_mdcngActorValuesEqual(
                   field,
                   _mdcngActorCurrentValue(target!, field),

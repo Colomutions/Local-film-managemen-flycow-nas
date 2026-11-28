@@ -64,7 +64,10 @@ class NasMoviesRepository {
         [movieId]);
     _db.execute('DELETE FROM movies WHERE id = ?', [movieId]);
     return NasRemovedMovieIndex(
-      posterFileName: movie.posterFileName,
+      posterFileName: _db.select(
+        'SELECT 1 FROM movies WHERE poster_file_name=? LIMIT 1',
+        [movie.posterFileName],
+      ).isEmpty ? movie.posterFileName : null,
       carouselFileNames: carouselFileNames,
     );
   }

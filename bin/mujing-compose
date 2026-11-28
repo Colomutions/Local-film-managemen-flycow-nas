@@ -34,6 +34,7 @@ require_value() {
 }
 
 allow_source_rename=$(read_value MUJING_ALLOW_SOURCE_RENAME)
+allow_source_delete=$(read_value MUJING_ALLOW_SOURCE_DELETE)
 overlay=
 case "$deployment_mode" in
   minimal)
@@ -90,19 +91,29 @@ case "$deployment_mode" in
 esac
 
 case "$deployment_mode" in
-  *-writable)
-    if [ "$allow_source_rename" != "true" ]; then
-      echo "可写媒体模式必须同时设置 MUJING_ALLOW_SOURCE_RENAME=true。" >&2
+  *-writable|*-writable-mdcng)
+    if [ "$allow_source_rename" != "true" ] && [ "$allow_source_delete" != "true" ]; then
+      echo "可写媒体模式需要开启 MUJING_ALLOW_SOURCE_DELETE 或 MUJING_ALLOW_SOURCE_RENAME。" >&2
       exit 2
     fi
     ;;
   *)
-    if [ "$allow_source_rename" = "true" ]; then
-      echo "MUJING_ALLOW_SOURCE_RENAME=true 只能与 *-writable 部署模式一起使用。" >&2
+    if [ "$allow_source_rename" = "true" ] || [ "$allow_source_delete" = "true" ]; then
+      echo "源文件写入权限需要对应的可写媒体部署模式。" >&2
       exit 2
     fi
     ;;
 esac
+
+if [ -n "$(read_value MEDIA_ROOT_DISK3)" ]; then
+  case "$deployment_mode" in
+    dual-writable*) MUJING_DISK3_READ_ONLY=false ;;
+    dual|dual-mdcng) MUJING_DISK3_READ_ONLY=true ;;
+    *) echo "第三块媒体盘需配合双盘部署模式使用。" >&2; exit 2 ;;
+  esac
+  export MUJING_DISK3_READ_ONLY
+  exec docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yml" -f "$project_dir/$overlay" -f "$project_dir/docker-compose.media.disk3.yml" "$@"
+fi
 
 if [ -n "$overlay" ]; then
   exec docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yml" -f "$project_dir/$overlay" "$@"

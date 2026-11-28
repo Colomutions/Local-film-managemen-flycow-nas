@@ -65,6 +65,12 @@ Future<void> writeApiError(HttpRequest request, int statusCode, String code) {
     'service_maintenance': 'The NAS database is being restored.',
     'source_rename_disabled':
         'Source rename is disabled until the writable media deployment opt-in is enabled.',
+    'source_delete_disabled': '此 NAS 尚未开启源文件删除。',
+    'source_delete_empty': '这部影片没有关联源文件，可使用仅移除索引。',
+    'source_delete_unavailable': '来源盘离线、分集缺失或路径含链接。请检查媒体盘并重新扫描。',
+    'source_delete_shared_video': '另一条记录也引用了同一源视频，请先核对片库归属。',
+    'source_delete_changed': '文件或分集归属已变化。请重新预览，若仍提示变化请先扫描对应分类。',
+    'source_delete_io': '文件操作失败，索引已保留。请检查媒体盘和目录写权限，重新预览后可继续。',
     'invalid_source_name':
         'The requested source name is invalid or changes the file extension.',
     'source_name_conflict': 'A file with the requested name already exists.',

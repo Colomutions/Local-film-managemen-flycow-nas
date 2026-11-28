@@ -100,9 +100,13 @@ sudo -H sh bin/mujing-compose build --pull=false
 sudo -H sh bin/mujing-compose up -d --force-recreate
 ```
 
-单盘目录只读挂载为 `/media`。Windows 管理端创建或绑定影片类别时，选择相对于 `/media` 的子目录。双盘与单盘覆盖文件、环境变量不得混用；若明确开启 `MUJING_ALLOW_SOURCE_RENAME=true`，才可改用相应的可写覆盖文件。
+单盘目录只读挂载为 `/media`。Windows 管理端创建或绑定影片类别时，选择相对于 `/media` 的子目录。开启源文件改名或永久删除时使用对应的可写部署模式。
 
 从单盘挂载迁移到双盘挂载时，已有 SQLite 条目的相对路径不含 `disk1/` 或 `disk2/` 前缀，首次启动后会显示为不可用。保留 `./data`，在 Windows 管理端将每个既有类别重新绑定到 `disk1/子目录` 或 `disk2/子目录` 后重新扫描；不要删除数据目录来“修复”路径。
+
+### 永久删除影片源文件（默认关闭）
+
+Windows 和 Android 平板在「从列表删除」里提供文件清单和二次确认。设置 `MUJING_ALLOW_SOURCE_DELETE=true` 并选择对应的可写媒体模式，重建容器后重新连接客户端。影集包含跨盘分集，已登记的手动海报、动态海报、截图，以及可确定归属的媒体目录配套文件随片清理。见[飞牛部署指南](docs/飞牛NAS小白部署指南.md#在-windows-和平板管理端启用永久删除)。
 
 ### 受控源文件改名（默认关闭）
 

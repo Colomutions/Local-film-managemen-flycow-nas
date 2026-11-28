@@ -358,6 +358,15 @@ Future<void> main() async {
     );
     final updatedActor =
         (updatedPreview.json['data']['current'] as Map<String, dynamic>);
+    final linkedTasks = await _request(
+        base, 'GET', '/api/v1/admin/mdcng-actor-imports?actorId=$batchActorId',
+        token: admin);
+    final scoped = linkedTasks.json['data'];
+    _expect(
+        scoped['actorId'] == batchActorId &&
+            scoped['items'].single['taskId'] == '2' &&
+            scoped['items'].single['searchNames'].contains('自定义名字'),
+        'detail lookup returns only this actor and includes their edited name');
     _expect(
         updatedActor['id'] == batchActorId &&
             updatedActor['stageName'] == '自定义名字' &&
@@ -498,6 +507,23 @@ Future<void> main() async {
         .where((diff) => diff['requiresConfirmation'] == true)
         .map((diff) => diff['key'] as String)
         .toList(growable: false);
+    final unlinkedReview = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-actor-imports/apply',
+        token: admin,
+        body: {
+          'taskId': source['taskId'],
+          'fingerprint': fingerprint,
+          'fieldKeys': fields,
+          'overwriteFieldKeys': overwriteFieldKeys,
+          'targetActorId': mergeTargetId,
+          'createNew': false,
+          'selectedProfileKey': candidate['key'],
+          'requireLinkedTarget': true,
+          'expectedTargetUpdatedAt': mergeTarget.json['data']['actor']
+              ['updatedAt'],
+        });
+    _expect(unlinkedReview.statusCode == HttpStatus.conflict,
+        'detail review cannot bind an unlinked task');
     final applied = await _request(
       base,
       'POST',
@@ -545,6 +571,75 @@ Future<void> main() async {
     );
     _expect(clearedMergeField.statusCode == HttpStatus.ok,
         'clears one field on the linked actor');
+    final reopened = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-actor-imports/preview',
+        token: admin,
+        body: {
+          'taskId': source['taskId'],
+          'targetActorId': mergeTargetId,
+        });
+    final review = reopened.json['data'];
+    _expect(
+        review['current']['id'] == mergeTargetId &&
+            review['source']['selectedProfileKey'] == candidate['key'] &&
+            review['profileResolution'] == 'matched',
+        'detail re-review restores the saved choice by Emby ID');
+    String imageStatus(dynamic data, String key) => (data['fieldDiffs'] as List)
+        .singleWhere((diff) => diff['key'] == key)['status'] as String;
+    _expect(
+        imageStatus(review, 'photo') == 'unchanged' &&
+            imageStatus(review, 'backdrop') == 'unchanged',
+        'reopening does not offer to replace identical image content');
+    final reviewed = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-actor-imports/apply',
+        token: admin,
+        body: {
+          'taskId': source['taskId'],
+          'fingerprint': review['source']['fingerprint'],
+          'fieldKeys': ['romanizedName'],
+          'overwriteFieldKeys': [],
+          'targetActorId': mergeTargetId,
+          'createNew': false,
+          'requireLinkedTarget': true,
+          'expectedTargetUpdatedAt': review['current']['updatedAt'],
+        });
+    _expect(
+        reviewed.statusCode == HttpStatus.ok &&
+            reviewed.json['data']['actor']['id'] == mergeTargetId,
+        'linked review writes to the same actor');
+    final staleReview = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-actor-imports/apply',
+        token: admin,
+        body: {
+          'taskId': source['taskId'],
+          'fingerprint': review['source']['fingerprint'],
+          'fieldKeys': ['romanizedName'],
+          'overwriteFieldKeys': ['romanizedName'],
+          'targetActorId': mergeTargetId,
+          'createNew': false,
+          'requireLinkedTarget': true,
+          'expectedTargetUpdatedAt': review['current']['updatedAt'],
+        });
+    _expect(
+        staleReview.statusCode == HttpStatus.conflict &&
+            staleReview.json['error']['code'] == 'mdcng_actor_preview_stale',
+        'a second device must refresh a stale detail review before overwriting');
+    final portrait =
+        File('${photos.path}${Platform.pathSeparator}涼森れむ-old.jpg');
+    final originalBytes = await portrait.readAsBytes();
+    await portrait.writeAsBytes([0xff, 0xd8, 0xff, 0xda]);
+    final changedImage = await _request(
+        base, 'POST', '/api/v1/admin/mdcng-actor-imports/preview',
+        token: admin,
+        body: {
+          'taskId': source['taskId'],
+          'targetActorId': mergeTargetId,
+        });
+    _expect(
+        imageStatus(changedImage.json['data'], 'photo') ==
+            'replace_requires_confirmation',
+        'images of equal length but different content still require confirmation');
+    await portrait.writeAsBytes(originalBytes);
     final repeated = await _request(
       base,
       'POST',

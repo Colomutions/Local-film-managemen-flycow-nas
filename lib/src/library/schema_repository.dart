@@ -10,7 +10,7 @@ class NasSchemaRepository {
 
   final Database Function() _connection;
   Database get _db => _connection();
-  static const currentSchemaVersion = 38;
+  static const currentSchemaVersion = 39;
 
   void migrate() {
     _db.execute('''
@@ -974,6 +974,21 @@ class NasSchemaRepository {
           'INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)',
           [38, now()],
         );
+        _db.execute('COMMIT');
+      } catch (_) {
+        _db.execute('ROLLBACK');
+        rethrow;
+      }
+    }
+    if (current < 39) {
+      _db.execute('BEGIN IMMEDIATE');
+      try {
+        _db.execute('''CREATE TABLE IF NOT EXISTS source_delete_receipts (
+          episode_id TEXT PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+          movie_id TEXT NOT NULL REFERENCES movies(id) ON DELETE CASCADE,
+          media_root_id TEXT NOT NULL, relative_path TEXT NOT NULL
+        )''');
+        _db.execute('INSERT INTO schema_migrations VALUES (?, ?)', [39, now()]);
         _db.execute('COMMIT');
       } catch (_) {
         _db.execute('ROLLBACK');
